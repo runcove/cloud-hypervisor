@@ -192,6 +192,16 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   content in a page that returns from the balloon, so this is correct.
   (`pvmemcontrol` differs: it issues operations that are only valid on
   anonymous memory, which is why it is on the fallback list above.)
+- Free page reporting (`free_page_reporting=on`) also releases reported pages
+  with `MADV_DONTNEED`, so a reported page reads back the snapshot's content
+  rather than zeroes. Only a guest that expects freed pages to keep a known
+  value (zeroes with `init_on_free=1`, a poison pattern with page poisoning)
+  could notice. Cloud Hypervisor does not offer
+  `VIRTIO_BALLOON_F_PAGE_POISON`, and without it Linux does not negotiate
+  `VIRTIO_BALLOON_F_REPORTING` when either option is enabled
+  (`virtballoon_validate()` in `drivers/virtio/virtio_balloon.c`, since Linux
+  5.8 and 5.7.5). Every other guest makes no assumption about the content of
+  free pages, so reporting stays correct.
 - virtio-mem also discards unplugged blocks with `MADV_DONTNEED`, but there
   the private file mapping is not acceptable: a block that is unplugged and
   later plugged again would read back the snapshot's old content instead of
