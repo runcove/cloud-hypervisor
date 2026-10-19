@@ -1142,6 +1142,10 @@ impl MemoryManager {
             info!("Restore (mode=copyonwrite): guest RAM unsuitable, falling back to copy");
             return self.fill_saved_regions(file_path, saved_regions);
         }
+        if saved_ranges_in_virtio_mem(&self.memory_zones, saved_regions) {
+            info!("Restore (mode=copyonwrite): plugged virtio-mem blocks, falling back to copy");
+            return self.fill_saved_regions(file_path, saved_regions);
+        }
         let memory_file = OpenOptions::new()
             .read(true)
             .open(file_path)
@@ -4045,6 +4049,32 @@ fn is_restore_cow_compatible(guest_memory: &GuestMemory, saved_regions: &MemoryR
     true
 }
 
+// Whether any saved range lies in a zone's virtio-mem region. A requested
+// size of 0 does not prove the guest finished unplugging, and a private file
+// map under a virtio-mem block would make unplug's MADV_DONTNEED revert to
+// snapshot content instead of zeroing it.
+fn saved_ranges_in_virtio_mem(
+    memory_zones: &MemoryZones,
+    saved_regions: &MemoryRangeTable,
+) -> bool {
+    let windows: Vec<(u64, u64)> = memory_zones
+        .values()
+        .filter_map(|z| z.virtio_mem_zone.as_ref())
+        .map(|v| (v.region.start_addr().raw_value(), v.region.len()))
+        .collect();
+    saved_ranges_overlap(saved_regions, &windows)
+}
+
+// Whether any saved range overlaps one of the `(start, len)` GPA windows.
+fn saved_ranges_overlap(saved_regions: &MemoryRangeTable, windows: &[(u64, u64)]) -> bool {
+    saved_regions.ranges().iter().any(|r| {
+        let end = r.gpa.saturating_add(r.length);
+        windows
+            .iter()
+            .any(|&(start, len)| r.gpa < start.saturating_add(len) && start < end)
+    })
+}
+
 // Maps each saved range over its guest RAM window, re-applying the owning
 // region's reserve policy and the THP policy. Ranges must have passed
 // `is_restore_cow_compatible`.
@@ -4393,6 +4423,174 @@ mod tests {
         assert!(got == want);
         assert_eq!(content[page as usize], 2);
         assert_eq!(got[page as usize], 0x55);
+    }
+
+    #[test]
+    fn cow_restore_detects_saved_ranges_in_virtio_mem_windows() {
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 0x1000_0000,
+        });
+        // Boot RAM only: a virtio-mem window above it does not overlap.
+        let windows = [(0x1_0000_0000u64, 0x4_0000_0000u64)];
+        assert!(!saved_ranges_overlap(&table, &windows));
+        assert!(!saved_ranges_overlap(&table, &[]));
+        // A touching-but-disjoint window does not overlap.
+        assert!(!saved_ranges_overlap(&table, &[(0x1000_0000, 0x1000)]));
+        // A plugged block inside the window does.
+        table.push(MemoryRange {
+            gpa: 0x1_0020_0000,
+            length: 0x20_0000,
+        });
+        assert!(saved_ranges_overlap(&table, &windows));
+    }
+
+    #[test]
+    fn cow_restore_overlap_edge_cases() {
+        let one = |gpa: u64, length: u64| {
+            let mut table = MemoryRangeTable::default();
+            table.push(MemoryRange { gpa, length });
+            table
+        };
+        let (start, len) = (0x1_0000_0000u64, 0x4000_0000u64);
+        let window = [(start, len)];
+        // Starts below the window and ends inside it.
+        assert!(saved_ranges_overlap(&one(start - 0x1000, 0x2000), &window));
+        // Ends exactly at the window's start.
+        assert!(!saved_ranges_overlap(&one(start - 0x1000, 0x1000), &window));
+        // Starts exactly at the window's end.
+        assert!(!saved_ranges_overlap(&one(start + len, 0x1000), &window));
+        // Last byte of the window, and first byte past it.
+        assert!(saved_ranges_overlap(
+            &one(start + len - 0x1000, 0x2000),
+            &window
+        ));
+        // A window entirely inside a larger range.
+        assert!(saved_ranges_overlap(&one(0, start + len + 0x1000), &window));
+        // Several windows: a range between them overlaps neither, a range in
+        // the second one is found.
+        let windows = [(start, len), (0x2_0000_0000, len)];
+        assert!(!saved_ranges_overlap(&one(start + len, 0x1000), &windows));
+        assert!(saved_ranges_overlap(&one(0x2_0010_0000, 0x1000), &windows));
+        // Several ranges, only the last of which overlaps.
+        let mut table = one(0, 0x1000);
+        table.push(MemoryRange {
+            gpa: 0x1_8000_0000,
+            length: 0x1000,
+        });
+        assert!(!saved_ranges_overlap(&table, &windows));
+        table.push(MemoryRange {
+            gpa: 0x2_3fff_f000,
+            length: 0x1000,
+        });
+        assert!(saved_ranges_overlap(&table, &windows));
+    }
+
+    // Boot RAM plus a virtio-mem region, laid out the way a restore lays
+    // them out: boot RAM in the zone's regions, the virtio-mem region in its
+    // virtio_mem_zone, nothing plugged. Built by hand because
+    // restore_memory_regions_and_zones() needs a hypervisor VM.
+    fn restore_zone_with_virtio_mem() -> (GuestMemory, MemoryZones) {
+        const MIB: u64 = 1 << 20;
+        let region = |gpa: u64, size: u64| {
+            Arc::new(GuestRegion::from(
+                vm_memory::GuestRegionMmap::<AtomicBitmap>::from_range(
+                    GuestAddress(gpa),
+                    size as usize,
+                    None,
+                )
+                .unwrap(),
+            ))
+        };
+        let boot = region(0, 4 * MIB);
+        let vmem = region(16 * MIB, 8 * MIB);
+        let mut zone = MemoryZone::new(false, false, get_page_size(), false);
+        zone.regions.push(Arc::clone(&boot));
+        zone.virtio_mem_zone = Some(VirtioMemZone {
+            region: Arc::clone(&vmem),
+            virtio_device: None,
+            hotplugged_size: 0,
+            hugepages: false,
+            blocks_state: Arc::new(Mutex::new(BlocksState::new(vmem.len()))),
+        });
+        let mut zones = MemoryZones::new();
+        zones.insert("mem0".to_string(), zone);
+        (
+            GuestMemory::from_arc_regions(vec![boot, vmem]).unwrap(),
+            zones,
+        )
+    }
+
+    #[test]
+    fn cow_restore_falls_back_for_saved_ranges_in_virtio_mem_zone() {
+        const MIB: u64 = 1 << 20;
+        let (_gm, zones) = restore_zone_with_virtio_mem();
+        let vmem = zones["mem0"].virtio_mem_zone.as_ref().unwrap();
+        assert_eq!(vmem.region.start_addr(), GuestAddress(16 * MIB));
+        // Nothing plugged: the saved ranges are boot RAM only, so CoW applies.
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        assert!(vmem.plugged_ranges().ranges().is_empty());
+        assert!(!saved_ranges_in_virtio_mem(&zones, &table));
+        assert!(!saved_ranges_in_virtio_mem(&MemoryZones::new(), &table));
+        // A block still plugged at snapshot time is saved: fall back to copy.
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        assert!(saved_ranges_in_virtio_mem(&zones, &table));
+    }
+
+    #[test]
+    fn cow_restore_keeps_unplugged_virtio_mem_anonymous() {
+        const MIB: u64 = 1 << 20;
+        let (gm, zones) = restore_zone_with_virtio_mem();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0xabu8; (4 * MIB) as usize]).unwrap();
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        assert!(is_restore_cow_compatible(&gm, &table));
+        assert!(!saved_ranges_in_virtio_mem(&zones, &table));
+        do_mmap_cow_saved_regions(&gm, &file, &table, false).unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+        // A block the guest plugs, writes and unplugs again reads as zero.
+        let block = GuestAddress(18 * MIB);
+        gm.write_obj::<u8>(0x5a, block).unwrap();
+        let host = gm.get_host_address(block).unwrap();
+        // SAFETY: host names 2 MiB inside the virtio-mem region mapped above.
+        let ret = unsafe { libc::madvise(host.cast(), (2 * MIB) as usize, libc::MADV_DONTNEED) };
+        assert_eq!(ret, 0);
+        assert_eq!(gm.read_obj::<u8>(block).unwrap(), 0);
+    }
+
+    // Why plugged virtio-mem blocks must not be CoW-mapped: unplug discards
+    // with MADV_DONTNEED, which on a private file map drops the private copy
+    // and re-exposes the snapshot page instead of zeroing it.
+    #[test]
+    fn cow_restore_dontneed_reverts_to_file_content() {
+        let page = get_page_size();
+        let gm = GuestMemory::from_ranges(&[(GuestAddress(0), page as usize)]).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0xabu8; page as usize]).unwrap();
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: page,
+        });
+        do_mmap_cow_saved_regions(&gm, &file, &table, false).unwrap();
+        gm.write_obj::<u8>(0x5a, GuestAddress(0)).unwrap();
+        let host = gm.get_host_address(GuestAddress(0)).unwrap();
+        // SAFETY: host/page name the private mapping installed above.
+        let ret = unsafe { libc::madvise(host.cast(), page as usize, libc::MADV_DONTNEED) };
+        assert_eq!(ret, 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
     }
 
     #[test]
