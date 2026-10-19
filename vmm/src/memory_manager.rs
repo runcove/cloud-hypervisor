@@ -1047,13 +1047,20 @@ impl MemoryManager {
         file_path: PathBuf,
         saved_regions: &MemoryRangeTable,
     ) -> Result<(), Error> {
+        Self::copy_saved_regions(&self.guest_memory.memory(), file_path, saved_regions)
+    }
+
+    fn copy_saved_regions(
+        guest_memory: &GuestMemory,
+        file_path: PathBuf,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
         // Open (read only) the snapshot file.
         let mut memory_file = OpenOptions::new()
             .read(true)
             .open(file_path)
             .map_err(Error::SnapshotOpen)?;
 
-        let guest_memory = self.guest_memory.memory();
         let mut file_cursor: u64 = 0;
 
         for range in saved_regions.ranges() {
@@ -1137,14 +1144,49 @@ impl MemoryManager {
         file_path: PathBuf,
         saved_regions: &MemoryRangeTable,
     ) -> Result<(), Error> {
-        let guest_memory = self.guest_memory.memory();
-        if !is_restore_cow_compatible(&guest_memory, saved_regions) {
+        let Some(memory_file) = Self::cow_map_saved_regions(
+            &self.guest_memory.memory(),
+            &self.memory_zones,
+            self.thp,
+            file_path,
+            saved_regions,
+        )?
+        else {
+            return Ok(());
+        };
+        // Landlock applies after the restore, so the pagemap is opened here.
+        self.cow_source = match PageMap::open() {
+            Ok(pagemap) => Some(CowSource {
+                file: memory_file,
+                ranges: saved_regions.clone(),
+                pagemap,
+            }),
+            Err(e) => {
+                warn!("Restore (mode=copyonwrite): snapshots will write all guest memory: {e}");
+                None
+            }
+        };
+        Ok(())
+    }
+
+    // Returns the snapshot file when the ranges were mapped from it, or None
+    // when the restore fell back to the eager copy.
+    fn cow_map_saved_regions(
+        guest_memory: &GuestMemory,
+        memory_zones: &MemoryZones,
+        thp: bool,
+        file_path: PathBuf,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<Option<File>, Error> {
+        if !is_restore_cow_compatible(guest_memory, saved_regions) {
             info!("Restore (mode=copyonwrite): guest RAM unsuitable, falling back to copy");
-            return self.fill_saved_regions(file_path, saved_regions);
+            Self::copy_saved_regions(guest_memory, file_path, saved_regions)?;
+            return Ok(None);
         }
-        if saved_ranges_in_virtio_mem(&self.memory_zones, saved_regions) {
+        if saved_ranges_in_virtio_mem(memory_zones, saved_regions) {
             info!("Restore (mode=copyonwrite): plugged virtio-mem blocks, falling back to copy");
-            return self.fill_saved_regions(file_path, saved_regions);
+            Self::copy_saved_regions(guest_memory, file_path, saved_regions)?;
+            return Ok(None);
         }
         let memory_file = OpenOptions::new()
             .read(true)
@@ -1159,20 +1201,8 @@ impl MemoryManager {
                 "snapshot memory file is shorter than the saved ranges",
             )));
         }
-        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)?;
-        // Landlock applies after the restore, so the pagemap is opened here.
-        self.cow_source = match PageMap::open() {
-            Ok(pagemap) => Some(CowSource {
-                file: memory_file,
-                ranges: saved_regions.clone(),
-                pagemap,
-            }),
-            Err(e) => {
-                warn!("Restore (mode=copyonwrite): snapshots will write all guest memory: {e}");
-                None
-            }
-        };
-        Ok(())
+        do_mmap_cow_saved_regions(guest_memory, &memory_file, saved_regions, thp)?;
+        Ok(Some(memory_file))
     }
 
     /// Restore guest memory using userfaultfd for lazy demand paging.
@@ -4169,6 +4199,7 @@ mod tests {
         assert_eq!(base_clear_of_reserved(&regions, 8 * GIB, 8 * GIB), 8 * GIB);
     }
 
+    use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::FileExt;
 
@@ -4545,29 +4576,108 @@ mod tests {
         assert!(saved_ranges_in_virtio_mem(&zones, &table));
     }
 
+    // A snapshot memory file holding `chunks` of (byte, length) in order.
+    fn snapshot_file(chunks: &[(u8, u64)]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for &(byte, len) in chunks {
+            file.write_all(&vec![byte; len as usize]).unwrap();
+        }
+        file
+    }
+
+    // Whether the host mapping containing `gpa` is backed by a file, from the
+    // inode column of /proc/self/maps.
+    fn gpa_is_file_backed(gm: &GuestMemory, gpa: u64) -> bool {
+        let host = gm.get_host_address(GuestAddress(gpa)).unwrap() as usize;
+        let maps = fs::read_to_string("/proc/self/maps").unwrap();
+        maps.lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (lo, hi) = fields.next()?.split_once('-')?;
+                let lo = usize::from_str_radix(lo, 16).ok()?;
+                let hi = usize::from_str_radix(hi, 16).ok()?;
+                // Skip perms, offset and dev to reach the inode.
+                (lo..hi).contains(&host).then(|| fields.nth(3) != Some("0"))
+            })
+            .expect("guest address not found in /proc/self/maps")
+    }
+
+    // What virtio-mem does to an unplugged block.
+    fn discard(gm: &GuestMemory, gpa: u64, len: u64) {
+        let host = gm.get_host_address(GuestAddress(gpa)).unwrap();
+        // SAFETY: host/len name guest RAM inside a single region of gm.
+        let ret = unsafe { libc::madvise(host.cast(), len as usize, libc::MADV_DONTNEED) };
+        assert_eq!(ret, 0);
+    }
+
     #[test]
-    fn cow_restore_keeps_unplugged_virtio_mem_anonymous() {
+    fn cow_restore_copies_saved_ranges_in_virtio_mem() {
         const MIB: u64 = 1 << 20;
         let (gm, zones) = restore_zone_with_virtio_mem();
-        let mut file = tempfile::tempfile().unwrap();
-        file.write_all(&vec![0xabu8; (4 * MIB) as usize]).unwrap();
+        // Boot RAM, then a block that was still plugged at snapshot time.
+        let file = snapshot_file(&[(0xab, 4 * MIB), (0xcd, 2 * MIB)]);
         let mut table = MemoryRangeTable::default();
         table.push(MemoryRange {
             gpa: 0,
             length: 4 * MIB,
         });
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        // The region checks accept the block: only the virtio-mem check
+        // keeps it from being mapped from the file.
         assert!(is_restore_cow_compatible(&gm, &table));
-        assert!(!saved_ranges_in_virtio_mem(&zones, &table));
-        do_mmap_cow_saved_regions(&gm, &file, &table, false).unwrap();
+        MemoryManager::cow_map_saved_regions(&gm, &zones, false, file.path().to_path_buf(), &table)
+            .unwrap();
+        // The eager copy ran: nothing is file-backed and the data is in place.
+        assert!(!gpa_is_file_backed(&gm, 0));
+        assert!(!gpa_is_file_backed(&gm, 18 * MIB));
         assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
-        // A block the guest plugs, writes and unplugs again reads as zero.
-        let block = GuestAddress(18 * MIB);
-        gm.write_obj::<u8>(0x5a, block).unwrap();
-        let host = gm.get_host_address(block).unwrap();
-        // SAFETY: host names 2 MiB inside the virtio-mem region mapped above.
-        let ret = unsafe { libc::madvise(host.cast(), (2 * MIB) as usize, libc::MADV_DONTNEED) };
-        assert_eq!(ret, 0);
-        assert_eq!(gm.read_obj::<u8>(block).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(4 * MIB - 1)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(18 * MIB)).unwrap(), 0xcd);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(20 * MIB - 1)).unwrap(), 0xcd);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(16 * MIB)).unwrap(), 0);
+    }
+
+    #[test]
+    fn cow_restore_keeps_unplugged_virtio_mem_anonymous() {
+        const MIB: u64 = 1 << 20;
+        let block = 18 * MIB;
+
+        // Nothing plugged: boot RAM is mapped from the file, and a block the
+        // guest plugs, writes and unplugs after the restore reads as zero.
+        let (gm, zones) = restore_zone_with_virtio_mem();
+        let file = snapshot_file(&[(0xab, 4 * MIB)]);
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        MemoryManager::cow_map_saved_regions(&gm, &zones, false, file.path().to_path_buf(), &table)
+            .unwrap();
+        assert!(gpa_is_file_backed(&gm, 0));
+        assert!(!gpa_is_file_backed(&gm, block));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+        gm.write_obj::<u8>(0x5a, GuestAddress(block)).unwrap();
+        discard(&gm, block, 2 * MIB);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(block)).unwrap(), 0);
+
+        // A block still plugged at snapshot time: restored with its content,
+        // and once the guest unplugs it, it reads as zero rather than as the
+        // snapshot's copy.
+        let (gm, zones) = restore_zone_with_virtio_mem();
+        let file = snapshot_file(&[(0xab, 4 * MIB), (0xcd, 2 * MIB)]);
+        table.push(MemoryRange {
+            gpa: block,
+            length: 2 * MIB,
+        });
+        MemoryManager::cow_map_saved_regions(&gm, &zones, false, file.path().to_path_buf(), &table)
+            .unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(block)).unwrap(), 0xcd);
+        gm.write_obj::<u8>(0x5a, GuestAddress(block)).unwrap();
+        discard(&gm, block, 2 * MIB);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(block)).unwrap(), 0);
     }
 
     // Why plugged virtio-mem blocks must not be CoW-mapped: unplug discards
