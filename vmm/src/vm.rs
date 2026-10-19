@@ -113,8 +113,9 @@ use crate::sev::MeasuredBootInfo;
 #[cfg(feature = "fw_cfg")]
 use crate::vm_config::FwCfgConfig;
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
-    NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, MemoryConfig,
+    NetConfig, NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig,
+    VsockConfig,
 };
 use crate::{
     CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemoryMmap,
@@ -500,7 +501,6 @@ pub fn physical_bits(hypervisor: &dyn hypervisor::Hypervisor, max_phys_bits: u8)
 // MADV_DONTNEED zeroing, KSM, per-zone reserve/NUMA replay) keep the eager
 // copy. Shared and hugepage zones are already rejected per region.
 fn is_restore_cow_supported(config: &VmConfig) -> bool {
-    let mem = &config.memory;
     // vDPA dma-maps guest RAM into the vhost-vdpa IOTLB, pinning host pages the
     // same way VFIO does, so it also needs the anonymous eager-copy mapping.
     let passthrough = config.devices.as_ref().is_some_and(|d| !d.is_empty())
@@ -511,20 +511,160 @@ fn is_restore_cow_supported(config: &VmConfig) -> bool {
     let pvmemcontrol = config.pvmemcontrol.is_some();
     #[cfg(not(feature = "pvmemcontrol"))]
     let pvmemcontrol = false;
+    !(passthrough || pvmemcontrol) && is_restore_cow_memory_supported(&config.memory)
+}
+
+// The memory-config half of `is_restore_cow_supported`. virtio-mem hotplug
+// is allowed while nothing is plugged: its region is never in the saved
+// ranges, so it stays plain anonymous memory and unplug's MADV_DONTNEED still
+// zeroes. Plugged virtio-mem and ACPI DIMM hotplug keep the eager copy.
+fn is_restore_cow_memory_supported(mem: &MemoryConfig) -> bool {
+    let virtio_mem = mem.hotplug_method == HotplugMethod::VirtioMem;
+    let unplugged = |hotplugged: Option<u64>| hotplugged.unwrap_or(0) == 0;
+    let unsupported_hotplug = if virtio_mem {
+        !unplugged(mem.hotplugged_size)
+    } else {
+        mem.hotplug_size.is_some() || mem.hotplugged_size.is_some()
+    };
     let unsupported_zone = mem.zones.as_ref().is_some_and(|zones| {
         zones.iter().any(|z| {
-            z.host_numa_node.is_some()
-                || z.hotplug_size.is_some()
-                || z.hotplugged_size.is_some()
-                || z.reserve.unwrap_or(false)
-                || z.mergeable
+            let zone_hotplug = if virtio_mem {
+                !unplugged(z.hotplugged_size)
+            } else {
+                z.hotplug_size.is_some() || z.hotplugged_size.is_some()
+            };
+            z.host_numa_node.is_some() || zone_hotplug || z.reserve.unwrap_or(false) || z.mergeable
         })
     });
-    !(passthrough
-        || pvmemcontrol
-        || mem.mergeable
-        || mem.hotplug_size.is_some()
-        || unsupported_zone)
+    !(mem.mergeable || unsupported_hotplug || unsupported_zone)
+}
+
+#[cfg(test)]
+mod restore_cow_gate_tests {
+    use super::*;
+    use crate::vm_config::MemoryZoneConfig;
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+
+    fn vmem(hotplug_size: Option<u64>, hotplugged_size: Option<u64>) -> MemoryConfig {
+        MemoryConfig {
+            size: 512 * MIB,
+            hotplug_method: HotplugMethod::VirtioMem,
+            hotplug_size,
+            hotplugged_size,
+            ..Default::default()
+        }
+    }
+
+    fn zone(hotplug_size: Option<u64>, hotplugged_size: Option<u64>) -> MemoryZoneConfig {
+        MemoryZoneConfig {
+            id: "z0".to_string(),
+            size: 512 * MIB,
+            hotplug_size,
+            hotplugged_size,
+            ..Default::default()
+        }
+    }
+
+    fn zoned(method: HotplugMethod, z: MemoryZoneConfig) -> MemoryConfig {
+        MemoryConfig {
+            size: 0,
+            hotplug_method: method,
+            zones: Some(vec![z]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plain_ram_is_supported() {
+        assert!(is_restore_cow_memory_supported(&MemoryConfig::default()));
+        assert!(is_restore_cow_memory_supported(&zoned(
+            HotplugMethod::Acpi,
+            zone(None, None)
+        )));
+    }
+
+    #[test]
+    fn unplugged_virtio_mem_is_supported() {
+        assert!(is_restore_cow_memory_supported(&vmem(Some(16 * GIB), None)));
+        assert!(is_restore_cow_memory_supported(&vmem(
+            Some(16 * GIB),
+            Some(0)
+        )));
+        let method = HotplugMethod::VirtioMem;
+        assert!(is_restore_cow_memory_supported(&zoned(
+            method,
+            zone(Some(16 * GIB), None)
+        )));
+        assert!(is_restore_cow_memory_supported(&zoned(
+            method,
+            zone(Some(16 * GIB), Some(0))
+        )));
+    }
+
+    #[test]
+    fn plugged_virtio_mem_is_refused() {
+        assert!(!is_restore_cow_memory_supported(&vmem(
+            Some(16 * GIB),
+            Some(GIB)
+        )));
+        assert!(!is_restore_cow_memory_supported(&zoned(
+            HotplugMethod::VirtioMem,
+            zone(Some(16 * GIB), Some(GIB))
+        )));
+    }
+
+    #[test]
+    fn acpi_hotplug_is_refused() {
+        let acpi = MemoryConfig {
+            hotplug_size: Some(16 * GIB),
+            ..Default::default()
+        };
+        assert!(!is_restore_cow_memory_supported(&acpi));
+        let acpi_plugged = MemoryConfig {
+            hotplug_size: Some(16 * GIB),
+            hotplugged_size: Some(0),
+            ..Default::default()
+        };
+        assert!(!is_restore_cow_memory_supported(&acpi_plugged));
+        // Zone hotplug fields under the ACPI method stay refused.
+        assert!(!is_restore_cow_memory_supported(&zoned(
+            HotplugMethod::Acpi,
+            zone(Some(16 * GIB), None)
+        )));
+        assert!(!is_restore_cow_memory_supported(&zoned(
+            HotplugMethod::Acpi,
+            zone(None, Some(0))
+        )));
+    }
+
+    #[test]
+    fn other_zone_attributes_still_refused() {
+        let mut z = zone(Some(16 * GIB), None);
+        z.host_numa_node = Some(0);
+        assert!(!is_restore_cow_memory_supported(&zoned(
+            HotplugMethod::VirtioMem,
+            z
+        )));
+        let mut z = zone(None, None);
+        z.mergeable = true;
+        assert!(!is_restore_cow_memory_supported(&zoned(
+            HotplugMethod::VirtioMem,
+            z
+        )));
+        let mut z = zone(Some(16 * GIB), Some(0));
+        z.reserve = Some(true);
+        assert!(!is_restore_cow_memory_supported(&zoned(
+            HotplugMethod::VirtioMem,
+            z
+        )));
+        let mergeable = MemoryConfig {
+            mergeable: true,
+            ..vmem(Some(16 * GIB), None)
+        };
+        assert!(!is_restore_cow_memory_supported(&mergeable));
+    }
 }
 
 /// Guest clock baseline captured for snapshot/restore, plus how it must be
@@ -1403,7 +1543,7 @@ impl Vm {
             && !is_restore_cow_supported(&vm_config.lock().unwrap())
         {
             warn!(
-                "Restore (mode=copyonwrite): requires non-resizable private RAM without passthrough, NUMA binding or KSM, falling back to copy"
+                "Restore (mode=copyonwrite): requires private RAM without passthrough, NUMA binding, KSM, ACPI hotplug or plugged virtio-mem, falling back to copy"
             );
             memory_restore_mode = MemoryRestoreMode::Copy;
         }

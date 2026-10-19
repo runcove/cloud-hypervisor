@@ -163,12 +163,18 @@ Current constraints for `memory_restore_mode=copyonwrite`:
 
 - Plain private guest RAM only. Anything else falls back to the eager copy
   (logged): `shared=on` or hugepages (global or per-zone), zones with
-  `host_numa_node`, `reserve`, `mergeable` or hotplug fields (a purely static
-  `id`+`size` zone is fine), resizable RAM (`hotplug_size`, virtio-mem), KSM
-  (`mergeable=on`), `--pvmemcontrol`, device passthrough
+  `host_numa_node`, `reserve` or `mergeable` (a purely static `id`+`size`
+  zone is fine), ACPI memory hotplug (`hotplug_size` or `hotplugged_size`,
+  global or per-zone, with `hotplug_method=acpi`), plugged virtio-mem memory
+  (see below), KSM (`mergeable=on`), `--pvmemcontrol`, device passthrough
   (`--device`/`--user-device`/`--vdpa`), and snapshot ranges that are not
   page-aligned single-region extents. Each region's `reserve` policy and the
   THP policy are re-applied to the mapped region.
+- virtio-mem hotplug (`hotplug_method=virtio-mem`, global or per-zone) is
+  supported while nothing is plugged: `hotplugged_size` unset or 0 in the
+  global config and in every zone. A non-zero `hotplugged_size` falls back to
+  the eager copy. Memory can be plugged and unplugged normally after the
+  restore.
 - A snapshot memory file shorter than the saved ranges is rejected up front (it
   would otherwise fault `SIGBUS` at run time).
 - `prefault` is rejected.
@@ -186,6 +192,16 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   content in a page that returns from the balloon, so this is correct.
   (`pvmemcontrol` differs: it issues operations that are only valid on
   anonymous memory, which is why it is on the fallback list above.)
+- virtio-mem also discards unplugged blocks with `MADV_DONTNEED`, but there
+  the private file mapping is not acceptable: a block that is unplugged and
+  later plugged again would read back the snapshot's old content instead of
+  zeroes, unlike after an eager-copy restore. The virtio-mem region is
+  therefore never mapped from the snapshot file. With nothing plugged it has
+  no saved ranges, so it stays anonymous memory. A `hotplugged_size` of 0 only
+  records the size that was requested, not that the guest had finished
+  unplugging when the snapshot was taken, so restore also checks the saved
+  ranges themselves: if any of them lies inside a virtio-mem region, the whole
+  restore falls back to the eager copy (logged).
 - A device that is hot-plugged after the restore and that pins guest memory
   (VFIO, vfio-user, vDPA) write-faults every guest page when its IOMMU mapping
   is created. Every page becomes a private copy: the VM stays correct, but the
