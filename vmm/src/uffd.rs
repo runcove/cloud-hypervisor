@@ -247,6 +247,7 @@ struct UffdioPoison {
 
 /// A guest memory range registered with userfaultfd, plus where its bytes
 /// live for the data source.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct UffdRange {
     pub host_addr: u64,
     pub length: u64,
@@ -482,6 +483,34 @@ impl Drop for SocketUffdMemorySource {
 
 fn io_other<E: fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+/// Resolve a fault on page `page_idx` of `range` with zeroes. The page is
+/// copied, so it is private to this mapping, unlike `UFFDIO_ZEROPAGE`, which
+/// maps the zero page every process shares. `zeroes` is a scratch buffer that
+/// is only ever grown with zeroes.
+pub(crate) fn copy_zeroes(
+    fd: BorrowedFd<'_>,
+    range: &UffdRange,
+    page_idx: u64,
+    zeroes: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let page_size = range.page_size as usize;
+    let page_addr = range.page_addr(page_idx);
+    if zeroes.len() < page_size {
+        zeroes.resize(page_size, 0);
+    }
+    match copy(fd, page_addr, zeroes.as_ptr(), range.page_size) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+            // Installed concurrently. Wake any blocked threads.
+            if let Err(e) = wake(fd, page_addr, range.page_size) {
+                log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Mark a missing page so that an access to it fails instead of resolving a

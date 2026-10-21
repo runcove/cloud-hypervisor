@@ -3441,6 +3441,15 @@ impl RequestHandler for Vmm {
                         "An on-demand memory restore is still in progress"
                     )));
                 }
+                // Pages the guest never accessed are only in the restore
+                // source, which migration does not read: a sparse range table
+                // skips them as holes in a shared backing file, and a local
+                // migration hands over the backing file itself.
+                if vm.copy_on_access() {
+                    return Err(MigratableError::Conflict(anyhow!(
+                        "A VM restored with memory_restore_mode=copyonaccess cannot be migrated"
+                    )));
+                }
             }
             VmOwnership::Migration { .. } => {
                 return Err(MigratableError::Conflict(anyhow!(

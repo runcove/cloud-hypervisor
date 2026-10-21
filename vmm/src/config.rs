@@ -427,6 +427,9 @@ pub enum ValidationError {
     /// Prefault requires the eager-copy restore mode
     #[error("'prefault' requires 'memory_restore_mode=copy'")]
     InvalidRestorePrefaultWithOnDemand,
+    /// Copy-on-access restore cannot keep pages private with KSM merging them
+    #[error("'memory_restore_mode=copyonaccess' is not supported with 'mergeable=on' memory")]
+    InvalidRestoreCopyOnAccessWithMergeable,
     /// Postcopy and on-demand restore are not supported with some devices
     #[error("Postcopy and on-demand restore are not supported with {0} devices")]
     PostcopyIncompatibleDevice(String),
@@ -2937,6 +2940,18 @@ pub enum MemoryRestoreMode {
     /// Restore by mapping the snapshot memory file copy-on-write, sharing the
     /// page cache across VMs restored from the same snapshot.
     CopyOnWrite,
+    /// Restore lazily like `OnDemand`, but never copy the rest of the
+    /// snapshot in the background: each page is copied into the VM's own
+    /// memory only when it is first accessed, for the VM's whole lifetime.
+    /// VMs restored from the same snapshot share no guest memory page.
+    CopyOnAccess,
+}
+
+impl MemoryRestoreMode {
+    /// Whether this mode restores guest memory over userfaultfd.
+    pub fn uses_userfaultfd(self) -> bool {
+        matches!(self, Self::OnDemand | Self::CopyOnAccess)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -2953,6 +2968,7 @@ impl FromStr for MemoryRestoreMode {
             "copy" => Ok(Self::Copy),
             "ondemand" => Ok(Self::OnDemand),
             "copyonwrite" => Ok(Self::CopyOnWrite),
+            "copyonaccess" => Ok(Self::CopyOnAccess),
             _ => Err(MemoryRestoreModeParseError::InvalidValue(s.to_owned())),
         }
     }
@@ -3011,13 +3027,13 @@ pub struct RestoreConfig {
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite,\
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite|copyonaccess,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,\
         vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,resume=true|false,\
         zone_updates=<list_of_updates>\"
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
-        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise) \
+        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise), and `memory_restore_mode=copyonaccess` demand-pages like `ondemand` without the background copy, so each page is copied into the VM only when first accessed and the snapshot must stay in place for the VM's lifetime \
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
         \n`vfio_fds` is a list of VFIO device ids each paired with a new cdev file descriptor, \
@@ -3118,8 +3134,17 @@ impl RestoreConfig {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
         }
 
-        if self.memory_restore_mode == MemoryRestoreMode::OnDemand {
+        if self.memory_restore_mode.uses_userfaultfd() {
             vm_config.check_postcopy_incompatible_device()?;
+        }
+
+        // KSM merges identical pages across VMs, which is exactly the sharing
+        // copy-on-access restores exist to prevent.
+        if self.memory_restore_mode == MemoryRestoreMode::CopyOnAccess
+            && (vm_config.memory.mergeable
+                || vm_config.memory.zones.iter().flatten().any(|z| z.mergeable))
+        {
+            return Err(ValidationError::InvalidRestoreCopyOnAccessWithMergeable);
         }
 
         let mut restored_net_with_fds = HashMap::new();
@@ -5559,6 +5584,19 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             }
         );
         assert_eq!(
+            RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=copyonaccess")?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                prefault: false,
+                memory_restore_mode: MemoryRestoreMode::CopyOnAccess,
+                net_fds: None,
+                vfio_fds: None,
+                iommufd_fd: None,
+                resume: false,
+                zone_updates: vec![],
+            }
+        );
+        assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[zone1@1]")?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
@@ -5641,6 +5679,18 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
     }
 
     #[test]
+    fn test_memory_restore_mode_uses_userfaultfd() {
+        assert!(!MemoryRestoreMode::Copy.uses_userfaultfd());
+        assert!(MemoryRestoreMode::OnDemand.uses_userfaultfd());
+        assert!(!MemoryRestoreMode::CopyOnWrite.uses_userfaultfd());
+        assert!(MemoryRestoreMode::CopyOnAccess.uses_userfaultfd());
+        assert_eq!(
+            "CopyOnAccess".parse::<MemoryRestoreMode>().unwrap(),
+            MemoryRestoreMode::CopyOnAccess
+        );
+    }
+
+    #[test]
     fn test_restore_config_serde() {
         assert_eq!(
             serde_json::from_str::<RestoreConfig>(r#"{"source_url":"/path/to/snapshot"}"#)
@@ -5655,6 +5705,18 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             .unwrap()
             .memory_restore_mode,
             MemoryRestoreMode::OnDemand
+        );
+        assert_eq!(
+            serde_json::from_str::<RestoreConfig>(
+                r#"{"source_url":"/path/to/snapshot","memory_restore_mode":"CopyOnAccess"}"#
+            )
+            .unwrap()
+            .memory_restore_mode,
+            MemoryRestoreMode::CopyOnAccess
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryRestoreMode::CopyOnAccess).unwrap(),
+            serde_json::json!("CopyOnAccess")
         );
         assert_eq!(
             serde_json::from_str::<RestoreConfig>(
@@ -5923,6 +5985,62 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_cow_prefault.validate(&snapshot_vm_config),
             Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
         );
+
+        let invalid_coa_prefault = RestoreConfig {
+            prefault: true,
+            memory_restore_mode: MemoryRestoreMode::CopyOnAccess,
+            ..invalid_cow_prefault.clone()
+        };
+        assert_eq!(
+            invalid_coa_prefault.validate(&snapshot_vm_config),
+            Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
+        );
+
+        // Copy-on-access refuses the devices on-demand restore refuses.
+        let coa_config = RestoreConfig {
+            memory_restore_mode: MemoryRestoreMode::CopyOnAccess,
+            ..valid_config.clone()
+        };
+        coa_config.validate(&snapshot_vm_config).unwrap();
+        let mut vfio_vm_config = snapshot_vm_config.clone();
+        vfio_vm_config.devices = Some(vec![device_fixture()]);
+        for mode in [MemoryRestoreMode::OnDemand, MemoryRestoreMode::CopyOnAccess] {
+            let config = RestoreConfig {
+                memory_restore_mode: mode,
+                ..valid_config.clone()
+            };
+            assert_eq!(
+                config.validate(&vfio_vm_config),
+                Err(ValidationError::PostcopyIncompatibleDevice(
+                    "VFIO".to_owned()
+                ))
+            );
+        }
+
+        // KSM would merge the pages copy-on-access keeps private, globally
+        // or in any zone; on-demand restore does not care.
+        let mut mergeable_vm_config = snapshot_vm_config.clone();
+        mergeable_vm_config.memory.mergeable = true;
+        assert_eq!(
+            coa_config.validate(&mergeable_vm_config),
+            Err(ValidationError::InvalidRestoreCopyOnAccessWithMergeable)
+        );
+        let mut mergeable_zone_vm_config = snapshot_vm_config.clone();
+        mergeable_zone_vm_config.memory.zones = Some(vec![MemoryZoneConfig {
+            id: "mem0".to_string(),
+            size: 1 << 30,
+            mergeable: true,
+            ..Default::default()
+        }]);
+        assert_eq!(
+            coa_config.validate(&mergeable_zone_vm_config),
+            Err(ValidationError::InvalidRestoreCopyOnAccessWithMergeable)
+        );
+        let ondemand_config = RestoreConfig {
+            memory_restore_mode: MemoryRestoreMode::OnDemand,
+            ..valid_config.clone()
+        };
+        ondemand_config.validate(&mergeable_vm_config).unwrap();
     }
 
     #[test]

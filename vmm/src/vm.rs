@@ -2205,6 +2205,11 @@ impl Vm {
         for thread in self.threads.drain(..) {
             thread.join().map_err(Error::ThreadCleanup)?;
         }
+
+        // A copy-on-access handler never exits on its own: stop it now, with
+        // the vCPUs gone, rather than whenever the memory manager is dropped.
+        self.memory_manager.lock().unwrap().stop_uffd_handler();
+
         self.state = new_state;
 
         Ok(())
@@ -3236,6 +3241,10 @@ impl Vm {
 
     pub fn restoring(&self) -> bool {
         self.memory_manager.lock().unwrap().restoring()
+    }
+
+    pub fn copy_on_access(&self) -> bool {
+        self.memory_manager.lock().unwrap().copy_on_access()
     }
 
     pub fn device_tree(&self) -> Arc<Mutex<DeviceTree>> {
