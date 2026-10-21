@@ -9610,6 +9610,31 @@ mod ivshmem {
     }
 
     #[test]
+    #[cfg(not(feature = "mshv"))]
+    fn test_snapshot_restore_copy_on_access() {
+        // A booted Jammy guest touches well under half of 2 GiB.
+        snapshot_restore_common::_test_snapshot_restore_uffd_mode(
+            "size=2G",
+            &[],
+            1_920_000,
+            true,
+            Some(1_200_000),
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "mshv"))]
+    fn test_snapshot_restore_copy_on_access_shared_memory() {
+        snapshot_restore_common::_test_snapshot_restore_uffd_mode(
+            "size=512M,shared=on",
+            &[],
+            480_000,
+            true,
+            None,
+        );
+    }
+
+    #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_snapshot_restore_pvpanic() {
         snapshot_restore_common::_test_snapshot_restore_devices(true);
@@ -10059,6 +10084,42 @@ mod snapshot_restore_common {
         memory_zone_config: &[&str],
         min_total_memory_kib: u32,
     ) {
+        _test_snapshot_restore_uffd_mode(
+            memory_config,
+            memory_zone_config,
+            min_total_memory_kib,
+            false,
+            None,
+        );
+    }
+
+    // Resident memory of a process, in KiB, shared memory included.
+    fn process_rss_kib(pid: u32) -> u64 {
+        fs::read_to_string(format!("/proc/{pid}/status"))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap()
+    }
+
+    /// Snapshot a booted VM, restore it over userfaultfd (`ondemand`, or
+    /// `copyonaccess` with `copy_on_access`), snapshot the restored VM before
+    /// it runs, and boot a third VM from that second snapshot.
+    /// `max_restored_rss_kib` bounds the restored VM's resident memory once
+    /// it has run, which only holds without a background fill.
+    pub(crate) fn _test_snapshot_restore_uffd_mode(
+        memory_config: &str,
+        memory_zone_config: &[&str],
+        min_total_memory_kib: u32,
+        copy_on_access: bool,
+        max_restored_rss_kib: Option<u64>,
+    ) {
+        let restore_mode = if copy_on_access {
+            "copyonaccess"
+        } else {
+            "ondemand"
+        };
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
         let api_socket_source = format!("{}.1", temp_api_path(&guest.tmp_dir));
@@ -10128,7 +10189,8 @@ mod snapshot_restore_common {
             ])
             .args([
                 "--restore",
-                format!("source_url=file://{snapshot_dir},memory_restore_mode=ondemand").as_str(),
+                format!("source_url=file://{snapshot_dir},memory_restore_mode={restore_mode}")
+                    .as_str(),
             ])
             .capture_output()
             .spawn()
@@ -10139,6 +10201,7 @@ mod snapshot_restore_common {
             &["restored"],
             &event_path_restored
         ));
+        let restored_pid = child.id();
 
         let r = panic::catch_unwind(|| {
             assert!(wait_until(Duration::from_secs(30), || remote_command(
@@ -10147,12 +10210,22 @@ mod snapshot_restore_common {
                 None
             )));
 
-            // Snapshot the still-restoring VM: refused until prefault completes.
-            assert!(wait_until(Duration::from_secs(120), || remote_command(
-                &api_socket_restored,
-                "snapshot",
-                Some(format!("file://{snapshot_dir2}").as_str()),
-            )));
+            if copy_on_access {
+                // Accepted at once: the pages never touched are saved from
+                // the restore source.
+                assert!(remote_command(
+                    &api_socket_restored,
+                    "snapshot",
+                    Some(format!("file://{snapshot_dir2}").as_str()),
+                ));
+            } else {
+                // Snapshot the still-restoring VM: refused until prefault completes.
+                assert!(wait_until(Duration::from_secs(120), || remote_command(
+                    &api_socket_restored,
+                    "snapshot",
+                    Some(format!("file://{snapshot_dir2}").as_str()),
+                )));
+            }
 
             assert!(remote_command(&api_socket_restored, "resume", None));
 
@@ -10166,6 +10239,16 @@ mod snapshot_restore_common {
             assert!(guest.get_total_memory().unwrap_or_default() > min_total_memory_kib);
 
             guest.check_devices_common(Some(&socket), Some(&console_text), None);
+
+            if let Some(max_rss_kib) = max_restored_rss_kib {
+                // Give a background fill, if any, time to show.
+                thread::sleep(Duration::from_secs(10));
+                let rss_kib = process_rss_kib(restored_pid);
+                assert!(
+                    rss_kib < max_rss_kib,
+                    "restored VM resident memory {rss_kib} KiB, expected below {max_rss_kib} KiB"
+                );
+            }
         });
 
         kill_child(&mut child);
@@ -10180,10 +10263,21 @@ mod snapshot_restore_common {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            let expected = if copy_on_access {
+                "UFFD restore: copy-on-access restore enabled"
+            } else {
+                "UFFD restore: demand-paged restore enabled"
+            };
             assert!(
-                logs.contains("UFFD restore: demand-paged restore enabled"),
+                logs.contains(expected),
                 "Expected UFFD restore path to be enabled. output: {logs}"
             );
+            if copy_on_access {
+                assert!(
+                    !logs.contains("prefault done"),
+                    "Copy-on-access restore ran a background fill. output: {logs}"
+                );
+            }
         });
         handle_child_output(r, &output);
 

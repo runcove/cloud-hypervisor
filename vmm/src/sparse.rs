@@ -137,6 +137,19 @@ pub fn copy_region(
         return Ok(());
     }
     // Dense fallback: source filesystem lacks SEEK_HOLE (e.g. hugetlbfs).
+    copy_region_dense(src, src_offset, dst, dst_offset, len)
+}
+
+/// Copy `[src_offset, src_offset+len)` of `src` to `dst` at `dst_offset`,
+/// every byte, holes included. Unlike [`copy_region`], `dst` need not be
+/// sized beforehand.
+pub fn copy_region_dense(
+    src: &File,
+    src_offset: u64,
+    dst: &File,
+    dst_offset: u64,
+    len: u64,
+) -> io::Result<()> {
     const CHUNK: usize = 1 << 20;
     let mut buf = vec![0u8; CHUNK];
     let mut done = 0u64;
