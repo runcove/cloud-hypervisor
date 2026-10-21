@@ -1505,7 +1505,9 @@ impl DeviceManager {
 
     fn postcopy_handler(&self) -> Option<Arc<dyn PostcopyHandler>> {
         let memory_manager = self.memory_manager.lock().unwrap();
-        if !memory_manager.restoring() {
+        // A copy-on-access restore serves faults for the VM's lifetime, so
+        // its backends need the registry even though it is not restoring.
+        if !memory_manager.restoring() && !memory_manager.copy_on_access() {
             return None;
         }
         let uffd_registry = memory_manager.uffd_registry()?;

@@ -58,7 +58,9 @@ use crate::coredump::{
 use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
 use crate::pagemap::PageMap;
-use crate::sparse::{clone_file_range, next_data_extent, write_region_sparse};
+use crate::sparse::{
+    clone_file_range, copy_region, copy_region_dense, next_data_extent, write_region_sparse,
+};
 use crate::uffd::{
     self, FileUffdMemorySource, SocketUffdMemorySource, Uffd, UffdHole, UffdMemorySource, UffdRange,
 };
@@ -71,6 +73,7 @@ struct UffdHandler {
     handle: thread::JoinHandle<()>,
     fault_socket_fd: Option<OwnedFd>,
     uffd_registry: Arc<UffdRegistry>,
+    copy_on_access: Option<CopyOnAccessPages>,
 }
 
 /// Userfaultfds sent to a UFFD handler.
@@ -142,7 +145,7 @@ impl PostcopyHandler for UffdRegistry {
                 // Faults on `fd` are at the addresses where its process maps
                 // guest memory, so translate the handler ranges to those
                 host_addr: region.backend_addr + (range.host_addr - region.host_addr),
-                ..range.clone()
+                ..*range
             });
         }
 
@@ -178,6 +181,154 @@ impl PostcopyHandler for UffdRegistry {
 
     fn postcopy_done_event(&self) -> &EventFd {
         &self.done
+    }
+}
+
+/// How a UFFD handler serves guest memory.
+enum UffdServing {
+    /// Serve faults and, with `background_fetch_pages`, copy every page the
+    /// guest has not accessed yet in the background, exiting once all are in.
+    OnDemand { background_fetch_pages: bool },
+    /// Serve faults for the VM's whole lifetime and never copy a page the
+    /// guest has not accessed. A page the guest discarded after accessing it
+    /// (balloon, free page reporting, virtio-mem unplug) comes back as zeroes,
+    /// as after an eager copy. `source` is the restore source, kept for the
+    /// snapshot writer.
+    CopyOnAccess { source: File },
+}
+
+/// What a copy-on-access VM's snapshot writer needs: the pages the guest
+/// never accessed are only in the snapshot the VM was restored from.
+struct CopyOnAccessPages {
+    source: File,
+    ranges: Box<[UffdRange]>,
+    served: Arc<[AtomicBitmap]>,
+    /// Held by the handler from deciding how to resolve a fault until the
+    /// page is installed and `served` updated. Holding it, `served` and the
+    /// pages in memory agree.
+    serve_lock: Arc<Mutex<()>>,
+}
+
+/// A part of a saved memory range and where its content is.
+#[derive(Debug, PartialEq, Eq)]
+enum CopyOnAccessSegment {
+    /// In guest memory: outside every UFFD range, served, or present.
+    Guest { offset: u64, len: u64 },
+    /// Never served and not present: still only in the restore source, at
+    /// `source_offset`.
+    Source {
+        offset: u64,
+        len: u64,
+        source_offset: u64,
+    },
+}
+
+impl CopyOnAccessSegment {
+    fn end(&self) -> u64 {
+        match *self {
+            Self::Guest { offset, len } | Self::Source { offset, len, .. } => offset + len,
+        }
+    }
+
+    /// Extend `self` with `next` if it continues it. Returns whether it did.
+    fn merge(&mut self, next: &Self) -> bool {
+        match (self, next) {
+            (
+                Self::Guest { offset, len },
+                Self::Guest {
+                    offset: next,
+                    len: next_len,
+                },
+            ) if *offset + *len == *next => *len += next_len,
+            (
+                Self::Source {
+                    offset,
+                    len,
+                    source_offset,
+                },
+                Self::Source {
+                    offset: next,
+                    len: next_len,
+                    source_offset: next_source,
+                },
+            ) if *offset + *len == *next && *source_offset + *len == *next_source => {
+                *len += next_len;
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+impl CopyOnAccessPages {
+    /// The longest leading part of the `len` bytes of guest memory mapped at
+    /// `host_addr` whose content is all in one place, at offsets relative to
+    /// `host_addr`. `page_present` tells whether the page at an address is in
+    /// memory; it is asked only about pages never served. Call with
+    /// `serve_lock` held, and the answer holds only as long as it is.
+    fn next_segment(
+        &self,
+        host_addr: u64,
+        len: u64,
+        page_present: &impl Fn(u64) -> bool,
+    ) -> CopyOnAccessSegment {
+        let end = host_addr + len;
+        let mut segment = self.piece(host_addr, host_addr, end, page_present);
+        while host_addr + segment.end() < end {
+            let next = self.piece(host_addr, host_addr + segment.end(), end, page_present);
+            if !segment.merge(&next) {
+                break;
+            }
+        }
+        segment
+    }
+
+    /// The part of `[addr, end)` up to the end of the page at `addr`, or up
+    /// to the next UFFD range when `addr` is in none, at an offset relative
+    /// to `base`.
+    fn piece(
+        &self,
+        base: u64,
+        addr: u64,
+        end: u64,
+        page_present: &impl Fn(u64) -> bool,
+    ) -> CopyOnAccessSegment {
+        let Some((range_idx, range)) = self
+            .ranges
+            .iter()
+            .enumerate()
+            .find(|(_, r)| addr >= r.host_addr && addr < r.host_addr + r.length)
+        else {
+            let next = self
+                .ranges
+                .iter()
+                .map(|r| r.host_addr)
+                .filter(|&start| start > addr && start < end)
+                .min()
+                .unwrap_or(end);
+            return CopyOnAccessSegment::Guest {
+                offset: addr - base,
+                len: next - addr,
+            };
+        };
+
+        let page_idx = (addr - range.host_addr) / range.page_size;
+        let page_end = (range.page_addr(page_idx) + range.page_size)
+            .min(range.host_addr + range.length)
+            .min(end);
+        let offset = addr - base;
+        let len = page_end - addr;
+        if self.served[range_idx].is_bit_set(page_idx as usize)
+            || page_present(range.page_addr(page_idx))
+        {
+            CopyOnAccessSegment::Guest { offset, len }
+        } else {
+            CopyOnAccessSegment::Source {
+                offset,
+                len,
+                source_offset: range.source_offset + (addr - range.host_addr),
+            }
+        }
     }
 }
 
@@ -1222,12 +1373,17 @@ impl MemoryManager {
     /// The handler thread keeps the snapshot file open while lazy restore
     /// is active. The file must remain available until the VM is shut down or
     /// all faulted pages have been served.
+    ///
+    /// With `copy_on_access`, nothing is copied in the background: a page is
+    /// copied only when first accessed, the handler serves faults until the
+    /// VM is shut down, and the snapshot file stays open for that long.
     fn restore_by_uffd(
         &mut self,
         file_path: &Path,
         saved_regions: &MemoryRangeTable,
         background_fetch_pages: bool,
         exit_evt: &EventFd,
+        copy_on_access: bool,
     ) -> Result<(), Error> {
         let mut file_offset: u64 = 0;
 
@@ -1262,6 +1418,24 @@ impl MemoryManager {
             })
             .collect();
 
+        if copy_on_access {
+            // No prefault, so holes stay unserved: a hole is then saved from
+            // the snapshot file (as a hole) rather than read through guest
+            // memory, which would fault it in.
+            self.spawn_uffd_handler(
+                uffd,
+                None,
+                served_bitmap.into(),
+                source,
+                exit_evt,
+                UffdServing::CopyOnAccess {
+                    source: snapshot_file,
+                },
+            )?;
+            info!("UFFD restore: copy-on-access restore enabled");
+            return Ok(());
+        }
+
         // For sparse files, we mark holes as served pages so we don't prefault them.
         for (range, served) in uffd.ranges().iter().zip(&served_bitmap) {
             let end = range.source_offset + range.length;
@@ -1284,10 +1458,12 @@ impl MemoryManager {
         self.spawn_uffd_handler(
             uffd,
             None,
-            served_bitmap,
+            served_bitmap.into(),
             source,
             exit_evt,
-            background_fetch_pages,
+            UffdServing::OnDemand {
+                background_fetch_pages,
+            },
         )?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
@@ -1333,10 +1509,12 @@ impl MemoryManager {
         self.spawn_uffd_handler(
             uffd,
             Some(socket_fd),
-            served_bitmap,
+            served_bitmap.into(),
             source,
             exit_evt,
-            background_fetch_pages,
+            UffdServing::OnDemand {
+                background_fetch_pages,
+            },
         )
     }
 
@@ -1435,15 +1613,32 @@ impl MemoryManager {
         &mut self,
         uffd: Uffd,
         fault_socket_fd: Option<OwnedFd>,
-        served_bitmap: Vec<AtomicBitmap>,
+        served_bitmap: Arc<[AtomicBitmap]>,
         source: Box<dyn UffdMemorySource>,
         exit_evt: &EventFd,
-        background_fetch_pages: bool,
+        serving: UffdServing,
     ) -> Result<(), Error> {
         info!(
             "UFFD: spawning handler for {} region(s)",
             uffd.ranges().len()
         );
+
+        let serve_lock = Arc::new(Mutex::new(()));
+        let (background_fetch_pages, private_zeroes, copy_on_access) = match serving {
+            UffdServing::OnDemand {
+                background_fetch_pages,
+            } => (background_fetch_pages, false, None),
+            UffdServing::CopyOnAccess { source } => (
+                false,
+                true,
+                Some(CopyOnAccessPages {
+                    source,
+                    ranges: uffd.ranges().into(),
+                    served: Arc::clone(&served_bitmap),
+                    serve_lock: Arc::clone(&serve_lock),
+                }),
+            ),
+        };
 
         let stop_event = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFdFail)?;
         let thread_stop_event = stop_event.try_clone().map_err(Error::EventFdFail)?;
@@ -1469,8 +1664,10 @@ impl MemoryManager {
                         &thread_exit_evt,
                         source,
                         served_bitmap,
+                        &serve_lock,
                         &ready_tx,
                         background_fetch_pages,
+                        private_zeroes,
                     );
 
                     if result.is_err() && thread_stop_event.read().is_ok() {
@@ -1509,6 +1706,7 @@ impl MemoryManager {
             handle,
             fault_socket_fd,
             uffd_registry,
+            copy_on_access,
         });
 
         Ok(())
@@ -1531,6 +1729,8 @@ impl MemoryManager {
         features
     }
 
+    /// Stop the UFFD handler, if any, and wait for it to exit, closing the
+    /// userfaultfd and the restore source.
     fn stop_uffd_handler(&mut self) {
         if let Some(uffd_handler) = self.uffd_handler.take() {
             uffd_handler.stop_event.write(1).ok();
@@ -1556,10 +1756,20 @@ impl MemoryManager {
     }
 
     /// True while an on-demand (UFFD) restore is still faulting in guest RAM.
+    /// A copy-on-access restore never completes and is not counted: its
+    /// snapshot writer saves the pages not faulted in from the restore source.
     pub fn restoring(&self) -> bool {
         self.uffd_handler
             .as_ref()
-            .is_some_and(|h| !h.uffd_registry.is_done())
+            .is_some_and(|h| h.copy_on_access.is_none() && !h.uffd_registry.is_done())
+    }
+
+    /// True when guest RAM was restored copy-on-access: part of it may still
+    /// be only in the snapshot it was restored from, for the VM's lifetime.
+    pub fn copy_on_access(&self) -> bool {
+        self.uffd_handler
+            .as_ref()
+            .is_some_and(|h| h.copy_on_access.is_some())
     }
 
     /// Poison a page that can no longer be restored. Exits if that's not
@@ -1591,15 +1801,22 @@ impl MemoryManager {
     ///
     /// A userfaultfd received with the id of an earlier one replaces it. Once
     /// all pages are present, `uffd_registry.done` is written.
-    #[expect(clippy::needless_pass_by_value)]
+    ///
+    /// With `private_zeroes`, a page faulted again after a discard is
+    /// resolved with a zeroed private copy rather than the zero page every
+    /// process shares. `serve_lock` is held while a fault is resolved and
+    /// its served bit updated.
+    #[expect(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     fn uffd_handler_loop(
         uffd_registry: &UffdRegistry,
         stop_event: &EventFd,
         exit_evt: &EventFd,
         mut source: Box<dyn UffdMemorySource>,
-        served_bitmap: Vec<AtomicBitmap>,
+        served_bitmap: Arc<[AtomicBitmap]>,
+        serve_lock: &Mutex<()>,
         ready_tx: &SyncSender<()>,
         background_fetch_pages: bool,
+        private_zeroes: bool,
     ) -> Result<(), io::Error> {
         let mut uffds = uffd_registry.drain_added_uffds();
         assert!(!uffds.is_empty());
@@ -1784,6 +2001,11 @@ impl MemoryManager {
                     continue;
                 }
 
+                // Held until the page is installed and its served bit says
+                // so, so that the snapshot writer never sees a page whose bit
+                // and content disagree.
+                let _serve_guard = serve_lock.lock().unwrap();
+
                 // A missing fault on a served page is either a discard, or a
                 // fault queued on another userfaultfd while the page was
                 // being resolved. Only the latter leaves the page present.
@@ -1844,15 +2066,24 @@ impl MemoryManager {
 
                 if discarded {
                     let page_addr = range.page_addr(page_idx);
-                    match uffd::zeropage(fault_uffd.fd(), page_addr, range.page_size) {
-                        // hugetlbfs does not support UFFDIO_ZEROPAGE.
-                        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => uffd::copy(
+                    let copy_zeroes = || {
+                        uffd::copy(
                             fault_uffd.fd(),
                             page_addr,
                             zero_buf.as_ptr(),
                             range.page_size,
-                        ),
-                        result => result,
+                        )
+                    };
+                    if private_zeroes {
+                        // UFFDIO_ZEROPAGE would map the zero page every
+                        // process shares: copy, so the page is the VM's own.
+                        copy_zeroes()
+                    } else {
+                        match uffd::zeropage(fault_uffd.fd(), page_addr, range.page_size) {
+                            // hugetlbfs does not support UFFDIO_ZEROPAGE.
+                            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => copy_zeroes(),
+                            result => result,
+                        }
                     }
                     .or_else(|e| {
                         if e.raw_os_error() == Some(libc::EEXIST) {
@@ -2575,9 +2806,15 @@ impl MemoryManager {
             )?;
 
             if !mem_snapshot.memory_ranges.is_empty() {
+                let memory_restore_mode = effective_restore_mode(
+                    memory_restore_mode,
+                    &mm.lock().unwrap().memory_zones,
+                    &mem_snapshot.memory_ranges,
+                );
                 match memory_restore_mode {
                     MemoryRestoreMode::OnDemand
-                    | MemoryRestoreMode::OnDemandNoBackgroundFetchPages => {
+                    | MemoryRestoreMode::OnDemandNoBackgroundFetchPages
+                    | MemoryRestoreMode::CopyOnAccess => {
                         let background_fetch_pages =
                             memory_restore_mode == MemoryRestoreMode::OnDemand;
                         mm.lock().unwrap().restore_by_uffd(
@@ -2585,6 +2822,7 @@ impl MemoryManager {
                             &mem_snapshot.memory_ranges,
                             background_fetch_pages,
                             exit_evt,
+                            memory_restore_mode == MemoryRestoreMode::CopyOnAccess,
                         )?;
                     }
                     MemoryRestoreMode::CopyOnWrite => mm
@@ -3871,41 +4109,30 @@ impl Transportable for MemoryManager {
         // write path which never writes past the growing EOF.
         let sparse_layout = memory_file.set_len(total_len).is_ok();
 
+        let copy_on_access = self
+            .uffd_handler
+            .as_ref()
+            .and_then(|h| h.copy_on_access.as_ref());
         let mut file_cursor: u64 = 0;
 
         for range in self.snapshot_memory_ranges.ranges() {
-            let mut wrote_sparse = false;
-            if sparse_layout
-                && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
-                && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
-                && let Some(file_offset) = region.file_offset()
-            {
-                let region_base = region.start_addr().raw_value();
-                let in_fd_off = file_offset.start()
-                    + range
-                        .gpa
-                        .checked_sub(region_base)
-                        .expect("range outside its region");
-                wrote_sparse = write_region_sparse(
-                    file_offset.file(),
-                    in_fd_off,
-                    &memory_file,
-                    file_cursor,
-                    range.length,
-                )
-                .context("Error writing sparse memory snapshot region")
-                .map_err(MigratableError::MigrateSend)?;
-            }
-
-            if !wrote_sparse {
-                // Dense fallback: anonymous mmap or hugetlbfs (no
-                // SEEK_HOLE).
-                write_guest_range(
+            if let Some(pages) = copy_on_access {
+                save_copy_on_access_range(
                     &guest_memory,
+                    pages,
+                    range,
                     &mut memory_file,
                     file_cursor,
+                    sparse_layout,
+                )?;
+            } else {
+                save_guest_range(
+                    &guest_memory,
                     range.gpa,
                     range.length,
+                    &mut memory_file,
+                    file_cursor,
+                    sparse_layout,
                 )?;
             }
 
@@ -3915,6 +4142,116 @@ impl Transportable for MemoryManager {
         debug_assert_eq!(file_cursor, total_len);
         Ok(())
     }
+}
+
+/// Save `len` bytes of guest memory at `gpa` to `memory_file` at
+/// `file_cursor`, reading a shared file-backed region's backing file and
+/// anything else through the guest mapping.
+fn save_guest_range(
+    guest_memory: &GuestMemory,
+    gpa: u64,
+    len: u64,
+    memory_file: &mut File,
+    file_cursor: u64,
+    sparse_layout: bool,
+) -> result::Result<(), MigratableError> {
+    let mut wrote_sparse = false;
+    if sparse_layout
+        && let Some(region) = guest_memory.find_region(GuestAddress(gpa))
+        && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
+        && let Some(file_offset) = region.file_offset()
+    {
+        let region_base = region.start_addr().raw_value();
+        let in_fd_off = file_offset.start()
+            + gpa
+                .checked_sub(region_base)
+                .expect("range outside its region");
+        wrote_sparse =
+            write_region_sparse(file_offset.file(), in_fd_off, memory_file, file_cursor, len)
+                .context("Error writing sparse memory snapshot region")
+                .map_err(MigratableError::MigrateSend)?;
+    }
+
+    if !wrote_sparse {
+        // Dense fallback: anonymous mmap or hugetlbfs (no
+        // SEEK_HOLE).
+        write_guest_range(guest_memory, memory_file, file_cursor, gpa, len)?;
+    }
+    Ok(())
+}
+
+/// Save `range` of a copy-on-access VM's memory to `memory_file` at
+/// `file_cursor`. A page the guest never accessed is copied from the restore
+/// source, not read through the guest mapping, where reading it would copy
+/// it into the VM. A shared region's backing file only holds the pages that
+/// were served, so it cannot be read on its own either.
+fn save_copy_on_access_range(
+    guest_memory: &GuestMemory,
+    pages: &CopyOnAccessPages,
+    range: &MemoryRange,
+    memory_file: &mut File,
+    file_cursor: u64,
+    sparse_layout: bool,
+) -> result::Result<(), MigratableError> {
+    // The segments are found by host address, so the range must be in one
+    // mapping.
+    guest_memory
+        .find_region(GuestAddress(range.gpa))
+        .filter(|region| range.gpa + range.length <= region.start_addr().raw_value() + region.len())
+        .ok_or_else(|| {
+            MigratableError::MigrateSend(anyhow!(
+                "Memory range {:#x}+{:#x} is not inside one guest memory region",
+                range.gpa,
+                range.length
+            ))
+        })?;
+    let host_addr = guest_memory
+        .get_host_address(GuestAddress(range.gpa))
+        .map_err(|e| MigratableError::MigrateSend(anyhow!(e)))? as u64;
+
+    // A part is copied from the source with `serve_lock` held, so that the
+    // handler cannot install any of it meanwhile. Guest memory is read with
+    // it released: reading a discarded page faults, and the handler needs
+    // the lock to resolve that fault.
+    let page_present = |addr: u64| uffd::page_present(addr).unwrap_or(true);
+    let mut done: u64 = 0;
+    while done < range.length {
+        let serve_guard = pages.serve_lock.lock().unwrap();
+        let segment = pages.next_segment(host_addr + done, range.length - done, &page_present);
+        let segment_end = segment.end();
+        match segment {
+            CopyOnAccessSegment::Source {
+                offset,
+                len,
+                source_offset,
+            } => {
+                let dst_offset = file_cursor + done + offset;
+                if sparse_layout {
+                    copy_region(&pages.source, source_offset, memory_file, dst_offset, len)
+                } else {
+                    copy_region_dense(&pages.source, source_offset, memory_file, dst_offset, len)
+                }
+                .context("Error copying unaccessed memory from the restore source")
+                .map_err(MigratableError::MigrateSend)?;
+                drop(serve_guard);
+            }
+            CopyOnAccessSegment::Guest { offset, len } => {
+                // Served or present. A page discarded since faults back in
+                // as zeroes, which is what a discarded page holds.
+                drop(serve_guard);
+                save_guest_range(
+                    guest_memory,
+                    range.gpa + done + offset,
+                    len,
+                    memory_file,
+                    file_cursor + done + offset,
+                    sparse_layout,
+                )?;
+            }
+        }
+        done += segment_end;
+    }
+    Ok(())
 }
 
 impl Migratable for MemoryManager {
@@ -4093,6 +4430,25 @@ fn saved_ranges_in_virtio_mem(
         .map(|v| (v.region.start_addr().raw_value(), v.region.len()))
         .collect();
     saved_ranges_overlap(saved_regions, &windows)
+}
+
+// The mode a restore in `mode` uses. Copy-on-access falls back to the eager
+// copy when a saved range lies in a virtio-mem region, for the reason
+// copy-on-write does: a block discarded before it is touched again would
+// read back the snapshot's content instead of zeroes, as the handler does
+// not see a discard of a page that is not in memory.
+fn effective_restore_mode(
+    mode: MemoryRestoreMode,
+    memory_zones: &MemoryZones,
+    saved_regions: &MemoryRangeTable,
+) -> MemoryRestoreMode {
+    if mode == MemoryRestoreMode::CopyOnAccess
+        && saved_ranges_in_virtio_mem(memory_zones, saved_regions)
+    {
+        info!("Restore (mode=copyonaccess): plugged virtio-mem blocks, falling back to copy");
+        return MemoryRestoreMode::Copy;
+    }
+    mode
 }
 
 // Whether any saved range overlaps one of the `(start, len)` GPA windows.
@@ -4576,6 +4932,39 @@ mod tests {
         assert!(saved_ranges_in_virtio_mem(&zones, &table));
     }
 
+    #[test]
+    fn copy_on_access_falls_back_for_saved_ranges_in_virtio_mem_zone() {
+        const MIB: u64 = 1 << 20;
+        let (_gm, zones) = restore_zone_with_virtio_mem();
+        // Nothing plugged: copy-on-access applies.
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        assert_eq!(
+            effective_restore_mode(MemoryRestoreMode::CopyOnAccess, &zones, &table),
+            MemoryRestoreMode::CopyOnAccess
+        );
+        // A block still plugged at snapshot time: fall back to copy. The
+        // other modes are left alone.
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        assert_eq!(
+            effective_restore_mode(MemoryRestoreMode::CopyOnAccess, &zones, &table),
+            MemoryRestoreMode::Copy
+        );
+        for mode in [
+            MemoryRestoreMode::Copy,
+            MemoryRestoreMode::OnDemand,
+            MemoryRestoreMode::CopyOnWrite,
+        ] {
+            assert_eq!(effective_restore_mode(mode, &zones, &table), mode);
+        }
+    }
+
     // A snapshot memory file holding `chunks` of (byte, length) in order.
     fn snapshot_file(chunks: &[(u8, u64)]) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -4779,5 +5168,543 @@ mod tests {
             do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
             assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xcd);
         }
+    }
+
+    #[test]
+    fn copy_on_access_segments_follow_served_pages() {
+        let page = get_page_size();
+        // Two UFFD ranges with a gap between them, the second one restored
+        // from further into the snapshot.
+        let ranges = [
+            UffdRange {
+                host_addr: 0x10_0000,
+                length: 4 * page,
+                source_offset: 0,
+                page_size: page,
+            },
+            UffdRange {
+                host_addr: 0x10_0000 + 6 * page,
+                length: 2 * page,
+                source_offset: 4 * page,
+                page_size: page,
+            },
+        ];
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
+        served[0].set_bit(1);
+        served[0].set_bit(2);
+        let pages = CopyOnAccessPages {
+            source: tempfile::tempfile().unwrap(),
+            ranges: Box::new(ranges),
+            served,
+            serve_lock: Arc::new(Mutex::new(())),
+        };
+        // Every segment of the window, as the snapshot writer walks it.
+        let segments = |host_addr: u64, len: u64, present: &dyn Fn(u64) -> bool| {
+            let mut out = Vec::new();
+            let mut done = 0;
+            while done < len {
+                let segment = pages.next_segment(host_addr + done, len - done, &present);
+                let end = segment.end();
+                out.push(match segment {
+                    CopyOnAccessSegment::Guest { offset, len } => CopyOnAccessSegment::Guest {
+                        offset: done + offset,
+                        len,
+                    },
+                    CopyOnAccessSegment::Source {
+                        offset,
+                        len,
+                        source_offset,
+                    } => CopyOnAccessSegment::Source {
+                        offset: done + offset,
+                        len,
+                        source_offset,
+                    },
+                });
+                done += end;
+            }
+            out
+        };
+        let absent = |_: u64| false;
+
+        // From one page before the first range to one page after the last.
+        let start = 0x10_0000 - page;
+        assert_eq!(
+            segments(start, 10 * page, &absent),
+            vec![
+                CopyOnAccessSegment::Guest {
+                    offset: 0,
+                    len: page,
+                },
+                CopyOnAccessSegment::Source {
+                    offset: page,
+                    len: page,
+                    source_offset: 0,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: 2 * page,
+                    len: 2 * page,
+                },
+                // The last page of the first range, not merged with the
+                // second range: their source offsets are not contiguous.
+                CopyOnAccessSegment::Source {
+                    offset: 4 * page,
+                    len: page,
+                    source_offset: 3 * page,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: 5 * page,
+                    len: 2 * page,
+                },
+                CopyOnAccessSegment::Source {
+                    offset: 7 * page,
+                    len: 2 * page,
+                    source_offset: 4 * page,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: 9 * page,
+                    len: page,
+                },
+            ]
+        );
+
+        // A page never served but present is in guest memory.
+        let page3 = 0x10_0000 + 3 * page;
+        assert_eq!(
+            segments(start, 10 * page, &|addr| addr == page3),
+            vec![
+                CopyOnAccessSegment::Guest {
+                    offset: 0,
+                    len: page,
+                },
+                CopyOnAccessSegment::Source {
+                    offset: page,
+                    len: page,
+                    source_offset: 0,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: 2 * page,
+                    len: 5 * page,
+                },
+                CopyOnAccessSegment::Source {
+                    offset: 7 * page,
+                    len: 2 * page,
+                    source_offset: 4 * page,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: 9 * page,
+                    len: page,
+                },
+            ]
+        );
+
+        // A window inside one range, starting mid-page.
+        assert_eq!(
+            segments(0x10_0000 + page / 2, page, &absent),
+            vec![
+                CopyOnAccessSegment::Source {
+                    offset: 0,
+                    len: page / 2,
+                    source_offset: page / 2,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: page / 2,
+                    len: page / 2,
+                },
+            ]
+        );
+    }
+
+    // Guest memory of `len` bytes at 0: private anonymous, or a shared memfd
+    // like `shared=on`.
+    fn test_guest_memory(shared: bool, len: u64) -> GuestMemory {
+        if !shared {
+            return GuestMemory::from_ranges(&[(GuestAddress(0), len as usize)]).unwrap();
+        }
+        // SAFETY: the name is a valid NUL-terminated string.
+        let fd = unsafe { libc::memfd_create(c"coa-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: memfd_create returned a new fd we own.
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(len).unwrap();
+        let region = MmapRegion::build(
+            Some(FileOffset::new(file, 0)),
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+        )
+        .unwrap();
+        GuestMemory::from_regions(vec![GuestRegion::from(
+            vm_memory::GuestRegionMmap::new(region, GuestAddress(0)).unwrap(),
+        )])
+        .unwrap()
+    }
+
+    // What the balloon does to a released page: punch a hole in a shared
+    // backing file, otherwise MADV_DONTNEED.
+    fn release(gm: &GuestMemory, gpa: u64, len: u64) {
+        let region = gm.find_region(GuestAddress(gpa)).unwrap();
+        match region.file_offset() {
+            Some(f_off) if region.flags() & libc::MAP_SHARED != 0 => {
+                // SAFETY: punches a hole in the memfd backing this region.
+                let ret = unsafe {
+                    libc::fallocate64(
+                        f_off.file().as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        (f_off.start() + gpa) as libc::off64_t,
+                        len as libc::off64_t,
+                    )
+                };
+                assert_eq!(ret, 0);
+            }
+            _ => discard(gm, gpa, len),
+        }
+    }
+
+    // A userfaultfd with all of `gm` registered for missing faults, or None
+    // when this host does not let the test create one.
+    fn register_uffd(gm: &GuestMemory) -> Option<Uffd> {
+        let fd = match uffd::create(userfaultfd::UFFD_FEATURE_MISSING_SHMEM) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!("skipping: cannot create a userfaultfd: {e}");
+                return None;
+            }
+        };
+        let page = get_page_size();
+        let mut ranges = Vec::new();
+        let mut source_offset = 0;
+        for region in gm.iter() {
+            let host_addr = region.as_ptr() as u64;
+            let length = region.len();
+            uffd::register(fd.as_fd(), host_addr, length, false).unwrap();
+            ranges.push(UffdRange {
+                host_addr,
+                length,
+                source_offset,
+                page_size: page,
+            });
+            source_offset += length;
+        }
+        Some(Uffd::new(fd, ranges.into(), Box::new([])).unwrap())
+    }
+
+    fn gpa_present(gm: &GuestMemory, gpa: u64) -> bool {
+        uffd::page_present(gm.get_host_address(GuestAddress(gpa)).unwrap() as u64).unwrap()
+    }
+
+    // Whether the page at `gpa` is mapped by this mapping alone
+    // (PM_MMAP_EXCLUSIVE). The zero page every process shares never is.
+    fn gpa_exclusive(gm: &GuestMemory, gpa: u64) -> bool {
+        use std::os::unix::fs::FileExt;
+
+        let addr = gm.get_host_address(GuestAddress(gpa)).unwrap() as u64;
+        let mut entry = [0u8; 8];
+        File::open("/proc/self/pagemap")
+            .unwrap()
+            .read_exact_at(&mut entry, addr / get_page_size() * 8)
+            .unwrap();
+        u64::from_ne_bytes(entry) & (1 << 56) != 0
+    }
+
+    // A UFFD handler serving `file` into `gm` without background fill, as a
+    // copy-on-access restore runs it when `private_zeroes`.
+    struct TestHandler {
+        stop: EventFd,
+        _exit: EventFd,
+        registry: Arc<UffdRegistry>,
+        handle: thread::JoinHandle<Result<(), io::Error>>,
+    }
+
+    impl TestHandler {
+        fn spawn(
+            uffd: Uffd,
+            file: File,
+            served: Arc<[AtomicBitmap]>,
+            private_zeroes: bool,
+        ) -> Self {
+            Self::spawn_with(
+                uffd,
+                Box::new(FileUffdMemorySource::new(file)),
+                served,
+                Arc::new(Mutex::new(())),
+                private_zeroes,
+            )
+        }
+
+        fn spawn_with(
+            uffd: Uffd,
+            source: Box<dyn UffdMemorySource>,
+            served: Arc<[AtomicBitmap]>,
+            serve_lock: Arc<Mutex<()>>,
+            private_zeroes: bool,
+        ) -> Self {
+            let stop = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let exit = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let registry = Arc::new(UffdRegistry {
+                ranges: uffd.ranges().into(),
+                added_uffds: Mutex::new(vec![(VMM_UFFD_ID.to_string(), uffd)]),
+                added_uffd_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                done: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            });
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let (thread_stop, thread_exit) = (stop.try_clone().unwrap(), exit.try_clone().unwrap());
+            let thread_registry = Arc::clone(&registry);
+            let handle = thread::spawn(move || {
+                MemoryManager::uffd_handler_loop(
+                    &thread_registry,
+                    &thread_stop,
+                    &thread_exit,
+                    source,
+                    served,
+                    &serve_lock,
+                    &ready_tx,
+                    false,
+                    private_zeroes,
+                )
+            });
+            ready_rx.recv().unwrap();
+            Self {
+                stop,
+                _exit: exit,
+                registry,
+                handle,
+            }
+        }
+
+        fn stop(self) {
+            assert!(!self.handle.is_finished(), "handler exited on its own");
+            assert!(!self.registry.is_done());
+            self.stop.write(1).unwrap();
+            self.handle.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn copy_on_access_handler_copies_only_accessed_pages() {
+        check_copy_on_access_handler(false);
+    }
+
+    #[test]
+    fn copy_on_access_handler_copies_only_accessed_pages_shared() {
+        check_copy_on_access_handler(true);
+    }
+
+    fn check_copy_on_access_handler(shared: bool) {
+        use std::os::unix::fs::FileExt;
+
+        let page = get_page_size();
+        let gm = test_guest_memory(shared, 4 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let ranges: Box<[UffdRange]> = uffd.ranges().into();
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
+        let file = snapshot_file(&[(0xa0, page), (0xa1, page), (0xa2, page), (0xa3, page)]);
+        let handler = TestHandler::spawn(uffd, file.reopen().unwrap(), Arc::clone(&served), true);
+
+        // Nothing is copied until it is accessed.
+        thread::sleep(time::Duration::from_millis(100));
+        for gpa in (0..4).map(|i| i * page) {
+            assert!(!gpa_present(&gm, gpa));
+        }
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0xa1);
+        assert!(gpa_present(&gm, page));
+        assert!(served[0].is_bit_set(1));
+        thread::sleep(time::Duration::from_millis(100));
+        for gpa in [0, 2 * page, 3 * page] {
+            assert!(!gpa_present(&gm, gpa));
+        }
+
+        // A discarded page comes back as zeroes, not as the snapshot's copy.
+        gm.write_obj::<u8>(0x5a, GuestAddress(page)).unwrap();
+        release(&gm, page, page);
+        assert!(!gpa_present(&gm, page));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0);
+        assert!(gpa_present(&gm, page));
+        // As a private copy, not the zero page every process shares.
+        assert!(gpa_exclusive(&gm, page));
+
+        // A written page keeps the guest's data.
+        gm.write_obj::<u8>(0x77, GuestAddress(2 * page)).unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(2 * page + 1)).unwrap(), 0xa2);
+
+        // Saving copies the untouched pages from the restore source and
+        // leaves them out of guest memory.
+        let pages = CopyOnAccessPages {
+            source: file.reopen().unwrap(),
+            ranges,
+            served: Arc::clone(&served),
+            serve_lock: Arc::new(Mutex::new(())),
+        };
+        let range = MemoryRange {
+            gpa: 0,
+            length: 4 * page,
+        };
+        // Without a pre-sized destination, served pages are read through the
+        // guest mapping whatever the backing.
+        let check_saved = |sparse_layout: bool| {
+            let mut saved = tempfile::tempfile().unwrap();
+            if sparse_layout {
+                saved.set_len(4 * page).unwrap();
+            }
+            save_copy_on_access_range(&gm, &pages, &range, &mut saved, 0, sparse_layout).unwrap();
+            let mut content = vec![0u8; (4 * page) as usize];
+            saved.read_exact_at(&mut content, 0).unwrap();
+            let byte = |gpa: u64| content[gpa as usize];
+            assert_eq!(byte(0), 0xa0);
+            assert_eq!(byte(page - 1), 0xa0);
+            assert_eq!(byte(page), 0);
+            assert_eq!(byte(2 * page), 0x77);
+            assert_eq!(byte(2 * page + 1), 0xa2);
+            assert_eq!(byte(3 * page), 0xa3);
+            assert_eq!(byte(4 * page - 1), 0xa3);
+            assert!(!gpa_present(&gm, 0));
+            assert!(!gpa_present(&gm, 3 * page));
+        };
+        check_saved(true);
+        check_saved(false);
+
+        // A page released again and not touched since is saved as zeroes.
+        // A shared backing file has the hole; private memory faults it back.
+        release(&gm, page, page);
+        check_saved(true);
+        assert_eq!(gpa_present(&gm, page), !shared);
+        check_saved(false);
+
+        // A page written to the backing file without a fault is present, so
+        // it is saved from guest memory even though it was never served.
+        if shared {
+            let region = gm.find_region(GuestAddress(0)).unwrap();
+            let backing = region.file_offset().unwrap().file();
+            backing.write_all_at(&[0x99], 3 * page).unwrap();
+            assert!(!served[0].is_bit_set(3));
+            let mut saved = tempfile::tempfile().unwrap();
+            saved.set_len(4 * page).unwrap();
+            save_copy_on_access_range(&gm, &pages, &range, &mut saved, 0, true).unwrap();
+            let mut byte = [0u8; 2];
+            saved.read_exact_at(&mut byte, 3 * page).unwrap();
+            assert_eq!(byte, [0x99, 0]);
+        }
+
+        handler.stop();
+    }
+
+    // A source that waits for the test's go before resolving each page.
+    struct GatedSource {
+        inner: FileUffdMemorySource,
+        entered: mpsc::Sender<()>,
+        go: mpsc::Receiver<()>,
+    }
+
+    impl UffdMemorySource for GatedSource {
+        fn resolve(
+            &mut self,
+            uffd_fd: BorrowedFd<'_>,
+            range: &UffdRange,
+            page_idx: u64,
+        ) -> Result<(), io::Error> {
+            self.entered.send(()).unwrap();
+            self.go.recv().unwrap();
+            self.inner.resolve(uffd_fd, range, page_idx)
+        }
+
+        fn requires_uffd_minor_mode(&self) -> bool {
+            false
+        }
+    }
+
+    // The snapshot writer must not decide where a page's content is while
+    // the handler is resolving it: before the served bit is set, the page
+    // would look untouched and be saved from the restore source.
+    #[test]
+    fn copy_on_access_save_waits_for_page_being_served() {
+        use std::os::unix::fs::FileExt;
+
+        let page = get_page_size();
+        let gm = Arc::new(test_guest_memory(false, 2 * page));
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let ranges: Box<[UffdRange]> = uffd.ranges().into();
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
+        let serve_lock = Arc::new(Mutex::new(()));
+        // The handler serves 0xc0/0xc1. The writer's restore source holds
+        // 0xee, so a page saved from it is told apart.
+        let served_file = snapshot_file(&[(0xc0, page), (0xc1, page)]);
+        let restore_source = snapshot_file(&[(0xee, 2 * page)]);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let handler = TestHandler::spawn_with(
+            uffd,
+            Box::new(GatedSource {
+                inner: FileUffdMemorySource::new(served_file.reopen().unwrap()),
+                entered: entered_tx,
+                go: go_rx,
+            }),
+            Arc::clone(&served),
+            Arc::clone(&serve_lock),
+            true,
+        );
+
+        // A vCPU faults on page 1 and the handler starts resolving it.
+        let vcpu_gm = Arc::clone(&gm);
+        let vcpu = thread::spawn(move || vcpu_gm.read_obj::<u8>(GuestAddress(page)).unwrap());
+        entered_rx.recv().unwrap();
+
+        // The writer starts meanwhile, and must wait.
+        let pages = CopyOnAccessPages {
+            source: restore_source.reopen().unwrap(),
+            ranges,
+            served: Arc::clone(&served),
+            serve_lock,
+        };
+        let writer_gm = Arc::clone(&gm);
+        let (saved_tx, saved_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let mut saved = tempfile::tempfile().unwrap();
+            saved.set_len(2 * page).unwrap();
+            let range = MemoryRange {
+                gpa: 0,
+                length: 2 * page,
+            };
+            save_copy_on_access_range(&writer_gm, &pages, &range, &mut saved, 0, true).unwrap();
+            saved_tx.send(()).unwrap();
+            saved
+        });
+        thread::sleep(time::Duration::from_millis(100));
+        assert!(saved_rx.try_recv().is_err(), "writer did not wait");
+
+        go_tx.send(()).unwrap();
+        assert_eq!(vcpu.join().unwrap(), 0xc1);
+        let saved = writer.join().unwrap();
+        let mut content = vec![0u8; (2 * page) as usize];
+        saved.read_exact_at(&mut content, 0).unwrap();
+        // Page 0 was never touched; page 1 is what the handler installed.
+        assert_eq!(content[0], 0xee);
+        assert_eq!(content[page as usize], 0xc1);
+        assert!(!gpa_present(&gm, 0));
+
+        handler.stop();
+    }
+
+    // Without `private_zeroes` (ondemand), a discarded page is resolved with
+    // the zero page every process shares, which copy-on-access avoids.
+    #[test]
+    fn on_demand_handler_serves_discarded_pages_as_zero_page() {
+        let page = get_page_size();
+        let gm = GuestMemory::from_ranges(&[(GuestAddress(0), (2 * page) as usize)]).unwrap();
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        let file = snapshot_file(&[(0xb0, page), (0xb1, page)]);
+        let handler = TestHandler::spawn(uffd, file.reopen().unwrap(), served, false);
+
+        gm.write_obj::<u8>(0x5a, GuestAddress(0)).unwrap();
+        discard(&gm, 0, page);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0);
+        assert!(!gpa_exclusive(&gm, 0));
+
+        handler.stop();
     }
 }

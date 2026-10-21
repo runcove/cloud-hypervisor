@@ -241,6 +241,74 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   page-cache sharing is lost for that VM and host memory use grows to the
   eager-copy level. The same applies to `ondemand` restores.
 
+### Copy-on-access restore
+
+With `memory_restore_mode=copyonaccess`, restore uses `userfaultfd` exactly as
+`ondemand` does, but never copies the rest of the snapshot in the background:
+a page is copied into the VM's own memory only when the guest (or a device, or
+KVM on its behalf) first accesses it, for the VM's whole lifetime. VMs restored
+from the same snapshot therefore share no guest memory page, unlike
+`copyonwrite`, while each VM uses host memory only for the pages it touched.
+This works with `shared=on` memory as well as private memory.
+
+`ondemand_no_background_fetch_pages` also skips the background copy. The
+differences are the ones below that keep pages private (a discarded page gets
+a zeroed copy of its own, not the zero page every process shares; KSM is
+refused), and that a copy-on-access VM is not left "restoring": it can be
+snapshotted.
+
+It has every constraint of `ondemand`, and:
+
+- The snapshot memory file must remain on disk **and unchanged** for the
+  entire lifetime of the VM: the handler keeps it open and reads a page from it
+  whenever the guest first touches that page, however late. A read error is a
+  controlled VM exit, with the unrestored memory poisoned.
+- `mergeable=on` (KSM), globally or in any zone, is rejected: KSM would merge
+  the pages this mode keeps private. Only that option is checked: keeping KSM
+  off for a Cloud Hypervisor process that inherits
+  `prctl(PR_SET_MEMORY_MERGE)` from whatever started it is the operator's
+  responsibility.
+- Only the saved memory ranges are handled by `userfaultfd`. Guest RAM outside
+  them (memory the snapshot did not save, or memory hot-plugged later) is
+  ordinary memory: in private RAM, a page there that the guest reads before
+  writing maps the kernel's shared zero page. That page holds no data of any
+  VM, so sharing it is accepted.
+- If any saved memory range lies inside a virtio-mem region (a block still
+  plugged when the snapshot was taken), the whole restore falls back to the
+  eager copy (logged), as `copyonwrite` does: a block unplugged before it was
+  touched and later plugged again would otherwise read back the snapshot's old
+  content instead of zeroes. With nothing plugged, the virtio-mem region has no
+  saved ranges and copy-on-access applies; memory can be plugged and unplugged
+  normally after the restore.
+- A page the guest discards after touching it (balloon inflation, free page
+  reporting, virtio-mem unplug) reads back as zeroes when touched again, as
+  after an eager-copy restore.
+- A page outside virtio-mem that the guest discards before ever touching it
+  (balloon inflation, free page reporting) is not zeroed: Cloud Hypervisor does
+  not see a discard of a page that is not in memory. It reads back the
+  snapshot's content when first touched, as with `ondemand` before its
+  background copy reaches it, and a later snapshot of the VM saves that
+  content too.
+- Snapshotting the VM is supported and does not copy the pages the guest never
+  touched into it: those are copied from the snapshot it was restored from. The
+  new snapshot is complete and can be restored in any mode. Pages that were
+  touched and then discarded are faulted back in as zeroes while the snapshot is
+  written, unless guest memory is `shared=on` without hugepages.
+- Live and local migration are rejected: they do not read the restore source.
+- vhost-user backends are served by the same handler for the VM's whole
+  lifetime, as during an `ondemand` restore, so the limits `ondemand` has only
+  until its background copy completes last as long as the VM: every
+  vhost-user backend, including one hot-plugged later, must support
+  `VHOST_USER_PROTOCOL_F_PAGEFAULT`; a backend that disconnects cannot
+  reconnect (the device stays disconnected); and adding a memory region (ACPI
+  memory hot-plug) is refused while the VM has a vhost-user device.
+- vfio-user devices are rejected, at restore and on hot-plug: the vfio-user
+  server maps guest memory in its own process, where the handler does not
+  serve it, so a page the guest never touched would read as zeroes there.
+- A device that is hot-plugged after the restore and pins guest memory (VFIO,
+  vDPA) accesses every page, so the VM ends up using as much memory as an
+  eager copy.
+
 ## Restore a VM with new external FDs
 
 For a VM created with FDs explicitly passed to `NetConfig`, replacement FDs

@@ -197,6 +197,11 @@ pub enum Error {
     #[error("VM on-demand memory restore is still in progress")]
     VmRestoring,
 
+    #[error(
+        "A vfio-user device cannot be added to a VM restored with memory_restore_mode=copyonaccess"
+    )]
+    UserDeviceWithCopyOnAccess,
+
     #[error("Cannot clone EventFd")]
     EventFdClone(#[source] io::Error),
 
@@ -2841,6 +2846,10 @@ impl Vm {
 
     pub fn restoring(&self) -> bool {
         self.memory_manager.lock().unwrap().restoring()
+    }
+
+    pub fn copy_on_access(&self) -> bool {
+        self.memory_manager.lock().unwrap().copy_on_access()
     }
 
     pub fn device_tree(&self) -> Arc<Mutex<DeviceTree>> {
