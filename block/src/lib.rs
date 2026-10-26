@@ -34,7 +34,8 @@ use formats::qcow;
 #[cfg(feature = "io_uring")]
 use io_uring::{IoUring, Probe, opcode};
 use libc::{
-    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, S_IFBLK, S_IFMT, ioctl,
+    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, S_IFBLK, S_IFMT, S_IFREG,
+    ioctl,
 };
 use log::{debug, info, warn};
 pub use request::{ExecuteAsync, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType};
@@ -316,6 +317,90 @@ pub(crate) fn is_block_device(fd: RawFd) -> bool {
     ret == 0 && stat.st_mode & S_IFMT == S_IFBLK
 }
 
+// The libc crate does not expose statx / STATX_DIOALIGN on all targets, for
+// example musl, so define the constants locally and invoke the syscall
+// directly.
+const STATX_DIOALIGN: u32 = 0x2000;
+const STATX_DIO_READ_ALIGN: u32 = 0x2_0000;
+const XFS_SUPER_MAGIC: u32 = 0x5846_5342;
+
+/// Direct I/O alignment of an O_DIRECT fd, in bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DirectIoAlignment {
+    /// Alignment of every request offset, length and buffer address
+    /// submitted to the fd, advertised to the guest as the logical block
+    /// size. Never below the kernel's memory alignment.
+    pub(crate) submit: u64,
+    /// Alignment at which the filesystem needs no internal fallback,
+    /// advertised to the guest as the physical block and minimum I/O
+    /// size. Never below `submit`.
+    pub(crate) physical: u64,
+}
+
+impl DirectIoAlignment {
+    const DEFAULT: Self = Self {
+        submit: SECTOR_SIZE,
+        physical: SECTOR_SIZE,
+    };
+
+    /// Derives the alignment from `statx(STATX_DIOALIGN |
+    /// STATX_DIO_READ_ALIGN)` results, or `None` when the kernel reported no
+    /// direct I/O alignment.
+    ///
+    /// The submission alignment is `max(mem_align, offset_align)`, except on
+    /// XFS regular files whose reported read offset alignment is smaller than
+    /// the offset alignment (Linux >= 6.14 on filesystems whose block is
+    /// larger than the device sector, e.g. with reflink): XFS then also
+    /// accepts direct writes at the read alignment, handling sub-block writes
+    /// internally under its own locking, so `max(mem_align,
+    /// read_offset_align)` is used and the offset alignment is only
+    /// advertised as the physical block size.
+    fn from_statx(
+        xfs_regular_file: bool,
+        mask: u32,
+        mem_align: u32,
+        offset_align: u32,
+        read_offset_align: u32,
+    ) -> Option<Self> {
+        if mask & STATX_DIOALIGN == 0 || mem_align == 0 {
+            return None;
+        }
+
+        let physical = u64::from(cmp::max(mem_align, offset_align));
+        let submit = if xfs_regular_file
+            && mask & STATX_DIO_READ_ALIGN != 0
+            && read_offset_align != 0
+            && read_offset_align < offset_align
+        {
+            u64::from(cmp::max(mem_align, read_offset_align))
+        } else {
+            physical
+        };
+
+        Some(Self { submit, physical })
+    }
+}
+
+/// Returns `true` iff `fd` is a regular file on XFS.
+fn is_xfs_regular_file(fd: RawFd) -> bool {
+    // SAFETY: `libc::stat` is POD; zero-initialization is a valid bit pattern
+    // and it is only read after `fstat` succeeds.
+    let mut stat: libc::stat = unsafe { mem::zeroed() };
+    // SAFETY: FFI call with a valid fd and a valid out-pointer.
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_mode & S_IFMT != S_IFREG {
+        return false;
+    }
+
+    // SAFETY: `libc::statfs` is POD; zero-initialization is a valid bit
+    // pattern and it is only read after `fstatfs` succeeds.
+    let mut sfs: libc::statfs = unsafe { mem::zeroed() };
+    // SAFETY: FFI call with a valid fd and a valid out-pointer.
+    let ret = unsafe { libc::fstatfs(fd, &mut sfs) };
+    // The width and signedness of f_type differ between libc targets; the
+    // magic fits in 32 bits.
+    ret == 0 && sfs.f_type as u32 == XFS_SUPER_MAGIC
+}
+
 /// Returns the kernel reported direct I/O alignment for `fd`, or `None`
 /// when `fd` was not opened with O_DIRECT.
 ///
@@ -324,19 +409,15 @@ pub(crate) fn is_block_device(fd: RawFd) -> bool {
 /// this specific fd. Unlike `fstatvfs().f_bsize`, which only returns the
 /// filesystem's preferred I/O block size, `STATX_DIOALIGN` reports the true per
 /// fd direct I/O constraint accounting for the filesystem, underlying block
-/// device, and any stacking such as loop or device mapper. Falls back to
-/// [`SECTOR_SIZE`] when the kernel does not report a value.
-pub(crate) fn probe_direct_alignment(fd: RawFd) -> Option<u64> {
+/// device, and any stacking such as loop or device mapper. See
+/// [`DirectIoAlignment::from_statx`] for how `STATX_DIO_READ_ALIGN` is used.
+/// Falls back to [`SECTOR_SIZE`] when the kernel does not report a value.
+pub(crate) fn probe_direct_io_alignment(fd: RawFd) -> Option<DirectIoAlignment> {
     // SAFETY: fcntl(F_GETFL) is always safe on a valid fd.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || (flags & libc::O_DIRECT) == 0 {
         return None;
     }
-
-    // The libc crate does not expose statx / STATX_DIOALIGN on all targets,
-    // for example musl, so define the constant and a minimal repr(C) struct
-    // locally and invoke the syscall directly.
-    const STATX_DIOALIGN: u32 = 0x2000;
 
     // Minimal statx layout, only the needed fields, everything else is
     // padding.
@@ -346,8 +427,14 @@ pub(crate) fn probe_direct_alignment(fd: RawFd) -> Option<u64> {
         _pad: [u8; 148],
         stx_dio_mem_align: u32,
         stx_dio_offset_align: u32,
-        _pad2: [u8; 96],
+        _pad2: [u8; 20],
+        stx_dio_read_offset_align: u32,
+        _pad3: [u8; 72],
     }
+    const _: () = assert!(mem::size_of::<Statx>() == 256);
+    const _: () = assert!(mem::offset_of!(Statx, stx_dio_mem_align) == 152);
+    const _: () = assert!(mem::offset_of!(Statx, stx_dio_offset_align) == 156);
+    const _: () = assert!(mem::offset_of!(Statx, stx_dio_read_offset_align) == 180);
 
     let mut stx = mem::MaybeUninit::<Statx>::zeroed();
     // SAFETY: FFI syscall with valid fd and correctly sized buffer.
@@ -357,20 +444,32 @@ pub(crate) fn probe_direct_alignment(fd: RawFd) -> Option<u64> {
             fd,
             c"".as_ptr(),
             libc::AT_EMPTY_PATH,
-            STATX_DIOALIGN,
+            STATX_DIOALIGN | STATX_DIO_READ_ALIGN,
             stx.as_mut_ptr(),
         )
     };
     if ret == 0 {
         // SAFETY: statx succeeded, the struct is fully initialized.
         let stx = unsafe { stx.assume_init() };
-        if stx.stx_mask & STATX_DIOALIGN != 0 && stx.stx_dio_mem_align > 0 {
-            return Some(cmp::max(stx.stx_dio_mem_align, stx.stx_dio_offset_align) as u64);
+        if let Some(alignment) = DirectIoAlignment::from_statx(
+            is_xfs_regular_file(fd),
+            stx.stx_mask,
+            stx.stx_dio_mem_align,
+            stx.stx_dio_offset_align,
+            stx.stx_dio_read_offset_align,
+        ) {
+            return Some(alignment);
         }
     }
 
     debug!("O_DIRECT alignment query failed, falling back to default {SECTOR_SIZE}");
-    Some(SECTOR_SIZE)
+    Some(DirectIoAlignment::DEFAULT)
+}
+
+/// Returns the alignment every direct I/O request on `fd` is submitted with,
+/// or `None` when `fd` was not opened with O_DIRECT.
+pub(crate) fn probe_direct_alignment(fd: RawFd) -> Option<u64> {
+    probe_direct_io_alignment(fd).map(|alignment| alignment.submit)
 }
 
 /// Probe whether the file/device supports punch hole and zero range
@@ -650,6 +749,19 @@ impl DiskTopology {
         }
     }
 
+    /// Raises the logical block size to the direct I/O submission
+    /// alignment, and the physical block and minimum I/O sizes to the
+    /// direct I/O physical alignment.
+    fn with_direct_io_alignment(self, alignment: DirectIoAlignment) -> Self {
+        let block_size = self.logical_block_size.max(alignment.submit);
+        let topology = self.with_block_size(block_size);
+        Self {
+            physical_block_size: topology.physical_block_size.max(alignment.physical),
+            minimum_io_size: topology.minimum_io_size.max(alignment.physical),
+            ..topology
+        }
+    }
+
     // libc::ioctl() takes different types on different architectures
     fn query_block_size(f: &File, block_size_type: BlockSize) -> io::Result<u64> {
         let mut block_size = 0;
@@ -686,9 +798,8 @@ impl DiskTopology {
         };
 
         // Direct I/O can require larger transfers than logical blocks.
-        if let Some(alignment) = probe_direct_alignment(f.as_raw_fd()) {
-            let block_size = topology.logical_block_size.max(alignment);
-            Ok(topology.with_block_size(block_size))
+        if let Some(alignment) = probe_direct_io_alignment(f.as_raw_fd()) {
+            Ok(topology.with_direct_io_alignment(alignment))
         } else {
             Ok(topology)
         }
@@ -737,6 +848,109 @@ mod tests {
         assert_eq!(topology.physical_block_size, 8192);
         assert_eq!(topology.minimum_io_size, 8192);
         assert_eq!(topology.optimal_io_size, 65536);
+    }
+
+    const DIO_MASK: u32 = STATX_DIOALIGN | STATX_DIO_READ_ALIGN;
+
+    fn dio(submit: u64, physical: u64) -> Option<DirectIoAlignment> {
+        Some(DirectIoAlignment { submit, physical })
+    }
+
+    #[test]
+    fn dio_alignment_xfs_read_below_offset_uses_read_alignment() {
+        // XFS on a reflink filesystem with 4K blocks on 512B sectors.
+        assert_eq!(
+            DirectIoAlignment::from_statx(true, DIO_MASK, 512, 4096, 512),
+            dio(512, 4096)
+        );
+    }
+
+    #[test]
+    fn dio_alignment_xfs_read_equal_offset_unchanged() {
+        assert_eq!(
+            DirectIoAlignment::from_statx(true, DIO_MASK, 512, 4096, 4096),
+            dio(4096, 4096)
+        );
+    }
+
+    #[test]
+    fn dio_alignment_read_flag_absent_unchanged() {
+        assert_eq!(
+            DirectIoAlignment::from_statx(true, STATX_DIOALIGN, 512, 4096, 512),
+            dio(4096, 4096)
+        );
+    }
+
+    #[test]
+    fn dio_alignment_read_offset_zero_unchanged() {
+        assert_eq!(
+            DirectIoAlignment::from_statx(true, DIO_MASK, 512, 4096, 0),
+            dio(4096, 4096)
+        );
+    }
+
+    #[test]
+    fn dio_alignment_not_xfs_unchanged() {
+        // Other filesystems, and block devices, which are never XFS regular
+        // files.
+        assert_eq!(
+            DirectIoAlignment::from_statx(false, DIO_MASK, 512, 4096, 512),
+            dio(4096, 4096)
+        );
+        assert_eq!(
+            DirectIoAlignment::from_statx(false, DIO_MASK, 512, 512, 512),
+            dio(512, 512)
+        );
+    }
+
+    #[test]
+    fn dio_alignment_mem_above_read_offset_wins() {
+        assert_eq!(
+            DirectIoAlignment::from_statx(true, DIO_MASK, 2048, 4096, 512),
+            dio(2048, 4096)
+        );
+        // Memory alignment above the offset alignment is kept everywhere.
+        assert_eq!(
+            DirectIoAlignment::from_statx(true, DIO_MASK, 8192, 4096, 512),
+            dio(8192, 8192)
+        );
+    }
+
+    #[test]
+    fn dio_alignment_not_reported() {
+        assert_eq!(
+            DirectIoAlignment::from_statx(true, STATX_DIO_READ_ALIGN, 512, 4096, 512),
+            None
+        );
+        assert_eq!(
+            DirectIoAlignment::from_statx(true, DIO_MASK, 0, 4096, 512),
+            None
+        );
+    }
+
+    #[test]
+    fn with_direct_io_alignment_advertises_512e() {
+        let topology = DiskTopology::default().with_direct_io_alignment(DirectIoAlignment {
+            submit: 512,
+            physical: 4096,
+        });
+        assert_eq!(topology.logical_block_size, 512);
+        assert_eq!(topology.physical_block_size, 4096);
+        assert_eq!(topology.minimum_io_size, 4096);
+        assert_eq!(topology.optimal_io_size, 0);
+    }
+
+    #[test]
+    fn with_direct_io_alignment_without_512e_is_with_block_size() {
+        let topology = DiskTopology::default().with_direct_io_alignment(DirectIoAlignment {
+            submit: 4096,
+            physical: 4096,
+        });
+        let expected = DiskTopology::default().with_block_size(4096);
+        assert_eq!(topology.logical_block_size, expected.logical_block_size);
+        assert_eq!(topology.physical_block_size, expected.physical_block_size);
+        assert_eq!(topology.minimum_io_size, expected.minimum_io_size);
+        assert_eq!(topology.optimal_io_size, expected.optimal_io_size);
     }
 
     #[test]
