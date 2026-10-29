@@ -11,9 +11,12 @@
 //! only the constructor differing.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use crate::async_io::AsyncIo;
+use crate::async_io::{AsyncIo, AsyncIoCompletion, BlockingOp, OwnedIoBuffer};
+use crate::sparse::{punch_hole, write_zeroes};
 
 fn next_completion(async_io: &mut dyn AsyncIo) -> (u64, i32) {
     let completion = async_io.next_completed_request().expect("No completion");
@@ -153,6 +156,78 @@ pub(crate) fn test_punch_hole_multiple_operations(async_io: &mut dyn AsyncIo, fi
     assert!(read_buf.iter().all(|&b| b == 0));
 
     file.seek(SeekFrom::Start(5 * 1024 * 1024)).unwrap();
+    file.read_exact(&mut read_buf).unwrap();
+    assert!(read_buf.iter().all(|&b| b == 0));
+}
+
+/// How long [`slow_file_op`] takes, standing in for a slow block device.
+const SLOW_OP_DELAY: Duration = Duration::from_secs(1);
+
+/// Runs a [`BlockingOp`] on a regular file after [`SLOW_OP_DELAY`], like a
+/// block device whose discards take that long.
+pub(crate) fn slow_file_op(
+    file: &mut File,
+    op: BlockingOp,
+    offset: u64,
+    length: u64,
+) -> io::Result<()> {
+    thread::sleep(SLOW_OP_DELAY);
+    match op {
+        BlockingOp::PunchHole => punch_hole(file, false, offset, length),
+        BlockingOp::WriteZeroes => write_zeroes(file, false, offset, length),
+    }
+}
+
+fn wait_for_completion(async_io: &mut dyn AsyncIo) -> AsyncIoCompletion {
+    let deadline = Instant::now() + 10 * SLOW_OP_DELAY;
+    loop {
+        if let Some(completion) = async_io.next_completed_request() {
+            return completion;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for completion"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Tests that a read submitted behind slow discard and write zeroes requests
+/// completes without waiting for them, for a backend whose discard and write
+/// zeroes run [`slow_file_op`].
+pub(crate) fn test_slow_discard_does_not_block_queue(async_io: &mut dyn AsyncIo, file: &mut File) {
+    file.write_all(&vec![0xAA; 64 * 1024]).unwrap();
+    file.sync_all().unwrap();
+
+    let start = Instant::now();
+    async_io.punch_hole(0, 4096, 1).unwrap();
+    async_io.write_zeroes(4096, 4096, 2).unwrap();
+    async_io
+        .read_to_vec(8192, OwnedIoBuffer::new(4096, 4096).unwrap(), 3)
+        .unwrap();
+
+    // The read completes first, before either slow request is done.
+    let completion = wait_for_completion(async_io);
+    let elapsed = start.elapsed();
+    assert_eq!(completion.user_data, 3);
+    assert_eq!(completion.result, 4096);
+    assert!(
+        elapsed < SLOW_OP_DELAY / 2,
+        "Read waited {elapsed:?} behind slow discard and write zeroes"
+    );
+    let buffer = completion
+        .buffer
+        .expect("Read completion returns its buffer");
+    assert!(buffer.as_slice().iter().all(|&b| b == 0xAA));
+
+    // The slow requests then complete successfully.
+    let mut completed = [wait_for_completion(async_io), wait_for_completion(async_io)]
+        .map(|completion| (completion.user_data, completion.result));
+    completed.sort_unstable();
+    assert_eq!(completed, [(1, 0), (2, 0)]);
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut read_buf = vec![0xFF; 8192];
     file.read_exact(&mut read_buf).unwrap();
     assert!(read_buf.iter().all(|&b| b == 0));
 }

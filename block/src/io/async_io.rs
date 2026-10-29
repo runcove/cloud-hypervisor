@@ -5,6 +5,7 @@
 use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 mod aio_data_io;
+mod blocking_offload;
 mod common;
 mod completion;
 mod guest_memory_target;
@@ -16,6 +17,7 @@ mod uring_data_io;
 use std::{io, result};
 
 pub use aio_data_io::AioDataIo;
+pub(crate) use blocking_offload::{BlockingOffload, BlockingOp, BlockingOpFn, block_device_op};
 pub use completion::AsyncIoCompletion;
 pub(crate) use completion::CompletionCommon;
 pub use guest_memory_target::GuestMemoryTarget;

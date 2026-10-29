@@ -10,10 +10,12 @@
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 
+use log::warn;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::async_io::{
     AioDataIo, AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult,
+    BlockingOffload, BlockingOp, BlockingOpFn, block_device_op,
 };
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::sparse::{punch_hole, write_zeroes};
@@ -24,10 +26,23 @@ pub(super) struct RawAio {
     data_io: AioDataIo,
     alignment: Option<u64>,
     is_block_device: bool,
+    // Runs discard and write zeroes off the queue thread on block devices.
+    offload: Option<BlockingOffload>,
 }
 
 impl RawAio {
     pub(super) fn new(raw_file: File, direct: bool, queue_depth: u32) -> BlockResult<Self> {
+        let is_block_device = is_block_device(raw_file.as_raw_fd());
+        let offload_fn = is_block_device.then_some(block_device_op as BlockingOpFn);
+        Self::with_offload(raw_file, direct, queue_depth, offload_fn)
+    }
+
+    fn with_offload(
+        raw_file: File,
+        direct: bool,
+        queue_depth: u32,
+        offload_fn: Option<BlockingOpFn>,
+    ) -> BlockResult<Self> {
         let data_io =
             AioDataIo::new(queue_depth).map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
         let is_block_device = is_block_device(raw_file.as_raw_fd());
@@ -36,12 +51,24 @@ impl RawAio {
         } else {
             None
         };
+        let offload = offload_fn.and_then(|run| {
+            raw_file
+                .try_clone()
+                .and_then(|file| {
+                    BlockingOffload::new(file, data_io.notifier(), queue_depth as usize, run)
+                })
+                .inspect_err(|e| {
+                    warn!("Failed to set up discard offload, running it synchronously: {e}");
+                })
+                .ok()
+        });
 
         Ok(RawAio {
             raw_file,
             data_io,
             alignment,
             is_block_device,
+            offload,
         })
     }
 }
@@ -83,13 +110,26 @@ impl AsyncIo for RawAio {
     }
 
     fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
-        self.data_io.next_completion()
+        self.data_io
+            .next_completion()
+            .or_else(|| self.offload.as_mut()?.next_completion())
     }
 
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
-        // Linux AIO has no IOCB command for fallocate, so perform the
-        // operation synchronously and signal completion via the completion
-        // list, matching the pattern used by the sync backend (RawSync).
+        if let Some(offload) = &mut self.offload {
+            offload.submit(
+                &mut self.raw_file,
+                BlockingOp::PunchHole,
+                offset,
+                length,
+                user_data,
+            );
+            return Ok(());
+        }
+        // Linux AIO has no IOCB command for fallocate, so otherwise perform
+        // the operation synchronously and signal completion via the
+        // completion list, matching the pattern used by the sync backend
+        // (RawSync).
         punch_hole(&mut self.raw_file, self.is_block_device, offset, length)
             .map_err(AsyncIoError::PunchHole)?;
         self.data_io
@@ -99,6 +139,16 @@ impl AsyncIo for RawAio {
     }
 
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
+        if let Some(offload) = &mut self.offload {
+            offload.submit(
+                &mut self.raw_file,
+                BlockingOp::WriteZeroes,
+                offset,
+                length,
+                user_data,
+            );
+            return Ok(());
+        }
         // Same as punch_hole().
         write_zeroes(&mut self.raw_file, self.is_block_device, offset, length)
             .map_err(AsyncIoError::WriteZeroes)?;
@@ -138,5 +188,19 @@ mod tests {
         let mut file = temp_file.into_file();
         let mut async_io = RawAio::new(file.try_clone().unwrap(), false, 128).unwrap();
         test_helpers::test_punch_hole_multiple_operations(&mut async_io, &mut file);
+    }
+
+    #[test]
+    fn test_slow_discard_does_not_block_queue() {
+        let temp_file = TempFile::new().unwrap();
+        let mut file = temp_file.into_file();
+        let mut async_io = RawAio::with_offload(
+            file.try_clone().unwrap(),
+            false,
+            128,
+            Some(test_helpers::slow_file_op),
+        )
+        .unwrap();
+        test_helpers::test_slow_discard_does_not_block_queue(&mut async_io, &mut file);
     }
 }
