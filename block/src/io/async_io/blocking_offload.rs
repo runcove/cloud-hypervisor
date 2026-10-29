@@ -20,11 +20,13 @@
 //! consumed, so pause and snapshot wait for it as they do for io_uring and AIO
 //! requests.
 //!
-//! At most [`OFFLOAD_DEPTH`] operations are in flight per worker. The device
-//! checks [`BlockingOffload::has_capacity`] before taking a discard or write
-//! zeroes request off the virtqueue and leaves it there while the worker is
-//! full, so a pause, which stops taking new requests and waits for the ones
-//! in flight, waits for at most `OFFLOAD_DEPTH` operations.
+//! At most [`OFFLOAD_DEPTH`] operations are accepted in flight per worker.
+//! The device bounds them further, across all of its queues, so that a pause,
+//! which stops taking new requests and waits for the ones in flight, waits
+//! for at most `OFFLOAD_DEPTH` operations whatever the number of queues.
+//!
+//! If the worker cannot be spawned, creating the async I/O object fails:
+//! running the operations inline instead would bring back the stall.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -42,16 +44,16 @@ use super::common::errno_result;
 use super::{AsyncIoCompletion, WorkerThreadInit};
 use crate::sparse::{punch_hole, write_zeroes};
 
-/// Maximum number of offloaded operations in flight per async I/O object.
+/// Maximum number of offloaded operations in flight, per async I/O object
+/// and, as the device bounds them, per device.
 ///
 /// The worker runs one operation at a time, so a depth above one only keeps
 /// the next operation queued for the worker while the device consumes the
-/// previous completion. Beyond that, the depth trades the time a pause waits
+/// previous completion. Beyond that, the depth bounds the time a pause waits
 /// (up to `OFFLOAD_DEPTH` times the device's discard latency, against the
-/// device's 30 s drain timeout) for how long a burst of discards can be
-/// absorbed before the queue thread stops taking requests: 4 keeps a pause
-/// under the timeout for operations of up to 7 s each.
-pub(crate) const OFFLOAD_DEPTH: usize = 4;
+/// device's 30 s drain timeout): 4 keeps a pause under the timeout for
+/// operations of up to 7 s each.
+pub const OFFLOAD_DEPTH: usize = 4;
 
 /// A blocking operation that can be offloaded.
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +82,33 @@ pub(crate) fn block_device_op(
 /// disk is a block device.
 pub(crate) fn offload_fn(is_block_device: bool) -> Option<BlockingOpFn> {
     is_block_device.then_some(block_device_op as BlockingOpFn)
+}
+
+/// Spawns a worker running `run` on a clone of `file`, if `run` is set.
+///
+/// Fails rather than returning no worker when it cannot be spawned, so the
+/// operations never fall back to running on the queue thread.
+pub(crate) fn spawn_offload(
+    file: &File,
+    notifier: &EventFd,
+    run: Option<BlockingOpFn>,
+) -> io::Result<Option<BlockingOffload>> {
+    run.map(|run| BlockingOffload::new(file.try_clone()?, notifier, OFFLOAD_DEPTH, run))
+        .transpose()
+}
+
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_SPAWN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the next [`BlockingOffload::new`] on this thread fail.
+#[cfg(test)]
+pub(crate) fn fail_next_spawn() {
+    FAIL_NEXT_SPAWN.with(|fail| fail.set(true));
 }
 
 struct Job {
@@ -178,13 +207,17 @@ impl BlockingOffload {
     ///
     /// The worker owns `file`, which must refer to the same disk as the
     /// backend, and signals `notifier`, the backend's completion eventfd. At
-    /// most `depth` operations are in flight; see [`Self::has_capacity`].
+    /// most `depth` operations are accepted in flight; see [`Self::submit`].
     pub(crate) fn new(
         file: File,
         notifier: &EventFd,
         depth: usize,
         run: BlockingOpFn,
     ) -> io::Result<Self> {
+        #[cfg(test)]
+        if FAIL_NEXT_SPAWN.with(|fail| fail.replace(false)) {
+            return Err(io::Error::other("injected spawn failure"));
+        }
         let notifier = notifier.try_clone()?;
         let worker_notifier = notifier.try_clone()?;
         // Room for every operation in flight and the thread init.
@@ -234,20 +267,16 @@ impl BlockingOffload {
     }
 
     /// Returns whether another operation can be submitted.
-    ///
-    /// Callers must check this before taking a request that ends in
-    /// [`Self::submit`] and keep the request queued while it is false. It
-    /// becomes true again once [`Self::next_completion`] has returned a
-    /// completion, which is signaled through the completion eventfd.
-    pub(crate) fn has_capacity(&self) -> bool {
+    #[cfg(test)]
+    fn has_capacity(&self) -> bool {
         self.in_flight < self.depth
     }
 
     /// Submits `op` and reports its completion through the completion list.
     ///
-    /// If the worker is full, because the caller did not check
-    /// [`Self::has_capacity`], or gone, the operation is not run and
-    /// completes with `EIO`.
+    /// If the worker is full, because the caller submitted more than `depth`
+    /// operations whose completion it has not taken, or gone, the operation
+    /// is not run and completes with `EIO`.
     pub(crate) fn submit(&mut self, op: BlockingOp, offset: u64, length: u64, user_data: u64) {
         let job = Job {
             op,
@@ -255,8 +284,10 @@ impl BlockingOffload {
             length,
             user_data,
         };
+        let full = self.in_flight >= self.depth;
         self.in_flight += 1;
         let sent = match &self.sender {
+            Some(_) if full => Err(TrySendError::Full(Message::Job(job))),
             Some(sender) => sender.try_send(Message::Job(job)),
             None => unreachable!("sender is only taken on drop"),
         };
@@ -369,6 +400,20 @@ mod tests {
     }
 
     #[test]
+    fn spawn_offload_fails_instead_of_falling_back() {
+        let notifier = EventFd::new(EFD_NONBLOCK).unwrap();
+        let file = temp_file();
+        assert!(spawn_offload(&file, &notifier, None).unwrap().is_none());
+        assert!(
+            spawn_offload(&file, &notifier, Some(slow))
+                .unwrap()
+                .is_some()
+        );
+        fail_next_spawn();
+        assert!(spawn_offload(&file, &notifier, Some(slow)).is_err());
+    }
+
+    #[test]
     fn errors_reach_the_completion() {
         for (run, expected) in [
             (enospc as BlockingOpFn, -libc::ENOSPC),
@@ -441,24 +486,21 @@ mod tests {
 
     #[test]
     fn full_worker_fails_request_instead_of_running_it() {
-        // Depth 1: the channel holds one job and the thread init. With one
-        // job running and two queued, a fourth submission finds it full.
+        // Depth 1: with one job in flight, a second submission is refused.
         let (mut offload, _notifier) = offload(1, slow);
-        for user_data in 1..=3 {
-            offload.submit(BlockingOp::PunchHole, 0, 4096, user_data);
-            if user_data == 1 {
-                // Let the worker take the first job.
-                thread::sleep(SLOW / 4);
-            }
-        }
+        offload.submit(BlockingOp::PunchHole, 0, 4096, 1);
         let start = Instant::now();
-        offload.submit(BlockingOp::PunchHole, 0, 4096, 4);
+        offload.submit(BlockingOp::PunchHole, 0, 4096, 2);
         assert!(
             start.elapsed() < SLOW / 4,
             "Submission ran the operation inline"
         );
         let completion = wait_completion(&mut offload, Duration::from_secs(5));
-        assert_eq!((completion.user_data, completion.result), (4, -libc::EIO));
+        assert_eq!((completion.user_data, completion.result), (2, -libc::EIO));
+        assert!(
+            start.elapsed() < SLOW / 2,
+            "Refused submission waited for the one in flight"
+        );
     }
 
     #[test]

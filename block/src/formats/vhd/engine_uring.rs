@@ -54,6 +54,10 @@ impl AsyncIo for FixedVhdAsync {
         self.raw_file_async.fsync(user_data)
     }
 
+    fn offloads_punch_hole_or_write_zeroes(&self) -> bool {
+        self.raw_file_async.offloads_punch_hole_or_write_zeroes()
+    }
+
     fn set_worker_thread_init(&mut self, init: WorkerThreadInit) {
         self.raw_file_async.set_worker_thread_init(init);
     }
