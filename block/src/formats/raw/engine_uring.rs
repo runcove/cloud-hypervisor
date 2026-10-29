@@ -144,6 +144,19 @@ impl AsyncIo for RawAsync {
             .map_err(AsyncIoError::PunchHole)
     }
 
+    fn write_zeroes_unmap(
+        &mut self,
+        offset: u64,
+        length: u64,
+        user_data: u64,
+    ) -> AsyncIoResult<()> {
+        if let Some(offload) = &mut self.offload {
+            offload.submit(BlockingOp::WriteZeroesUnmap, offset, length, user_data);
+            return Ok(());
+        }
+        self.punch_hole(offset, length, user_data)
+    }
+
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
         if let Some(offload) = &mut self.offload {
             offload.submit(BlockingOp::WriteZeroes, offset, length, user_data);

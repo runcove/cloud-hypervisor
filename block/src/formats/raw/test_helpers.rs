@@ -173,7 +173,9 @@ pub(crate) fn slow_file_op(
 ) -> io::Result<()> {
     thread::sleep(SLOW_OP_DELAY);
     match op {
-        BlockingOp::PunchHole => punch_hole(file, false, offset, length),
+        BlockingOp::PunchHole | BlockingOp::WriteZeroesUnmap => {
+            punch_hole(file, false, offset, length)
+        }
         BlockingOp::WriteZeroes => write_zeroes(file, false, offset, length),
     }
 }
