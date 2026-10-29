@@ -10,12 +10,11 @@
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 
-use log::warn;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::async_io::{
     AioDataIo, AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult,
-    BlockingOffload, BlockingOp, BlockingOpFn, OFFLOAD_DEPTH, WorkerThreadInit, offload_fn,
+    BlockingOffload, BlockingOp, BlockingOpFn, WorkerThreadInit, offload_fn, spawn_offload,
 };
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::sparse::{punch_hole, write_zeroes};
@@ -50,15 +49,10 @@ impl RawAio {
         } else {
             None
         };
-        let offload = offload_fn.and_then(|run| {
-            raw_file
-                .try_clone()
-                .and_then(|file| BlockingOffload::new(file, data_io.notifier(), OFFLOAD_DEPTH, run))
-                .inspect_err(|e| {
-                    warn!("Failed to set up discard offload, running it synchronously: {e}");
-                })
-                .ok()
-        });
+        // Without the worker, discard and write zeroes would stall the queue
+        // thread: fail instead, which fails the device activation.
+        let offload = spawn_offload(&raw_file, data_io.notifier(), offload_fn)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
 
         Ok(RawAio {
             raw_file,
@@ -106,10 +100,8 @@ impl AsyncIo for RawAio {
         Ok(())
     }
 
-    fn can_submit_punch_hole_or_write_zeroes(&self) -> bool {
-        self.offload
-            .as_ref()
-            .is_none_or(BlockingOffload::has_capacity)
+    fn offloads_punch_hole_or_write_zeroes(&self) -> bool {
+        self.offload.is_some()
     }
 
     fn set_worker_thread_init(&mut self, init: WorkerThreadInit) {
@@ -161,6 +153,7 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::async_io::fail_next_spawn;
     use crate::formats::raw::test_helpers;
 
     #[test]
@@ -193,16 +186,19 @@ mod tests {
         let file = temp_file.into_file();
         let async_io = RawAio::new(file.try_clone().unwrap(), false, 128).unwrap();
         assert!(async_io.offload.is_none());
-        assert!(async_io.can_submit_punch_hole_or_write_zeroes());
-        let mut async_io =
+        assert!(!async_io.offloads_punch_hole_or_write_zeroes());
+        let async_io =
             RawAio::with_offload(file, false, 128, Some(test_helpers::slow_file_op)).unwrap();
         assert!(async_io.offload.is_some());
-        // The offload depth, not the ring depth, bounds requests in flight.
-        for user_data in 0..OFFLOAD_DEPTH as u64 {
-            assert!(async_io.can_submit_punch_hole_or_write_zeroes());
-            async_io.punch_hole(0, 4096, user_data).unwrap();
-        }
-        assert!(!async_io.can_submit_punch_hole_or_write_zeroes());
+        assert!(async_io.offloads_punch_hole_or_write_zeroes());
+    }
+
+    #[test]
+    fn test_offload_spawn_failure_fails_creation() {
+        let file = TempFile::new().unwrap().into_file();
+        fail_next_spawn();
+        // Not a fallback to running discards on the queue thread.
+        assert!(RawAio::with_offload(file, false, 128, Some(test_helpers::slow_file_op)).is_err());
     }
 
     #[test]

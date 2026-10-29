@@ -284,62 +284,7 @@ impl Request {
                 return Ok(ret);
             }
             RequestType::Discard => {
-                let (data_addr, data_len) = if self.data_descriptors.len() == 1 {
-                    (self.data_descriptors[0].0, self.data_descriptors[0].1)
-                } else {
-                    return Err(ExecuteError::BadRequest(Error::TooManyDescriptors));
-                };
-
-                if data_len < DISCARD_WZ_SEG_SIZE {
-                    return Err(ExecuteError::BadRequest(Error::DescriptorLengthTooSmall));
-                }
-                if data_len > DISCARD_WZ_MAX_PAYLOAD {
-                    return Err(ExecuteError::BadRequest(Error::TooManySegments(
-                        data_len.div_ceil(DISCARD_WZ_SEG_SIZE),
-                    )));
-                }
-
-                let mut discard_sector = [0u8; 8];
-                let mut discard_num_sectors = [0u8; 4];
-                let mut discard_flags = [0u8; 4];
-
-                let sector_addr = data_addr.checked_add(DISCARD_WZ_SECTOR_OFFSET).unwrap();
-                mem.read_slice(&mut discard_sector, sector_addr)
-                    .map_err(ExecuteError::Read)?;
-
-                let num_sectors_addr = data_addr
-                    .checked_add(DISCARD_WZ_NUM_SECTORS_OFFSET)
-                    .unwrap();
-                mem.read_slice(&mut discard_num_sectors, num_sectors_addr)
-                    .map_err(ExecuteError::Read)?;
-
-                let flags_addr = data_addr.checked_add(DISCARD_WZ_FLAGS_OFFSET).unwrap();
-                mem.read_slice(&mut discard_flags, flags_addr)
-                    .map_err(ExecuteError::Read)?;
-
-                let discard_flags = u32::from_le_bytes(discard_flags);
-                // Per virtio spec v1.2 reject discard if any flag is set, including unmap.
-                if discard_flags != 0 {
-                    warn!("Unsupported flags {discard_flags:#x} in discard request");
-                    return Err(ExecuteError::UnsupportedFlags {
-                        request_type: VIRTIO_BLK_T_DISCARD,
-                        flags: discard_flags,
-                    });
-                }
-
-                let discard_sector = u64::from_le_bytes(discard_sector);
-                let discard_num_sectors = u32::from_le_bytes(discard_num_sectors);
-
-                let top = discard_sector
-                    .checked_add(discard_num_sectors as u64)
-                    .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
-                if top > disk_nsectors {
-                    return Err(ExecuteError::BadRequest(Error::InvalidOffset));
-                }
-
-                let discard_offset = discard_sector * SECTOR_SIZE;
-                let discard_length = (discard_num_sectors as u64) * SECTOR_SIZE;
-
+                let (discard_offset, discard_length) = self.discard_range(&mem, disk_nsectors)?;
                 disk_image
                     .punch_hole(discard_offset, discard_length, user_data)
                     .map_err(ExecuteError::AsyncPunchHole)?;
@@ -565,6 +510,81 @@ impl Request {
             buffer_offset += data_len;
         }
         Ok(())
+    }
+
+    /// Checks a discard request as [`Self::execute_async`] does before
+    /// submitting it, so the caller can defer a valid one.
+    pub fn check_discard<B: Bitmap + 'static>(
+        &self,
+        mem: &vm_memory::GuestMemoryMmap<B>,
+        disk_nsectors: u64,
+    ) -> Result<(), ExecuteError> {
+        self.discard_range(mem, disk_nsectors).map(|_| ())
+    }
+
+    /// Returns the byte range of a discard request.
+    fn discard_range<B: Bitmap + 'static>(
+        &self,
+        mem: &vm_memory::GuestMemoryMmap<B>,
+        disk_nsectors: u64,
+    ) -> Result<(u64, u64), ExecuteError> {
+        let (data_addr, data_len) = if self.data_descriptors.len() == 1 {
+            (self.data_descriptors[0].0, self.data_descriptors[0].1)
+        } else {
+            return Err(ExecuteError::BadRequest(Error::TooManyDescriptors));
+        };
+
+        if data_len < DISCARD_WZ_SEG_SIZE {
+            return Err(ExecuteError::BadRequest(Error::DescriptorLengthTooSmall));
+        }
+        if data_len > DISCARD_WZ_MAX_PAYLOAD {
+            return Err(ExecuteError::BadRequest(Error::TooManySegments(
+                data_len.div_ceil(DISCARD_WZ_SEG_SIZE),
+            )));
+        }
+
+        let mut discard_sector = [0u8; 8];
+        let mut discard_num_sectors = [0u8; 4];
+        let mut discard_flags = [0u8; 4];
+
+        let sector_addr = data_addr.checked_add(DISCARD_WZ_SECTOR_OFFSET).unwrap();
+        mem.read_slice(&mut discard_sector, sector_addr)
+            .map_err(ExecuteError::Read)?;
+
+        let num_sectors_addr = data_addr
+            .checked_add(DISCARD_WZ_NUM_SECTORS_OFFSET)
+            .unwrap();
+        mem.read_slice(&mut discard_num_sectors, num_sectors_addr)
+            .map_err(ExecuteError::Read)?;
+
+        let flags_addr = data_addr.checked_add(DISCARD_WZ_FLAGS_OFFSET).unwrap();
+        mem.read_slice(&mut discard_flags, flags_addr)
+            .map_err(ExecuteError::Read)?;
+
+        let discard_flags = u32::from_le_bytes(discard_flags);
+        // Per virtio spec v1.2 reject discard if any flag is set, including unmap.
+        if discard_flags != 0 {
+            warn!("Unsupported flags {discard_flags:#x} in discard request");
+            return Err(ExecuteError::UnsupportedFlags {
+                request_type: VIRTIO_BLK_T_DISCARD,
+                flags: discard_flags,
+            });
+        }
+
+        let discard_sector = u64::from_le_bytes(discard_sector);
+        let discard_num_sectors = u32::from_le_bytes(discard_num_sectors);
+
+        let top = discard_sector
+            .checked_add(discard_num_sectors as u64)
+            .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
+        if top > disk_nsectors {
+            return Err(ExecuteError::BadRequest(Error::InvalidOffset));
+        }
+
+        let discard_offset = discard_sector * SECTOR_SIZE;
+        let discard_length = (discard_num_sectors as u64) * SECTOR_SIZE;
+
+        Ok((discard_offset, discard_length))
     }
 
     pub fn complete_async<B: Bitmap + 'static>(
