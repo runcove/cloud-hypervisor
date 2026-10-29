@@ -2030,9 +2030,10 @@ impl Migratable for Block {
 #[cfg(test)]
 mod tests {
     use std::io::Result as IoResult;
+    use std::ops::Range;
     use std::sync::Mutex;
     use std::sync::mpsc::{self, Sender};
-    use std::{panic, slice};
+    use std::{env, mem, panic, slice};
 
     use block::async_io::{AsyncIoOperation, AsyncIoResult};
     use block::{BLKDISCARD, BLKZEROOUT};
@@ -2131,6 +2132,9 @@ mod tests {
         disk: Mutex<Vec<u8>>,
         // Write zeroes finished by the workers.
         write_zeroes_done: AtomicUsize,
+        // Discards and write zeroes accepted and not yet finished.
+        offloads_in_flight: AtomicUsize,
+        max_offloads_in_flight: AtomicUsize,
     }
 
     impl BackendStats {
@@ -2143,6 +2147,12 @@ mod tests {
         }
 
         /// The sector of the disk at `sector`.
+        fn start_offload(&self) {
+            let in_flight = self.offloads_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_offloads_in_flight
+                .fetch_max(in_flight, Ordering::SeqCst);
+        }
+
         fn sector(&self, sector: u64) -> Vec<u8> {
             let disk = self.disk.lock().unwrap();
             let offset = (sector * 512) as usize;
@@ -2153,17 +2163,23 @@ mod tests {
 
     type Completions = Arc<Mutex<VecDeque<AsyncIoCompletion>>>;
 
-    /// A backend whose discards take `SLOW_LATENCY` each, one at a time on a
-    /// worker thread, and whose writes complete at once.
+    /// A backend whose discards take `latency` (`SLOW_LATENCY` unless set)
+    /// each, one at a time on a worker thread, and whose reads and writes
+    /// complete at once.
     struct SlowDiscards {
         notifier: EventFd,
         jobs: Sender<(u64, u64, u64)>,
         completions: Completions,
         stats: Arc<BackendStats>,
+        latency: Duration,
     }
 
     impl SlowDiscards {
         fn new(stats: &Arc<BackendStats>) -> Self {
+            Self::with_latency(stats, SLOW_LATENCY)
+        }
+
+        fn with_latency(stats: &Arc<BackendStats>, latency: Duration) -> Self {
             let notifier = EventFd::new(0).unwrap();
             let worker_notifier = notifier.try_clone().unwrap();
             let completions = Arc::new(Mutex::new(VecDeque::new()));
@@ -2172,10 +2188,13 @@ mod tests {
             let (jobs, receiver) = mpsc::channel::<(u64, u64, u64)>();
             thread::spawn(move || {
                 for (offset, length, user_data) in receiver {
-                    thread::sleep(SLOW_LATENCY);
+                    thread::sleep(latency);
                     // The discarded range reads back as zeroes.
                     worker_stats.zero(offset, length);
                     worker_stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    worker_stats
+                        .offloads_in_flight
+                        .fetch_sub(1, Ordering::SeqCst);
                     worker_completions
                         .lock()
                         .unwrap()
@@ -2188,6 +2207,7 @@ mod tests {
                 jobs,
                 completions,
                 stats: Arc::clone(stats),
+                latency,
             }
         }
     }
@@ -2197,10 +2217,24 @@ mod tests {
             &self.notifier
         }
         fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
-            assert!(!op.is_read());
             let mut disk = self.stats.disk.lock().unwrap();
             let mut offset = op.offset() as usize;
             for iovec in op.iovecs() {
+                if op.is_read() {
+                    // SAFETY: the operation's iovecs point to guest memory
+                    // it keeps mapped while it lives.
+                    let data = unsafe {
+                        slice::from_raw_parts_mut(iovec.iov_base as *mut u8, iovec.iov_len)
+                    };
+                    // Past the end of the disk reads back as zeroes.
+                    data.fill(0);
+                    let end = disk.len().min(offset + iovec.iov_len);
+                    if let Some(range) = disk.get(offset..end) {
+                        data[..range.len()].copy_from_slice(range);
+                    }
+                    offset += iovec.iov_len;
+                    continue;
+                }
                 if disk.len() < offset + iovec.iov_len {
                     disk.resize(offset + iovec.iov_len, 0);
                 }
@@ -2237,19 +2271,23 @@ mod tests {
             self.stats
                 .max_in_flight
                 .fetch_max(in_flight, Ordering::SeqCst);
+            self.stats.start_offload();
             self.stats.executed.fetch_add(1, Ordering::SeqCst);
             self.jobs.send((offset, length, user_data)).unwrap();
             Ok(())
         }
         fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
-            // Each on its own worker, taking `SLOW_LATENCY`.
+            // Each on its own worker, taking `latency`.
+            self.stats.start_offload();
             let stats = Arc::clone(&self.stats);
             let completions = Arc::clone(&self.completions);
             let notifier = self.notifier.try_clone().unwrap();
+            let latency = self.latency;
             thread::spawn(move || {
-                thread::sleep(SLOW_LATENCY);
+                thread::sleep(latency);
                 stats.zero(offset, length);
                 stats.write_zeroes_done.fetch_add(1, Ordering::SeqCst);
+                stats.offloads_in_flight.fetch_sub(1, Ordering::SeqCst);
                 completions
                     .lock()
                     .unwrap()
@@ -2335,8 +2373,19 @@ mod tests {
 
         let disk_image = SlowDiscards::new(stats);
         let completions = Arc::clone(&disk_image.completions);
+        let handler = handler_on(mem, &vq, disk_image);
+        (handler, vq, completions)
+    }
+
+    /// Builds a handler, with its own offload budget, of the queue `vq` on
+    /// `disk_image`.
+    fn handler_on(
+        mem: &GuestMemoryMmap,
+        vq: &GuestQ,
+        disk_image: SlowDiscards,
+    ) -> BlockEpollHandler {
         let evt = || EventFd::new(EFD_NONBLOCK).unwrap();
-        let handler = BlockEpollHandler {
+        BlockEpollHandler {
             queue_index: 0,
             queue: vq.create_queue(),
             mem: GuestMemoryAtomic::new(mem.clone()),
@@ -2358,8 +2407,7 @@ mod tests {
             access_platform: None,
             host_cpus: None,
             acked_features: 0,
-        };
-        (handler, vq, completions)
+        }
     }
 
     /// Makes `handlers` the queues of one device: one offload budget, which
@@ -2433,31 +2481,37 @@ mod tests {
         thread::spawn(move || {
             let (_kill_evt, _pause_evt, mut helper) = epoll_helper();
             while !stop.load(Ordering::SeqCst) {
-                let mut pollfds: Vec<_> = handlers
-                    .iter()
-                    .flat_map(|h| [h.queue_evt.as_raw_fd(), h.disk_image.notifier().as_raw_fd()])
-                    .map(|fd| libc::pollfd {
-                        fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    })
-                    .collect();
-                // SAFETY: pollfds is a valid array of pollfds for the
-                // duration of the call.
-                unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, 10) };
-                for (i, pollfd) in pollfds.iter().enumerate() {
-                    if pollfd.revents & libc::POLLIN != 0 {
-                        let event = if i % 2 == 0 {
-                            QUEUE_AVAIL_EVENT
-                        } else {
-                            COMPLETION_EVENT
-                        };
-                        handle(&mut handlers[i / 2], &mut helper, event);
-                    }
-                }
+                poll_queues(&mut handlers, &mut helper, 10);
             }
             handlers
         })
+    }
+
+    /// Waits up to `timeout_ms` for queue or completion events of
+    /// `handlers`, and handles those there are, as their queue threads do.
+    fn poll_queues(handlers: &mut [BlockEpollHandler], helper: &mut EpollHelper, timeout_ms: i32) {
+        let mut pollfds: Vec<_> = handlers
+            .iter()
+            .flat_map(|h| [h.queue_evt.as_raw_fd(), h.disk_image.notifier().as_raw_fd()])
+            .map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: pollfds is a valid array of pollfds for the duration of
+        // the call.
+        unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+        for (i, pollfd) in pollfds.iter().enumerate() {
+            if pollfd.revents & libc::POLLIN != 0 {
+                let event = if i % 2 == 0 {
+                    QUEUE_AVAIL_EVENT
+                } else {
+                    COMPLETION_EVENT
+                };
+                handle(&mut handlers[i / 2], helper, event);
+            }
+        }
     }
 
     #[test]
@@ -2866,6 +2920,504 @@ mod tests {
     #[test]
     fn parked_discard_overlapped_by_write_on_another_queue_does_not_run() {
         parked_discard_overlapped_by_write(true);
+    }
+
+    /// xorshift64*: a small seeded generator, so that a failing request mix
+    /// is reproduced from its seed alone.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        }
+    }
+
+    const MIX_CASES: u64 = 24;
+    const MIX_LATENCY: Duration = Duration::from_millis(20);
+    // A small disk, so that requests overlap often.
+    const MIX_SECTORS: u64 = 48;
+    const MIX_QUEUES: [u64; 2] = [0x1000, 0x5000];
+    // Headers, segments and statuses: 0x100 per request of each queue.
+    const MIX_REQUESTS: [u64; 2] = [0x10000, 0x20000];
+    // Read and write buffers: 0x1000 per request of the case.
+    const MIX_DATA: u64 = 0x40000;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum MixOp {
+        Discard,
+        WriteZeroes,
+        Read,
+        Write,
+        Flush,
+    }
+
+    struct MixRequest {
+        op: MixOp,
+        queue: usize,
+        // Its index on its queue: its head is three times that.
+        n: u16,
+        sectors: Range<u64>,
+        submitted: Instant,
+        completed: Option<Instant>,
+        // Outstanding when the device drained for a pause.
+        across_drain: bool,
+        // For a read: what each of its sectors may hold.
+        may_read: Vec<Vec<Vec<u8>>>,
+    }
+
+    impl MixRequest {
+        fn overlaps(&self, other: &MixRequest) -> bool {
+            self.sectors.start < other.sectors.end && other.sectors.start < self.sectors.end
+        }
+
+        fn data_addr(&self, id: usize) -> u64 {
+            MIX_DATA + id as u64 * 0x1000
+        }
+    }
+
+    /// The head of the `i`th used element of `vq`.
+    fn used_id(vq: &GuestQ, i: u16) -> u32 {
+        // The ring follows the flags and index, 8 bytes an element.
+        let addr = vq.used_start().0 + 4 + u64::from(i) * 8;
+        vq.mem.read_obj(GuestAddress(addr)).unwrap()
+    }
+
+    /// The fill of `sector` written by request `id`: never zero.
+    fn mix_pattern(id: usize, sector: u64) -> Vec<u8> {
+        vec![1 + ((id as u64 * MIX_SECTORS + sector) % 255) as u8; 512]
+    }
+
+    /// A guest driving two queues of one device, and a model of what each
+    /// sector of the disk may hold.
+    struct RequestMix<'a> {
+        seed: u64,
+        mem: &'a GuestMemoryMmap,
+        vqs: Vec<GuestQ<'a>>,
+        handlers: Vec<BlockEpollHandler>,
+        helper: EpollHelper,
+        requests: Vec<MixRequest>,
+        // The request of each index on each queue.
+        by_queue: [Vec<usize>; 2],
+        used_seen: [u16; 2],
+        may_hold: Vec<Vec<Vec<u8>>>,
+        trace: Vec<String>,
+    }
+
+    impl Drop for RequestMix<'_> {
+        fn drop(&mut self) {
+            if thread::panicking() {
+                eprintln!("Request mix of seed {}: {:#?}", self.seed, self.trace);
+            }
+        }
+    }
+
+    impl RequestMix<'_> {
+        /// Handles the device's events for up to `timeout_ms`, and notes the
+        /// requests it completed.
+        fn step(&mut self, timeout_ms: i32) {
+            poll_queues(&mut self.handlers, &mut self.helper, timeout_ms);
+            self.collect();
+        }
+
+        fn collect(&mut self) {
+            for queue in 0..2 {
+                let vq = &self.vqs[queue];
+                while self.used_seen[queue] != vq.used.idx.get() {
+                    let id = used_id(vq, self.used_seen[queue]);
+                    assert_eq!(id % 3, 0, "Unknown head {id} used on queue {queue}");
+                    let index = self.by_queue[queue][(id / 3) as usize];
+                    let request = &mut self.requests[index];
+                    assert!(
+                        request.completed.is_none(),
+                        "Request {index} ({:?}) completed twice",
+                        request.op
+                    );
+                    request.completed = Some(Instant::now());
+                    self.trace.push(format!("done {index}"));
+                    self.used_seen[queue] += 1;
+                }
+            }
+        }
+
+        /// Waits, as a guest does, for the outstanding requests `blocks`
+        /// says `request` must not overlap.
+        fn wait_for(&mut self, request: &MixRequest, blocks: impl Fn(&MixRequest) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self
+                .requests
+                .iter()
+                .any(|r| r.completed.is_none() && r.overlaps(request) && blocks(r))
+            {
+                assert!(Instant::now() < deadline, "Timed out waiting for requests");
+                self.step(1);
+            }
+        }
+
+        /// Makes `request` available on its queue and notifies the device,
+        /// which processes the queue at once.
+        fn submit(&mut self, mut request: MixRequest) {
+            let id = self.requests.len();
+            let (queue, n) = (request.queue, request.n);
+            let vq = &self.vqs[queue];
+            assert_eq!(vq.avail.idx.get(), n);
+            let base = MIX_REQUESTS[queue];
+            let addr = base + u64::from(n) * 0x100;
+            let start = request.sectors.start;
+            let len = (request.sectors.end - start) as u32;
+            let segment = addr + 0x20;
+            let data_addr = request.data_addr(id);
+            let (request_type, data) = match request.op {
+                MixOp::Discard | MixOp::WriteZeroes => {
+                    self.mem.write_obj(start, GuestAddress(segment)).unwrap();
+                    self.mem.write_obj(len, GuestAddress(segment + 8)).unwrap();
+                    self.mem
+                        .write_obj(0u32, GuestAddress(segment + 12))
+                        .unwrap();
+                    let request_type = if request.op == MixOp::Discard {
+                        VIRTIO_BLK_T_DISCARD
+                    } else {
+                        VIRTIO_BLK_T_WRITE_ZEROES
+                    };
+                    (request_type, Some((segment, 16, 0)))
+                }
+                MixOp::Write => {
+                    for (i, sector) in request.sectors.clone().enumerate() {
+                        let buf = GuestAddress(data_addr + i as u64 * 512);
+                        self.mem.write_slice(&mix_pattern(id, sector), buf).unwrap();
+                    }
+                    (VIRTIO_BLK_T_OUT, Some((data_addr, len * 512, 0)))
+                }
+                MixOp::Read => {
+                    let buf = vec![0xee; len as usize * 512];
+                    self.mem.write_slice(&buf, GuestAddress(data_addr)).unwrap();
+                    let write = VRING_DESC_F_WRITE as u16;
+                    (VIRTIO_BLK_T_IN, Some((data_addr, len * 512, write)))
+                }
+                MixOp::Flush => (VIRTIO_BLK_T_FLUSH, None),
+            };
+            // Header: type, reserved, sector.
+            self.mem
+                .write_obj(request_type, GuestAddress(addr))
+                .unwrap();
+            self.mem.write_obj(0u32, GuestAddress(addr + 4)).unwrap();
+            self.mem.write_obj(start, GuestAddress(addr + 8)).unwrap();
+            self.mem.write_obj(0xffu8, status_addr(base, n)).unwrap();
+            let desc = n * 3;
+            let next = VRING_DESC_F_NEXT as u16;
+            let status = GuestAddress(addr + 0x40);
+            vq.dtable[usize::from(desc)].set(addr, 16, next, desc + 1);
+            let status_desc = if let Some((data, len, flags)) = data {
+                vq.dtable[usize::from(desc) + 1].set(data, len, flags | next, desc + 2);
+                desc + 2
+            } else {
+                desc + 1
+            };
+            vq.dtable[usize::from(status_desc)].set(status.0, 1, VRING_DESC_F_WRITE as u16, 0);
+            vq.avail.ring[usize::from(n)].set(desc);
+            vq.avail.idx.set(n + 1);
+
+            self.trace.push(format!(
+                "submit {id}: {:?} on queue {queue}, sectors {:?}",
+                request.op, request.sectors
+            ));
+            request.submitted = Instant::now();
+            self.by_queue[queue].push(id);
+            self.requests.push(request);
+            self.handlers[queue].queue_evt.write(1).unwrap();
+            handle(
+                &mut self.handlers[queue],
+                &mut self.helper,
+                QUEUE_AVAIL_EVENT,
+            );
+        }
+
+        /// Whether the device took request `id` off its virtqueue.
+        fn taken(&self, id: usize) -> bool {
+            let request = &self.requests[id];
+            let head = request.n * 3;
+            request.completed.is_some()
+                || self.handlers[request.queue]
+                    .inflight_requests
+                    .iter()
+                    .any(|(h, _)| *h == head)
+                || (0..self.vqs[request.queue].used.idx.get())
+                    .any(|i| used_id(&self.vqs[request.queue], i) == u32::from(head))
+        }
+
+        /// Whether discard `id` is parked: taken, and not yet running.
+        fn parked(&self, id: usize) -> bool {
+            let request = &self.requests[id];
+            let head = request.n * 3;
+            self.handlers[request.queue]
+                .parked_discards
+                .iter()
+                .any(|(h, _)| *h == head)
+        }
+    }
+
+    /// Drives one random mix of requests, from `seed`, across two queues of
+    /// one device, and checks the offload invariants.
+    fn run_request_mix(seed: u64) {
+        let mut rng = Rng::new(seed);
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        let vqs: Vec<_> = MIX_QUEUES
+            .iter()
+            .map(|&addr| GuestQ::new(GuestAddress(addr), &mem, 256))
+            .collect();
+        let backend = || SlowDiscards::with_latency(&stats, MIX_LATENCY);
+        let mut q0 = handler_on(&mem, &vqs[0], backend());
+        let mut q1 = handler_on(&mem, &vqs[1], backend());
+        let (budget, queue_evts) = one_device(&mut [&mut q0, &mut q1]);
+        let draining = Arc::clone(&q0.draining_active_requests);
+        let active = Arc::clone(&q0.active_request_count);
+        let (_kill_evt, _pause_evt, helper) = epoll_helper();
+        let mut mix = RequestMix {
+            seed,
+            mem: &mem,
+            vqs,
+            handlers: vec![q0, q1],
+            helper,
+            requests: Vec::new(),
+            by_queue: [Vec::new(), Vec::new()],
+            used_seen: [0; 2],
+            may_hold: vec![vec![vec![0; 512]]; MIX_SECTORS as usize],
+            trace: Vec::new(),
+        };
+
+        let count = 30 + rng.below(31) as usize;
+        let drain_at = (rng.below(2) == 0).then(|| rng.below(count as u64) as usize);
+        for i in 0..count {
+            if drain_at == Some(i) {
+                mix.trace.push("drain".to_string());
+                let stop = Arc::new(AtomicBool::new(false));
+                let runner = run_queues(mem::take(&mut mix.handlers), Arc::clone(&stop));
+                drain_for_pause(&draining, &queue_evts, || {
+                    Block::wait_for_active_requests(&active).map_err(MigratableError::Pause)
+                })
+                .unwrap();
+                // Nothing runs once the device is drained.
+                assert_eq!(budget.in_flight(), 0, "Offloads in flight after draining");
+                stop.store(true, Ordering::SeqCst);
+                mix.handlers = runner.join().unwrap();
+                for request in mix.requests.iter_mut() {
+                    request.across_drain |= request.completed.is_none();
+                }
+                // Resume, which kicks the queues.
+                for evt in &queue_evts {
+                    evt.write(1).unwrap();
+                }
+                mix.collect();
+            }
+
+            let op = match rng.below(20) {
+                0..=7 => MixOp::Discard,
+                8..=10 => MixOp::WriteZeroes,
+                11..=13 => MixOp::Read,
+                14..=18 => MixOp::Write,
+                _ => MixOp::Flush,
+            };
+            let queue = rng.below(2) as usize;
+            let mut start = rng.below(MIX_SECTORS);
+            // Half the writes aim at a parked discard, if there is one.
+            let parked: Vec<_> = (0..mix.requests.len())
+                .filter(|&d| mix.requests[d].completed.is_none() && mix.parked(d))
+                .collect();
+            if op == MixOp::Write && !parked.is_empty() && rng.below(2) == 0 {
+                let target = &mix.requests[parked[rng.below(parked.len() as u64) as usize]];
+                let sectors = &target.sectors;
+                start = sectors.start + rng.below(sectors.end - sectors.start);
+            }
+            let sectors = if op == MixOp::Flush {
+                0..0
+            } else {
+                // Discards are larger, so that writes overlap them.
+                let most = if op == MixOp::Discard { 8 } else { 4 };
+                start..start + 1 + rng.below(most.min(MIX_SECTORS - start))
+            };
+            let mut request = MixRequest {
+                op,
+                queue,
+                n: mix.by_queue[queue].len() as u16,
+                sectors,
+                submitted: Instant::now(),
+                completed: None,
+                across_drain: false,
+                may_read: Vec::new(),
+            };
+            // A guest waits for the requests its request overlaps, except
+            // that a write may be made over discards still outstanding, and
+            // discards and write zeroes over each other: either order
+            // leaves what the model allows.
+            let zeroing = |op| matches!(op, MixOp::Discard | MixOp::WriteZeroes);
+            mix.wait_for(&request, |r| match op {
+                MixOp::Write => r.op != MixOp::Discard,
+                MixOp::Discard | MixOp::WriteZeroes => !zeroing(r.op),
+                MixOp::Read | MixOp::Flush => true,
+            });
+            let id = mix.requests.len();
+            // The outstanding discards the write overlaps, and whether each
+            // is parked: not yet running.
+            let discards: Vec<(usize, bool)> = mix
+                .requests
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    r.op == MixOp::Discard && r.completed.is_none() && r.overlaps(&request)
+                })
+                .map(|(d, _)| (d, mix.parked(d)))
+                .collect();
+            if op == MixOp::Read {
+                request.may_read = request
+                    .sectors
+                    .clone()
+                    .map(|s| mix.may_hold[s as usize].clone())
+                    .collect();
+            }
+            let sectors = request.sectors.clone();
+            mix.submit(request);
+
+            let zeroes = vec![0; 512];
+            let write_taken = op == MixOp::Write && mix.taken(id);
+            for sector in sectors {
+                let may_hold = &mut mix.may_hold[sector as usize];
+                match op {
+                    // A discard may deallocate, or leave the data.
+                    MixOp::Discard => {
+                        if !may_hold.contains(&zeroes) {
+                            may_hold.push(zeroes.clone());
+                        }
+                    }
+                    MixOp::WriteZeroes => *may_hold = vec![zeroes.clone()],
+                    MixOp::Write => {
+                        *may_hold = vec![mix_pattern(id, sector)];
+                        // The device takes a write while the discards it
+                        // overlaps are parked: they must never run after
+                        // it. A discard already running, or a write not
+                        // taken at once, races with the write.
+                        let racing = discards.iter().any(|&(d, parked)| {
+                            let covers = mix.requests[d].sectors.contains(&sector);
+                            covers && (!parked || !write_taken)
+                        });
+                        if racing {
+                            may_hold.push(zeroes.clone());
+                        }
+                    }
+                    MixOp::Read | MixOp::Flush => {}
+                }
+            }
+            mix.step(0);
+            // Sometimes the guest pauses before its next request.
+            if rng.below(8) == 0 {
+                let until = Instant::now() + MIX_LATENCY * rng.below(3) as u32;
+                while Instant::now() < until {
+                    mix.step(1);
+                }
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while mix.requests.iter().any(|r| r.completed.is_none()) {
+            assert!(Instant::now() < deadline, "Timed out completing requests");
+            mix.step(1);
+        }
+        // Long enough for a discard that should not have run to land.
+        let until = Instant::now() + MIX_LATENCY * 2;
+        while Instant::now() < until {
+            mix.step(1);
+        }
+        mix.collect();
+
+        // The device-wide bounds.
+        let max_offloads = stats.max_offloads_in_flight.load(Ordering::SeqCst);
+        assert!(
+            max_offloads <= OFFLOAD_DEPTH,
+            "{max_offloads} offloads in flight"
+        );
+        let max_discards = stats.max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            max_discards <= SLOW_DEPTH,
+            "{max_discards} discards in flight"
+        );
+        assert_eq!(budget.in_flight(), 0);
+        assert!(mix.handlers.iter().all(|h| h.parked_discards.is_empty()));
+
+        // A read or write behind a write zeroes waiting for a slot waits up
+        // to about two offload latencies; the rest is slack for a loaded
+        // host. Held behind the discards of a mix, it would wait for many.
+        let bound = MIX_LATENCY * 6;
+        for (id, request) in mix.requests.iter().enumerate() {
+            // One completion each, with a status.
+            let base = MIX_REQUESTS[request.queue];
+            let status: u8 = mem.read_obj(status_addr(base, request.n)).unwrap();
+            assert_eq!(status, VIRTIO_BLK_S_OK as u8, "Status of request {id}");
+            let elapsed = request.completed.unwrap() - request.submitted;
+            // Reads and writes do not wait for discards and write zeroes.
+            if matches!(request.op, MixOp::Read | MixOp::Write) && !request.across_drain {
+                assert!(
+                    elapsed < bound,
+                    "Request {id} ({:?}) took {elapsed:?}, with offloads of {MIX_LATENCY:?}",
+                    request.op
+                );
+            }
+            if request.op == MixOp::Read {
+                for (i, may_read) in request.may_read.iter().enumerate() {
+                    let mut data = vec![0; 512];
+                    let buf = GuestAddress(request.data_addr(id) + i as u64 * 512);
+                    mem.read_slice(&mut data, buf).unwrap();
+                    assert!(
+                        may_read.contains(&data),
+                        "Read {id} got {:#x} at sector {}",
+                        data[0],
+                        request.sectors.start + i as u64
+                    );
+                }
+            }
+        }
+        for queue in 0..2 {
+            assert_eq!(
+                usize::from(mix.vqs[queue].used.idx.get()),
+                mix.by_queue[queue].len()
+            );
+        }
+        // What the guest last wrote or zeroed is on the disk.
+        for (sector, may_hold) in mix.may_hold.iter().enumerate() {
+            let data = stats.sector(sector as u64);
+            assert!(
+                may_hold.contains(&data),
+                "Sector {sector} holds {:#x}, not one of {:x?}",
+                data[0],
+                may_hold.iter().map(|d| d[0]).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Random mixes of discards, write zeroes, reads, writes and flushes
+    /// across two queues of a device, with a drain for a pause in some:
+    /// the device keeps its offload bounds, completes every request once,
+    /// never holds reads and writes behind discards or write zeroes, and
+    /// never loses data the guest wrote. `MIX_SEED` runs one mix.
+    #[test]
+    fn random_request_mixes_keep_the_offload_invariants() {
+        let seeds = match env::var("MIX_SEED") {
+            Ok(seed) => {
+                let seed = seed.parse().unwrap();
+                seed..seed + 1
+            }
+            Err(_) => 0..MIX_CASES,
+        };
+        for seed in seeds {
+            if panic::catch_unwind(|| run_request_mix(seed)).is_err() {
+                panic!("The request mix of seed {seed} failed: rerun it with MIX_SEED={seed}");
+            }
+        }
     }
 
     /// Runs what the block offload worker does on a thread under the
