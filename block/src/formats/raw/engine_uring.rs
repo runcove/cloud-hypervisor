@@ -12,7 +12,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::async_io::{
     AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, BlockingOffload,
-    BlockingOp, BlockingOpFn, UringDataIo, block_device_op,
+    BlockingOp, BlockingOpFn, OFFLOAD_DEPTH, UringDataIo, WorkerThreadInit, offload_fn,
 };
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::sparse::{punch_hole, write_zeroes};
@@ -30,8 +30,7 @@ pub(crate) struct RawAsync {
 
 impl RawAsync {
     pub(crate) fn new(raw_file: File, direct: bool, ring_depth: u32) -> BlockResult<Self> {
-        let is_block_device = is_block_device(raw_file.as_raw_fd());
-        let offload_fn = is_block_device.then_some(block_device_op as BlockingOpFn);
+        let offload_fn = offload_fn(is_block_device(raw_file.as_raw_fd()));
         Self::with_offload(raw_file, direct, ring_depth, offload_fn)
     }
 
@@ -52,9 +51,7 @@ impl RawAsync {
         let offload = offload_fn.and_then(|run| {
             raw_file
                 .try_clone()
-                .and_then(|file| {
-                    BlockingOffload::new(file, data_io.notifier(), ring_depth as usize, run)
-                })
+                .and_then(|file| BlockingOffload::new(file, data_io.notifier(), OFFLOAD_DEPTH, run))
                 .inspect_err(|e| {
                     warn!("Failed to set up discard offload, running it synchronously: {e}");
                 })
@@ -107,6 +104,18 @@ impl AsyncIo for RawAsync {
         Ok(())
     }
 
+    fn can_submit_punch_hole_or_write_zeroes(&self) -> bool {
+        self.offload
+            .as_ref()
+            .is_none_or(BlockingOffload::has_capacity)
+    }
+
+    fn set_worker_thread_init(&mut self, init: WorkerThreadInit) {
+        if let Some(offload) = &mut self.offload {
+            offload.set_thread_init(init);
+        }
+    }
+
     fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
         self.data_io
             .next_completion()
@@ -125,13 +134,7 @@ impl AsyncIo for RawAsync {
 
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
         if let Some(offload) = &mut self.offload {
-            offload.submit(
-                &mut self.raw_file,
-                BlockingOp::PunchHole,
-                offset,
-                length,
-                user_data,
-            );
+            offload.submit(BlockingOp::PunchHole, offset, length, user_data);
             return Ok(());
         }
         // Otherwise run synchronously rather than submitting a fallocate
@@ -151,13 +154,7 @@ impl AsyncIo for RawAsync {
 
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
         if let Some(offload) = &mut self.offload {
-            offload.submit(
-                &mut self.raw_file,
-                BlockingOp::WriteZeroes,
-                offset,
-                length,
-                user_data,
-            );
+            offload.submit(BlockingOp::WriteZeroes, offset, length, user_data);
             return Ok(());
         }
         // Same rationale as punch_hole().
@@ -175,6 +172,24 @@ mod tests {
 
     use super::*;
     use crate::formats::raw::test_helpers;
+
+    #[test]
+    fn test_offload_follows_block_device_detection() {
+        let temp_file = TempFile::new().unwrap();
+        let file = temp_file.into_file();
+        let async_io = RawAsync::new(file.try_clone().unwrap(), false, 128).unwrap();
+        assert!(async_io.offload.is_none());
+        assert!(async_io.can_submit_punch_hole_or_write_zeroes());
+        let mut async_io =
+            RawAsync::with_offload(file, false, 128, Some(test_helpers::slow_file_op)).unwrap();
+        assert!(async_io.offload.is_some());
+        // The offload depth, not the ring depth, bounds requests in flight.
+        for user_data in 0..OFFLOAD_DEPTH as u64 {
+            assert!(async_io.can_submit_punch_hole_or_write_zeroes());
+            async_io.punch_hole(0, 4096, user_data).unwrap();
+        }
+        assert!(!async_io.can_submit_punch_hole_or_write_zeroes());
+    }
 
     #[test]
     fn test_slow_discard_does_not_block_queue() {

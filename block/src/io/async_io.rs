@@ -17,7 +17,9 @@ mod uring_data_io;
 use std::{io, result};
 
 pub use aio_data_io::AioDataIo;
-pub(crate) use blocking_offload::{BlockingOffload, BlockingOp, BlockingOpFn, block_device_op};
+pub(crate) use blocking_offload::{
+    BlockingOffload, BlockingOp, BlockingOpFn, OFFLOAD_DEPTH, offload_fn,
+};
 pub use completion::AsyncIoCompletion;
 pub(crate) use completion::CompletionCommon;
 pub use guest_memory_target::GuestMemoryTarget;
@@ -100,6 +102,10 @@ pub enum AsyncIoError {
 
 pub type AsyncIoResult<T> = result::Result<T, AsyncIoError>;
 
+/// Runs on a worker thread spawned by an [`AsyncIo`] backend before the
+/// thread does any I/O, for instance to apply a seccomp filter.
+pub type WorkerThreadInit = Box<dyn FnOnce() -> io::Result<()> + Send>;
+
 pub trait AsyncIo: Send {
     fn notifier(&self) -> &EventFd;
 
@@ -155,6 +161,21 @@ pub trait AsyncIo: Send {
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()>;
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
+
+    /// Returns whether a discard or write zeroes request can be submitted now.
+    ///
+    /// Backends that run these requests on a worker thread with a bounded
+    /// number in flight return false while it is full. The caller then keeps
+    /// the request queued and retries once a completion has been returned by
+    /// [`AsyncIo::next_completed_request`].
+    fn can_submit_punch_hole_or_write_zeroes(&self) -> bool {
+        true
+    }
+
+    /// Passes `init` to run on every worker thread this backend has spawned,
+    /// before that thread does any I/O. Must be called before any request is
+    /// submitted. Backends without worker threads drop it.
+    fn set_worker_thread_init(&mut self, _init: WorkerThreadInit) {}
 
     /// Returns the next owned completion, if one is available.
     ///

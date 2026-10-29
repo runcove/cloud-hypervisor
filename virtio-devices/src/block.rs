@@ -34,7 +34,7 @@ use event_monitor::event;
 use log::{debug, error, info, warn};
 use rate_limiter::TokenType;
 use rate_limiter::group::{RateLimiterGroup, RateLimiterGroupHandle};
-use seccompiler::SeccompAction;
+use seccompiler::{SeccompAction, apply_filter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_bindings::virtio_blk::*;
@@ -52,7 +52,7 @@ use super::{
     VirtioInterruptType,
 };
 use crate::device::ActivationContext;
-use crate::seccomp_filters::Thread;
+use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::{GuestMemoryMmap, VirtioInterrupt};
 
 const SECTOR_SHIFT: u8 = 9;
@@ -301,6 +301,20 @@ impl BlockEpollHandler {
                     .enable_notification(desc_chain.memory())
                     .map_err(Error::QueueEnableNotification)?;
                 continue;
+            }
+
+            // Backends that run discard and write zeroes on a worker thread
+            // bound how many are in flight. While the worker is full, leave
+            // this request and the ones behind it on the queue: the worker's
+            // next completion reprocesses the queue. This keeps what a pause
+            // waits for bounded by the backend's depth, not the queue size.
+            if matches!(
+                request.request_type(),
+                RequestType::Discard | RequestType::WriteZeroes
+            ) && !self.disk_image.can_submit_punch_hole_or_write_zeroes()
+            {
+                queue.go_to_previous_position();
+                break;
             }
 
             if let Some(rate_limiter) = &mut self.rate_limiter {
@@ -1177,17 +1191,29 @@ impl VirtioDevice for Block {
             let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
             let queue_idx = i as u16;
 
-            let mut handler = BlockEpollHandler {
-                queue_index: queue_idx,
-                queue,
-                mem: mem.clone(),
-                disk_image: self
-                    .disk_image
+            let mut disk_image =
+                self.disk_image
                     .create_async_io(queue_size as u32)
                     .map_err(|e| {
                         error!("failed to create new AsyncIo: {e}");
                         ActivateError::BadActivate
-                    })?,
+                    })?;
+            // Worker threads the backend spawns for this queue get the same
+            // seccomp filter as the queue thread.
+            let seccomp_filter = get_seccomp_filter(&self.seccomp_action, Thread::VirtioBlock)
+                .map_err(ActivateError::CreateSeccompFilter)?;
+            disk_image.set_worker_thread_init(Box::new(move || {
+                if seccomp_filter.is_empty() {
+                    return Ok(());
+                }
+                apply_filter(&seccomp_filter).map_err(io::Error::other)
+            }));
+
+            let mut handler = BlockEpollHandler {
+                queue_index: queue_idx,
+                queue,
+                mem: mem.clone(),
+                disk_image,
                 disk_nsectors: Arc::clone(&self.disk_nsectors),
                 interrupt_cb: Arc::clone(&interrupt_cb),
                 serial: self.serial.clone(),
@@ -1355,12 +1381,18 @@ impl Migratable for Block {
 #[cfg(test)]
 mod tests {
     use std::io::Result as IoResult;
+    use std::panic;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{self, Sender};
 
     use block::async_io::{AsyncIoCompletion, AsyncIoOperation, AsyncIoResult};
+    use block::{BLKDISCARD, BLKZEROOUT};
     use hypervisor::Vm;
+    use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use vm_memory::GuestAddress;
     use vm_virtio::queue::testing::VirtQueue as GuestQ;
     use vmm_sys_util::eventfd::EFD_NONBLOCK;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
 
@@ -1428,5 +1460,251 @@ mod tests {
         handler.process_queue_submit().unwrap();
 
         assert_eq!(vq.used.idx.get(), 1);
+    }
+
+    const SLOW_DEPTH: usize = 4;
+    const SLOW_LATENCY: Duration = Duration::from_millis(200);
+
+    /// A backend whose discards take `SLOW_LATENCY` each, one at a time on a
+    /// worker thread, with at most `SLOW_DEPTH` accepted at once.
+    struct SlowDiscards {
+        notifier: EventFd,
+        jobs: Sender<u64>,
+        completions: Arc<Mutex<VecDeque<AsyncIoCompletion>>>,
+        in_flight: usize,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    impl SlowDiscards {
+        fn new() -> Self {
+            let notifier = EventFd::new(0).unwrap();
+            let worker_notifier = notifier.try_clone().unwrap();
+            let completions = Arc::new(Mutex::new(VecDeque::new()));
+            let worker_completions = Arc::clone(&completions);
+            let (jobs, receiver) = mpsc::channel::<u64>();
+            thread::spawn(move || {
+                for user_data in receiver {
+                    thread::sleep(SLOW_LATENCY);
+                    worker_completions
+                        .lock()
+                        .unwrap()
+                        .push_back(AsyncIoCompletion::new(user_data, 0, None));
+                    worker_notifier.write(1).unwrap();
+                }
+            });
+            SlowDiscards {
+                notifier,
+                jobs,
+                completions,
+                in_flight: 0,
+                max_in_flight: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl AsyncIo for SlowDiscards {
+        fn notifier(&self) -> &EventFd {
+            &self.notifier
+        }
+        fn submit_data_operation(&mut self, _: AsyncIoOperation) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn fsync(&mut self, _: Option<u64>) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn punch_hole(&mut self, _: u64, _: u64, user_data: u64) -> AsyncIoResult<()> {
+            // Record rather than refuse, so a test sees how far the bound is
+            // exceeded.
+            self.in_flight += 1;
+            self.max_in_flight
+                .fetch_max(self.in_flight, Ordering::SeqCst);
+            self.jobs.send(user_data).unwrap();
+            Ok(())
+        }
+        fn write_zeroes(&mut self, _: u64, _: u64, _: u64) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn can_submit_punch_hole_or_write_zeroes(&self) -> bool {
+            self.in_flight < SLOW_DEPTH
+        }
+        fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
+            let completion = self.completions.lock().unwrap().pop_front();
+            if completion.is_some() {
+                self.in_flight -= 1;
+            }
+            completion
+        }
+    }
+
+    const DISCARDS: u16 = 12;
+
+    /// Builds a handler whose queue holds `DISCARDS` discard requests.
+    fn slow_discard_handler<'a>(
+        mem: &'a GuestMemoryMmap,
+        max_in_flight: &mut Arc<AtomicUsize>,
+    ) -> (BlockEpollHandler, GuestQ<'a>) {
+        let vq = GuestQ::new(GuestAddress(0x1000), mem, 64);
+        for i in 0..DISCARDS {
+            let base = 0x8000 + u64::from(i) * 0x100;
+            // Header: type, reserved, sector.
+            mem.write_obj(VIRTIO_BLK_T_DISCARD, GuestAddress(base))
+                .unwrap();
+            // Segment: sector 0, 8 sectors, no flags.
+            mem.write_obj(8u32, GuestAddress(base + 0x28)).unwrap();
+            let desc = i * 3;
+            let next = VRING_DESC_F_NEXT as u16;
+            vq.dtable[desc as usize].set(base, 16, next, desc + 1);
+            vq.dtable[desc as usize + 1].set(base + 0x20, 16, next, desc + 2);
+            vq.dtable[desc as usize + 2].set(base + 0x40, 1, VRING_DESC_F_WRITE as u16, 0);
+            vq.avail.ring[i as usize].set(desc);
+        }
+        vq.avail.idx.set(DISCARDS);
+
+        let disk_image = SlowDiscards::new();
+        *max_in_flight = Arc::clone(&disk_image.max_in_flight);
+        let evt = || EventFd::new(EFD_NONBLOCK).unwrap();
+        let handler = BlockEpollHandler {
+            queue_index: 0,
+            queue: vq.create_queue(),
+            mem: GuestMemoryAtomic::new(mem.clone()),
+            disk_image: Box::new(disk_image),
+            disk_nsectors: Arc::new(AtomicU64::new(1 << 20)),
+            interrupt_cb: Arc::new(Noop(evt())),
+            serial: Box::default(),
+            kill_evt: evt(),
+            pause_evt: evt(),
+            writeback: Arc::new(AtomicBool::new(false)),
+            counters: BlockCounters::default(),
+            queue_evt: evt(),
+            inflight_requests: VecDeque::new(),
+            active_request_count: Arc::new(AtomicUsize::new(0)),
+            draining_active_requests: Arc::new(AtomicBool::new(false)),
+            rate_limiter: None,
+            access_platform: None,
+            host_cpus: None,
+            acked_features: 0,
+        };
+        (handler, vq)
+    }
+
+    /// Waits for the backend's next completion event and handles it, as the
+    /// queue thread does.
+    fn handle_completion_event(handler: &mut BlockEpollHandler, helper: &mut EpollHelper) {
+        // The backend's notifier is blocking: wait until it is signaled
+        // without consuming the event, which handle_event() reads.
+        let mut pollfd = libc::pollfd {
+            fd: handler.disk_image.notifier().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pollfd is a valid pollfd for the duration of the call.
+        let ret = unsafe { libc::poll(&mut pollfd, 1, 10_000) };
+        assert_eq!(ret, 1, "Timed out waiting for a completion");
+        let event = epoll::Event::new(epoll::Events::EPOLLIN, u64::from(COMPLETION_EVENT));
+        handler.handle_event(helper, &event).unwrap();
+    }
+
+    #[test]
+    fn slow_discards_in_flight_are_bounded_by_backend() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut max_in_flight = Arc::default();
+        let (mut handler, vq) = slow_discard_handler(&mem, &mut max_in_flight);
+        let kill_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let pause_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let mut helper = EpollHelper::new(&kill_evt, &pause_evt).unwrap();
+
+        handler.process_queue_submit().unwrap();
+        // The requests the backend could not take stay on the queue.
+        assert_eq!(handler.inflight_requests.len(), SLOW_DEPTH);
+        assert_eq!(
+            handler.active_request_count.load(Ordering::SeqCst),
+            SLOW_DEPTH
+        );
+
+        // Each completion lets the queue thread take the next discard.
+        while vq.used.idx.get() < DISCARDS {
+            handle_completion_event(&mut handler, &mut helper);
+        }
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), SLOW_DEPTH);
+        assert_eq!(handler.active_request_count.load(Ordering::SeqCst), 0);
+        for i in 0..DISCARDS {
+            let status: u8 = mem
+                .read_obj(GuestAddress(0x8000 + u64::from(i) * 0x100 + 0x40))
+                .unwrap();
+            assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+        }
+    }
+
+    #[test]
+    fn drain_waits_only_for_bounded_slow_discards() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut max_in_flight = Arc::default();
+        let (mut handler, vq) = slow_discard_handler(&mem, &mut max_in_flight);
+        let kill_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let pause_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let mut helper = EpollHelper::new(&kill_evt, &pause_evt).unwrap();
+
+        handler.process_queue_submit().unwrap();
+        // Pause: stop taking requests and wait for the ones in flight.
+        let start = Instant::now();
+        handler
+            .draining_active_requests
+            .store(true, Ordering::SeqCst);
+        while handler.active_request_count.load(Ordering::SeqCst) > 0 {
+            handle_completion_event(&mut handler, &mut helper);
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(vq.used.idx.get(), SLOW_DEPTH as u16);
+        assert!(max_in_flight.load(Ordering::SeqCst) <= SLOW_DEPTH);
+        assert!(
+            elapsed < SLOW_LATENCY * (SLOW_DEPTH as u32 + 1),
+            "Drain took {elapsed:?} for {SLOW_DEPTH} discards of {SLOW_LATENCY:?}"
+        );
+    }
+
+    /// Runs what the block offload worker does on a thread under the
+    /// virtio-block seccomp filter, applied the way activate() has the
+    /// backend apply it. A syscall the filter does not allow raises SIGSYS
+    /// and kills the test binary.
+    #[test]
+    fn virtio_block_filter_allows_offload_worker() {
+        let filter = get_seccomp_filter(&SeccompAction::Trap, Thread::VirtioBlock).unwrap();
+        let notifier = EventFd::new(EFD_NONBLOCK).unwrap();
+        let worker_notifier = notifier.try_clone().unwrap();
+        let file = TempFile::new().unwrap().into_file();
+        let (sender, receiver) = mpsc::sync_channel::<u64>(1);
+        let worker = thread::spawn(move || {
+            apply_filter(&filter).unwrap();
+            let completions = Mutex::new(VecDeque::new());
+            for user_data in receiver {
+                let range = [0u64, 4096];
+                for request in [BLKDISCARD, BLKZEROOUT] {
+                    // SAFETY: range is a valid [u64; 2] for the ioctl. On a
+                    // regular file it fails with ENOTTY, after the filter
+                    // has checked it.
+                    let ret = unsafe { libc::ioctl(file.as_raw_fd(), request as _, &range) };
+                    assert_eq!(ret, -1);
+                    assert_eq!(
+                        io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ENOTTY)
+                    );
+                }
+                // A panic in an operation is caught and logged.
+                let caught = panic::catch_unwind(|| panic!("offloaded operation panicked"));
+                assert!(caught.is_err());
+                completions
+                    .lock()
+                    .unwrap()
+                    .push_back(AsyncIoCompletion::new(user_data, -libc::EIO, None));
+                worker_notifier.write(1).unwrap();
+            }
+            completions.into_inner().unwrap().len()
+        });
+        sender.send(1).unwrap();
+        sender.send(2).unwrap();
+        drop(sender);
+        assert_eq!(worker.join().unwrap(), 2);
+        assert_eq!(notifier.read().unwrap(), 2);
     }
 }
