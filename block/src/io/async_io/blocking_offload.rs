@@ -41,7 +41,7 @@ use log::{error, warn};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::common::errno_result;
-use super::{AsyncIoCompletion, WorkerThreadInit};
+use super::{AsyncIoCompletion, OffloadedOp, WorkerThreadInit};
 use crate::sparse::{punch_hole, write_zeroes};
 
 /// Maximum number of offloaded operations in flight, per async I/O object
@@ -60,6 +60,18 @@ pub const OFFLOAD_DEPTH: usize = 4;
 pub(crate) enum BlockingOp {
     PunchHole,
     WriteZeroes,
+    /// A punch hole for a write zeroes that may unmap the range.
+    WriteZeroesUnmap,
+}
+
+impl BlockingOp {
+    /// What the operation completes as.
+    fn offloaded_op(self) -> OffloadedOp {
+        match self {
+            BlockingOp::PunchHole => OffloadedOp::Discard,
+            BlockingOp::WriteZeroes | BlockingOp::WriteZeroesUnmap => OffloadedOp::WriteZeroes,
+        }
+    }
 }
 
 /// Executes a [`BlockingOp`] over `[offset, offset + length)` of a file.
@@ -73,7 +85,9 @@ pub(crate) fn block_device_op(
     length: u64,
 ) -> io::Result<()> {
     match op {
-        BlockingOp::PunchHole => punch_hole(file, true, offset, length),
+        BlockingOp::PunchHole | BlockingOp::WriteZeroesUnmap => {
+            punch_hole(file, true, offset, length)
+        }
         BlockingOp::WriteZeroes => write_zeroes(file, true, offset, length),
     }
 }
@@ -132,6 +146,7 @@ fn eio() -> io::Error {
 fn complete(
     completions: &CompletionList,
     notifier: &EventFd,
+    op: BlockingOp,
     user_data: u64,
     result: io::Result<()>,
 ) {
@@ -142,7 +157,11 @@ fn complete(
     completions
         .lock()
         .unwrap()
-        .push_back(AsyncIoCompletion::from_offload(user_data, result));
+        .push_back(AsyncIoCompletion::from_offload(
+            user_data,
+            result,
+            op.offloaded_op(),
+        ));
     // Signal after queuing so the device always finds the completion once it
     // has consumed the event.
     if let Err(e) = notifier.write(1) {
@@ -186,7 +205,7 @@ fn worker_loop(
                 Err(eio())
             })
         };
-        complete(completions, notifier, job.user_data, result);
+        complete(completions, notifier, job.op, job.user_data, result);
     }
 }
 
@@ -295,11 +314,11 @@ impl BlockingOffload {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 warn!("Block offload worker full, failing {op:?} request");
-                complete(&self.completions, &self.notifier, user_data, Err(eio()));
+                complete(&self.completions, &self.notifier, op, user_data, Err(eio()));
             }
             Err(TrySendError::Disconnected(_)) => {
                 error!("Block offload worker gone, failing {op:?} request");
-                complete(&self.completions, &self.notifier, user_data, Err(eio()));
+                complete(&self.completions, &self.notifier, op, user_data, Err(eio()));
             }
         }
     }

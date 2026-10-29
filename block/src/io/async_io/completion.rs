@@ -8,6 +8,17 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::{AsyncIoOperation, OwnedIoBuffer};
 
+/// What an operation run on a worker thread was submitted as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OffloadedOp {
+    /// A discard ([`super::AsyncIo::punch_hole`]).
+    Discard,
+    /// A write zeroes, with or without unmapping the range
+    /// ([`super::AsyncIo::write_zeroes`],
+    /// [`super::AsyncIo::write_zeroes_unmap`]).
+    WriteZeroes,
+}
+
 /// Completion returned by an owned async I/O backend.
 ///
 /// The completion carries the caller provided `user_data`, the result,
@@ -23,9 +34,10 @@ pub struct AsyncIoCompletion {
     pub result: i32,
     /// The backing buffer that can now be dropped or re-used.
     pub buffer: Option<OwnedIoBuffer>,
-    /// Whether the operation ran on a worker thread through
-    /// [`super::AsyncIo::offloads_punch_hole_or_write_zeroes`].
-    pub offloaded: bool,
+    /// Set when the operation ran on a worker thread through
+    /// [`super::AsyncIo::offloads_punch_hole_or_write_zeroes`]: what it was
+    /// submitted as.
+    pub offloaded: Option<OffloadedOp>,
 }
 
 impl AsyncIoCompletion {
@@ -35,14 +47,14 @@ impl AsyncIoCompletion {
             user_data,
             result,
             buffer,
-            offloaded: false,
+            offloaded: None,
         }
     }
 
     /// Creates the completion of an operation that ran on a worker thread.
-    pub fn from_offload(user_data: u64, result: i32) -> Self {
+    pub fn from_offload(user_data: u64, result: i32, op: OffloadedOp) -> Self {
         Self {
-            offloaded: true,
+            offloaded: Some(op),
             ..Self::new(user_data, result, None)
         }
     }
