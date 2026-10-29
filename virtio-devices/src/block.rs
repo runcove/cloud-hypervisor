@@ -2435,6 +2435,15 @@ mod tests {
             });
             Ok(())
         }
+        fn write_zeroes_unmap(
+            &mut self,
+            offset: u64,
+            length: u64,
+            user_data: u64,
+        ) -> AsyncIoResult<()> {
+            // Zeroes the range like a write zeroes, and is reported as one.
+            self.write_zeroes(offset, length, user_data)
+        }
         fn offloads_punch_hole_or_write_zeroes(&self) -> bool {
             true
         }
@@ -2481,11 +2490,24 @@ mod tests {
     /// Makes a discard or write zeroes request of 8 sectors at `sector`
     /// available.
     fn push_segment(mem: &GuestMemoryMmap, vq: &GuestQ, base: u64, request_type: u32, sector: u64) {
+        push_segment_with_flags(mem, vq, base, request_type, sector, 0);
+    }
+
+    /// Makes a discard or write zeroes request of 8 sectors at `sector`,
+    /// with segment flags `flags`, available.
+    fn push_segment_with_flags(
+        mem: &GuestMemoryMmap,
+        vq: &GuestQ,
+        base: u64,
+        request_type: u32,
+        sector: u64,
+        flags: u32,
+    ) {
         let segment = base + u64::from(vq.avail.idx.get()) * 0x100 + 0x20;
-        // Segment: sector, 8 sectors, no flags.
+        // Segment: sector, 8 sectors, flags.
         mem.write_obj(sector, GuestAddress(segment)).unwrap();
         mem.write_obj(8u32, GuestAddress(segment + 8)).unwrap();
-        mem.write_obj(0u32, GuestAddress(segment + 12)).unwrap();
+        mem.write_obj(flags, GuestAddress(segment + 12)).unwrap();
         push_request(mem, vq, base, request_type, (segment, 16));
     }
 
@@ -2951,6 +2973,305 @@ mod tests {
         assert_eq!(stats.executed.load(Ordering::SeqCst), 2 * SLOW_DEPTH);
     }
 
+    /// Runs `handlers` as their queue threads do until `done`, or fails
+    /// after 10 seconds; then for `settle` more, and returns them.
+    fn run_until(
+        handlers: Vec<BlockEpollHandler>,
+        done: impl Fn() -> bool,
+        settle: Duration,
+    ) -> Vec<BlockEpollHandler> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let runner = run_queues(handlers, Arc::clone(&stop));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            if Instant::now() >= deadline {
+                stop.store(true, Ordering::SeqCst);
+                runner.join().unwrap();
+                panic!("Timed out waiting for requests");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(settle);
+        stop.store(true, Ordering::SeqCst);
+        runner.join().unwrap()
+    }
+
+    /// The queues waiting for a slot, oldest first.
+    fn line(budget: &OffloadBudget) -> Vec<usize> {
+        let state = budget.state.lock().unwrap();
+        state.waiters.iter().map(|(q, _, _)| *q).collect()
+    }
+
+    /// A queue thread that fails, run as spawn_worker runs it (`run()`),
+    /// gives back on exit the slots its requests hold, its parked discards,
+    /// its place in line and its share of the active count: the other
+    /// queue of the device then takes every slot.
+    #[test]
+    fn exiting_queue_gives_back_what_it_holds_of_the_device() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        let depth = SLOW_DEPTH as u16;
+        let (mut q0, vq0, completions) = slow_discard_handler(&mem, 0x1000, 0x8000, depth, &stats);
+        push_segment(&mem, &vq0, 0x8000, VIRTIO_BLK_T_WRITE_ZEROES, 100);
+        push_segment(&mem, &vq0, 0x8000, VIRTIO_BLK_T_DISCARD, 200);
+        let (mut q1, vq1, _) = slow_discard_handler(&mem, 0x3000, 0xa000, 0, &stats);
+        push_segment(&mem, &vq1, 0xa000, VIRTIO_BLK_T_WRITE_ZEROES, 300);
+        let (budget, queue_evts) = one_device(&mut [&mut q0, &mut q1]);
+        let active = Arc::clone(&q0.active_request_count);
+
+        // Queue 0 holds every slot and parks a discard; queue 1's write
+        // zeroes waits after it.
+        q0.process_queue_submit().unwrap();
+        q1.process_queue_submit().unwrap();
+        assert_eq!(budget.in_flight(), OFFLOAD_DEPTH);
+        assert_eq!(q0.parked_discards.len(), 1);
+        assert_eq!(line(&budget), [0, 1]);
+        assert_eq!(active.load(Ordering::SeqCst), OFFLOAD_DEPTH + 1);
+
+        // The backend reports its first completion for no request in
+        // flight, which fails the queue thread with the discards that run
+        // one after the other still in flight.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while completions.lock().unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "Timed out waiting for completions"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        completions.lock().unwrap()[0].user_data = 999;
+        let (sender, receiver) = mpsc::channel();
+        let runner = thread::spawn(move || {
+            let paused = AtomicBool::new(false);
+            let paused_sync = Barrier::new(1);
+            sender.send(q0.run(&paused, &paused_sync)).unwrap();
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("The queue thread did not exit");
+        runner.join().unwrap();
+        assert!(stats.in_flight.load(Ordering::SeqCst) > 0);
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Missing the expected entry"),
+            "{err:?}"
+        );
+
+        // Nothing of queue 0 is left on the device.
+        {
+            let state = budget.state.lock().unwrap();
+            assert_eq!(state.in_flight, 0);
+            assert_eq!(state.discards, 0);
+            assert!(state.parked.iter().all(|parked| parked.queue != 0));
+            assert!(state.waiters.iter().all(|(q, _, _)| *q != 0));
+        }
+        assert_eq!(budget.parked_count.load(Ordering::SeqCst), 0);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        // Queue 1 is woken, and takes every slot.
+        queue_evts[1].read().unwrap();
+        for sector in 0..u64::from(depth) {
+            push_segment(&mem, &vq1, 0xa000, VIRTIO_BLK_T_DISCARD, 400 + 8 * sector);
+        }
+        q1.process_queue_submit().unwrap();
+        assert_eq!(budget.in_flight(), OFFLOAD_DEPTH);
+        assert!(q1.parked_discards.is_empty());
+        assert_eq!(q1.inflight_requests.len(), OFFLOAD_DEPTH);
+        assert!(line(&budget).is_empty());
+        assert_eq!(active.load(Ordering::SeqCst), OFFLOAD_DEPTH);
+    }
+
+    /// A write zeroes that cancels a parked discard whose status cannot be
+    /// written, as its memory was removed after the discard was parked, is
+    /// still submitted and completes, and no slot leaks.
+    #[test]
+    fn write_zeroes_cancelling_a_discard_with_a_bad_status_completes() {
+        const STATUS_REGION: u64 = 0x2_0000;
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x10000),
+            (GuestAddress(STATUS_REGION), 0x1000),
+        ])
+        .unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        let depth = SLOW_DEPTH as u16;
+        let (mut handler, vq, _) = slow_discard_handler(&mem, 0x1000, 0x8000, depth, &stats);
+        let (budget, _) = one_device(&mut [&mut handler]);
+        let active = Arc::clone(&handler.active_request_count);
+        push_segment(&mem, &vq, 0x8000, VIRTIO_BLK_T_DISCARD, WRITE_SECTOR);
+        // The parked discard's status is in a region of its own.
+        vq.dtable[usize::from(depth) * 3 + 2].set(STATUS_REGION, 1, VRING_DESC_F_WRITE as u16, 0);
+        handler.process_queue_submit().unwrap();
+        assert_eq!(handler.parked_discards.len(), 1);
+        let (smaller, _) = mem
+            .remove_region(GuestAddress(STATUS_REGION), 0x1000)
+            .unwrap();
+        handler.mem.lock().unwrap().replace(smaller);
+        push_segment(&mem, &vq, 0x8000, VIRTIO_BLK_T_WRITE_ZEROES, WRITE_SECTOR);
+
+        handler.process_queue_submit().unwrap();
+        assert!(handler.parked_discards.is_empty());
+        assert_eq!(budget.in_flight(), OFFLOAD_DEPTH);
+
+        let used = depth + 2;
+        run_until(vec![handler], || vq.used.idx.get() >= used, Duration::ZERO);
+        let status: u8 = mem.read_obj(status_addr(0x8000, depth + 1)).unwrap();
+        assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+        assert_eq!(stats.write_zeroes_done.load(Ordering::SeqCst), 1);
+        assert_eq!(stats.executed.load(Ordering::SeqCst), SLOW_DEPTH);
+        assert_eq!(budget.in_flight(), 0);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    /// A write zeroes with the unmap flag cancels the parked discard it
+    /// overlaps: the discard does not run, and the range reads back zeroed.
+    #[test]
+    fn write_zeroes_with_unmap_cancels_an_overlapped_parked_discard() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        stats
+            .disk
+            .lock()
+            .unwrap()
+            .resize((WRITE_SECTOR as usize + 8) * 512, 0x5a);
+        let depth = SLOW_DEPTH as u16;
+        let (mut handler, vq, _) = slow_discard_handler(&mem, 0x1000, 0x8000, depth, &stats);
+        let (budget, _) = one_device(&mut [&mut handler]);
+        push_segment(&mem, &vq, 0x8000, VIRTIO_BLK_T_DISCARD, WRITE_SECTOR);
+        push_segment_with_flags(
+            &mem,
+            &vq,
+            0x8000,
+            VIRTIO_BLK_T_WRITE_ZEROES,
+            WRITE_SECTOR,
+            VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP,
+        );
+
+        handler.process_queue_submit().unwrap();
+        // Completed before the write zeroes was submitted.
+        assert!(handler.parked_discards.is_empty());
+        let status: u8 = mem.read_obj(status_addr(0x8000, depth)).unwrap();
+        assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+
+        // Long enough for the discard to have run, had it been submitted.
+        run_until(
+            vec![handler],
+            || vq.used.idx.get() >= depth + 2,
+            SLOW_LATENCY * 2,
+        );
+        for n in 0..depth + 2 {
+            let status: u8 = mem.read_obj(status_addr(0x8000, n)).unwrap();
+            assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+        }
+        assert_eq!(stats.executed.load(Ordering::SeqCst), SLOW_DEPTH);
+        assert_eq!(stats.write_zeroes_done.load(Ordering::SeqCst), 1);
+        for sector in WRITE_SECTOR..WRITE_SECTOR + 8 {
+            assert_eq!(stats.sector(sector), [0; 512]);
+        }
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    /// A write of no bytes inside a parked discard's range changes nothing:
+    /// the discard is not cancelled, and runs.
+    #[test]
+    fn zero_length_write_does_not_cancel_a_parked_discard() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        let depth = SLOW_DEPTH as u16;
+        let (mut handler, vq, _) = slow_discard_handler(&mem, 0x1000, 0x8000, depth, &stats);
+        let (budget, _) = one_device(&mut [&mut handler]);
+        // The discard covers WRITE_SECTOR, where the write lands.
+        push_segment(&mem, &vq, 0x8000, VIRTIO_BLK_T_DISCARD, WRITE_SECTOR - 1);
+        push_request(&mem, &vq, 0x8000, VIRTIO_BLK_T_OUT, (WRITE_DATA, 0));
+
+        handler.process_queue_submit().unwrap();
+        assert_eq!(handler.parked_discards.len(), 1);
+
+        run_until(
+            vec![handler],
+            || vq.used.idx.get() >= depth + 2,
+            Duration::ZERO,
+        );
+        let status: u8 = mem.read_obj(status_addr(0x8000, depth)).unwrap();
+        assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+        assert_eq!(stats.executed.load(Ordering::SeqCst), SLOW_DEPTH + 1);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    /// A queue whose pass ends with an error, after a write cancelled the
+    /// discard it waited for a slot for, leaves the line: another queue
+    /// takes the next free slot without waiting for it.
+    #[test]
+    fn queue_failing_its_pass_leaves_the_line() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        let (mut q0, vq0, _) = slow_discard_handler(&mem, 0x1000, 0x8000, 0, &stats);
+        let (mut q1, _vq1, _) = slow_discard_handler(&mem, 0x3000, 0xa000, 0, &stats);
+        let (budget, _) = one_device(&mut [&mut q0, &mut q1]);
+        // Queue 1 holds every discard slot.
+        for _ in 0..SLOW_DEPTH {
+            assert!(budget.try_acquire(1, OffloadKind::Discard));
+        }
+        // Queue 0 parks a discard and waits; a write cancels it; then the
+        // guest reuses the write's head while it is in flight.
+        push_segment(&mem, &vq0, 0x8000, VIRTIO_BLK_T_DISCARD, WRITE_SECTOR);
+        push_write(&mem, &vq0, 0x8000, 0x5a);
+        vq0.avail.ring[2].set(3);
+        vq0.avail.idx.set(3);
+
+        let err = q0.process_queue_submit().unwrap_err();
+        assert!(matches!(err, Error::QueueDuplicatedHeadIndex), "{err:?}");
+        assert!(q0.parked_discards.is_empty());
+        assert!(line(&budget).is_empty());
+        budget.release(1, OffloadKind::Discard);
+        assert!(budget.try_acquire(1, OffloadKind::Discard));
+    }
+
+    /// An offloaded discard completion for no request in flight, while a
+    /// write zeroes of the queue is also in flight, gives back a discard
+    /// slot: once the write zeroes completes, the device holds none.
+    #[test]
+    fn missing_discard_completion_releases_a_discard_slot() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        let (mut handler, vq, completions) = slow_discard_handler(&mem, 0x1000, 0x8000, 1, &stats);
+        push_segment(&mem, &vq, 0x8000, VIRTIO_BLK_T_WRITE_ZEROES, 100);
+        let (budget, _) = one_device(&mut [&mut handler]);
+        let (_kill_evt, _pause_evt, mut helper) = epoll_helper();
+
+        handler.process_queue_submit().unwrap();
+        assert_eq!(budget.in_flight(), 2);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while completions.lock().unwrap().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "Timed out waiting for completions"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The discard's completion comes first, while the write zeroes is in
+        // flight, for no request in flight; the batch goes on after it.
+        {
+            let mut completions = completions.lock().unwrap();
+            let index = completions
+                .iter()
+                .position(|c| c.offloaded == Some(OffloadedOp::Discard))
+                .unwrap();
+            let mut discard = completions.remove(index).unwrap();
+            discard.user_data = 999;
+            completions.push_front(discard);
+        }
+        assert!(wait_readable(
+            handler.disk_image.notifier().as_raw_fd(),
+            Duration::from_secs(10)
+        ));
+        let event = epoll::Event::new(epoll::Events::EPOLLIN, u64::from(COMPLETION_EVENT));
+        handler.handle_event(&mut helper, &event).unwrap_err();
+
+        assert_eq!(stats.write_zeroes_done.load(Ordering::SeqCst), 1);
+        let state = budget.state.lock().unwrap();
+        assert_eq!(state.in_flight, 0);
+        assert_eq!(state.discards, 0);
+    }
+
     /// Waits up to `timeout` for the status of the `n`th request from `base`
     /// to be set, and returns it.
     fn wait_status(mem: &GuestMemoryMmap, base: u64, n: u16, timeout: Duration) -> u8 {
@@ -3094,7 +3415,7 @@ mod tests {
     }
 
     /// xorshift64*: a small seeded generator, so that a failing request mix
-    /// is reproduced from its seed alone.
+    /// replays the same requests from its seed.
     struct Rng(u64);
 
     impl Rng {
@@ -3139,6 +3460,8 @@ mod tests {
         completed: Option<Instant>,
         // Outstanding when the device drained for a pause.
         across_drain: bool,
+        // For a write zeroes: whether it sets the unmap flag.
+        unmap: bool,
         // For a read: what each of its sectors may hold.
         may_read: Vec<Vec<Vec<u8>>>,
     }
@@ -3248,8 +3571,13 @@ mod tests {
                 MixOp::Discard | MixOp::WriteZeroes => {
                     self.mem.write_obj(start, GuestAddress(segment)).unwrap();
                     self.mem.write_obj(len, GuestAddress(segment + 8)).unwrap();
+                    let flags = if request.unmap {
+                        VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP
+                    } else {
+                        0
+                    };
                     self.mem
-                        .write_obj(0u32, GuestAddress(segment + 12))
+                        .write_obj(flags, GuestAddress(segment + 12))
                         .unwrap();
                     let request_type = if request.op == MixOp::Discard {
                         VIRTIO_BLK_T_DISCARD
@@ -3295,8 +3623,10 @@ mod tests {
             vq.avail.idx.set(n + 1);
 
             self.trace.push(format!(
-                "submit {id}: {:?} on queue {queue}, sectors {:?}",
-                request.op, request.sectors
+                "submit {id}: {:?}{} on queue {queue}, sectors {:?}",
+                request.op,
+                if request.unmap { " (unmap)" } else { "" },
+                request.sectors
             ));
             request.submitted = Instant::now();
             self.by_queue[queue].push(id);
@@ -3370,14 +3700,24 @@ mod tests {
                 mix.trace.push("drain".to_string());
                 let stop = Arc::new(AtomicBool::new(false));
                 let runner = run_queues(mem::take(&mut mix.handlers), Arc::clone(&stop));
+                let mut handlers = None;
                 drain_for_pause(&draining, &queue_evts, || {
-                    Block::wait_for_active_requests(&active).map_err(MigratableError::Pause)
+                    let result =
+                        Block::wait_for_active_requests(&active).map_err(MigratableError::Pause);
+                    // The queue threads stop for the pause, still draining.
+                    stop.store(true, Ordering::SeqCst);
+                    handlers = Some(runner.join().unwrap());
+                    result
                 })
                 .unwrap();
+                mix.handlers = handlers.unwrap();
                 // Nothing runs once the device is drained.
                 assert_eq!(budget.in_flight(), 0, "Offloads in flight after draining");
-                stop.store(true, Ordering::SeqCst);
-                mix.handlers = runner.join().unwrap();
+                assert_eq!(
+                    active.load(Ordering::SeqCst),
+                    0,
+                    "Requests active after draining"
+                );
                 for request in mix.requests.iter_mut() {
                     request.across_drain |= request.completed.is_none();
                 }
@@ -3413,6 +3753,8 @@ mod tests {
                 let most = if op == MixOp::Discard { 8 } else { 4 };
                 start..start + 1 + rng.below(most.min(MIX_SECTORS - start))
             };
+            // Half the write zeroes unmap their range.
+            let unmap = op == MixOp::WriteZeroes && rng.below(2) == 0;
             let mut request = MixRequest {
                 op,
                 queue,
@@ -3421,6 +3763,7 @@ mod tests {
                 submitted: Instant::now(),
                 completed: None,
                 across_drain: false,
+                unmap,
                 may_read: Vec::new(),
             };
             // A guest waits for the requests its request overlaps, except
@@ -3518,6 +3861,7 @@ mod tests {
             "{max_discards} discards in flight"
         );
         assert_eq!(budget.in_flight(), 0);
+        assert_eq!(active.load(Ordering::SeqCst), 0, "Requests still active");
         assert!(mix.handlers.iter().all(|h| h.parked_discards.is_empty()));
 
         // A read or write behind a write zeroes waiting for a slot waits up
@@ -3570,11 +3914,14 @@ mod tests {
         }
     }
 
-    /// Random mixes of discards, write zeroes, reads, writes and flushes
-    /// across two queues of a device, with a drain for a pause in some:
-    /// the device keeps its offload bounds, completes every request once,
-    /// never holds reads and writes behind discards or write zeroes, and
-    /// never loses data the guest wrote. `MIX_SEED` runs one mix.
+    /// Random mixes of discards, write zeroes (with and without the unmap
+    /// flag), reads, writes and flushes across two queues of a device, with
+    /// a drain for a pause in some: the device keeps its offload bounds,
+    /// completes every request once, leaves no request active, never holds
+    /// reads and writes behind discards or write zeroes, and never loses
+    /// data the guest wrote. `MIX_SEED` runs one mix: a seed replays the
+    /// sequence of requests, not the interleaving of the backend's worker
+    /// threads with the queues.
     #[test]
     fn random_request_mixes_keep_the_offload_invariants() {
         let seeds = match env::var("MIX_SEED") {
