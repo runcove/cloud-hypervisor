@@ -513,13 +513,15 @@ impl Request {
     }
 
     /// Checks a discard request as [`Self::execute_async`] does before
-    /// submitting it, so the caller can defer a valid one.
+    /// submitting it, so the caller can defer a valid one. Returns the byte
+    /// offset and length it covers; write zeroes requests have the same
+    /// layout.
     pub fn check_discard<B: Bitmap + 'static>(
         &self,
         mem: &vm_memory::GuestMemoryMmap<B>,
         disk_nsectors: u64,
-    ) -> Result<(), ExecuteError> {
-        self.discard_range(mem, disk_nsectors).map(|_| ())
+    ) -> Result<(u64, u64), ExecuteError> {
+        self.discard_range(mem, disk_nsectors)
     }
 
     /// Returns the byte range of a discard request.

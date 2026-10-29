@@ -142,7 +142,7 @@ fn complete(
     completions
         .lock()
         .unwrap()
-        .push_back(AsyncIoCompletion::new(user_data, result, None));
+        .push_back(AsyncIoCompletion::from_offload(user_data, result));
     // Signal after queuing so the device always finds the completion once it
     // has consumed the event.
     if let Err(e) = notifier.write(1) {

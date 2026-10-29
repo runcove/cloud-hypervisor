@@ -17,7 +17,7 @@ use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 use std::{io, mem, result, thread};
 
@@ -165,66 +165,289 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
+/// What an offload slot is taken for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OffloadKind {
+    Discard,
+    WriteZeroes,
+}
+
+impl OffloadKind {
+    fn of(request_type: RequestType) -> Option<Self> {
+        match request_type {
+            RequestType::Discard => Some(OffloadKind::Discard),
+            RequestType::WriteZeroes => Some(OffloadKind::WriteZeroes),
+            _ => None,
+        }
+    }
+}
+
+/// A discard parked on a queue, by byte range, until it takes a slot.
+struct ParkedRange {
+    queue: usize,
+    head: u16,
+    start: u64,
+    end: u64,
+    // Overlapped by a later write: completed without running.
+    cancelled: bool,
+}
+
+/// What a parked discard does when its queue tries to submit it.
+#[derive(Debug, PartialEq, Eq)]
+enum ParkedStart {
+    Run,
+    Cancelled,
+    NoSlot,
+}
+
+#[derive(Default)]
+struct BudgetState {
+    in_flight: usize,
+    discards: usize,
+    // Queues waiting for a slot, oldest first, with the kind they wait for
+    // (write zeroes when they wait for both).
+    waiters: VecDeque<(usize, OffloadKind)>,
+    // The parked discards of every queue of the device.
+    parked: Vec<ParkedRange>,
+}
+
 /// Bounds the discard and write zeroes requests running on backend worker
 /// threads across all queues of a device, so that a pause, which waits for
 /// them, waits for at most `depth` of them however many queues there are.
+///
+/// Discards take at most `depth - 1` slots, so that one is always left for
+/// write zeroes, which wait on the virtqueue, holding up the requests behind
+/// them, rather than being parked. Slots go to the waiting queues in the
+/// order they started waiting: a queue does not take a slot that a queue
+/// waiting before it can use, so a queue with many parked discards cannot
+/// starve the others by retaking every slot it releases.
+///
+/// It also holds the parked discards of the device, so that a write on one
+/// queue can cancel a parked discard of another that it overlaps.
 struct OffloadBudget {
-    in_flight: AtomicUsize,
     depth: usize,
-    // Per queue, by position: whether the queue waits for a slot, and the
-    // eventfd that makes it process its queue again.
-    waiters: Vec<(AtomicBool, EventFd)>,
+    state: Mutex<BudgetState>,
+    // The number of parked discards, so that a write checks for overlap
+    // without the lock when there are none.
+    parked_count: AtomicUsize,
+    // Per queue, by position: the eventfd that makes it process its queue
+    // again.
+    queue_evts: Vec<EventFd>,
 }
 
 impl OffloadBudget {
     fn new(depth: usize, queue_evts: Vec<EventFd>) -> Self {
         OffloadBudget {
-            in_flight: AtomicUsize::new(0),
             depth,
-            waiters: queue_evts
-                .into_iter()
-                .map(|queue_evt| (AtomicBool::new(false), queue_evt))
-                .collect(),
+            state: Mutex::new(BudgetState::default()),
+            parked_count: AtomicUsize::new(0),
+            queue_evts,
         }
     }
 
-    fn take(&self) -> bool {
-        let mut n = self.in_flight.load(Ordering::SeqCst);
-        while n < self.depth {
-            match self
-                .in_flight
-                .compare_exchange_weak(n, n + 1, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => return true,
-                Err(current) => n = current,
+    fn discard_depth(&self) -> usize {
+        max(self.depth.saturating_sub(1), 1)
+    }
+
+    fn fits(&self, state: &BudgetState, kind: OffloadKind) -> bool {
+        state.in_flight < self.depth
+            && (kind == OffloadKind::WriteZeroes || state.discards < self.discard_depth())
+    }
+
+    fn wake(&self, queue: usize) {
+        if let Some(queue_evt) = self.queue_evts.get(queue)
+            && let Err(e) = queue_evt.write(1)
+        {
+            error!("Failed to wake a block queue waiting for an offload slot: {e}");
+        }
+    }
+
+    /// Takes a slot of `kind` for `queue` if one is free and no queue that
+    /// started waiting before it can use it; otherwise registers `queue` as
+    /// waiting, to be woken through its eventfd.
+    fn acquire_locked(&self, state: &mut BudgetState, queue: usize, kind: OffloadKind) -> bool {
+        let position = state.waiters.iter().position(|(q, _)| *q == queue);
+        let ahead = position.unwrap_or(state.waiters.len());
+        let blocked = state
+            .waiters
+            .iter()
+            .take(ahead)
+            .any(|(_, k)| self.fits(state, *k));
+        if self.fits(state, kind) && !blocked {
+            state.in_flight += 1;
+            if kind == OffloadKind::Discard {
+                state.discards += 1;
             }
+            // A queue still waiting for write zeroes keeps its place.
+            if let Some(position) = position
+                && (kind == OffloadKind::WriteZeroes
+                    || state.waiters[position].1 == OffloadKind::Discard)
+            {
+                state.waiters.remove(position);
+            }
+            return true;
+        }
+        match position {
+            Some(position) => {
+                if kind == OffloadKind::WriteZeroes {
+                    state.waiters[position].1 = kind;
+                }
+            }
+            None => state.waiters.push_back((queue, kind)),
         }
         false
     }
 
-    /// Takes a slot for queue `queue`. Without one, the queue is woken
-    /// through its eventfd once a slot is released.
-    fn try_acquire(&self, queue: usize) -> bool {
-        if self.take() {
-            return true;
-        }
-        if let Some((waiting, _)) = self.waiters.get(queue) {
-            waiting.store(true, Ordering::SeqCst);
-        }
-        // A slot released before the queue was marked waiting woke nobody.
-        self.take()
+    fn try_acquire(&self, queue: usize, kind: OffloadKind) -> bool {
+        let mut state = self.state.lock().unwrap();
+        self.acquire_locked(&mut state, queue, kind)
     }
 
-    fn release(&self) {
-        let previous = self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        debug_assert!(previous > 0);
-        for (waiting, queue_evt) in &self.waiters {
-            if waiting.swap(false, Ordering::SeqCst)
-                && let Err(e) = queue_evt.write(1)
-            {
-                error!("Failed to wake a block queue waiting for an offload slot: {e}");
+    /// Wakes the waiting queues the free slots can serve, oldest first.
+    fn wake_waiters(&self, state: &BudgetState) {
+        let mut in_flight = state.in_flight;
+        let mut discards = state.discards;
+        for (queue, kind) in &state.waiters {
+            if in_flight >= self.depth {
+                break;
+            }
+            if *kind == OffloadKind::Discard {
+                if discards >= self.discard_depth() {
+                    continue;
+                }
+                discards += 1;
+            }
+            in_flight += 1;
+            self.wake(*queue);
+        }
+    }
+
+    fn release(&self, kind: OffloadKind) {
+        let mut state = self.state.lock().unwrap();
+        debug_assert!(state.in_flight > 0);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if kind == OffloadKind::Discard {
+            debug_assert!(state.discards > 0);
+            state.discards = state.discards.saturating_sub(1);
+        }
+        self.wake_waiters(&state);
+    }
+
+    /// Releases a slot whose kind is not known, for a completion that has no
+    /// request: the device needs a reset, but its other queues go on.
+    fn release_unknown(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.in_flight = state.in_flight.saturating_sub(1);
+        state.discards = state.discards.min(state.in_flight);
+        self.wake_waiters(&state);
+    }
+
+    /// Records a discard that `queue` parked, at bytes `start..end`.
+    fn park(&self, queue: usize, head: u16, start: u64, end: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.parked.push(ParkedRange {
+            queue,
+            head,
+            start,
+            end,
+            cancelled: false,
+        });
+        self.parked_count
+            .store(state.parked.len(), Ordering::SeqCst);
+    }
+
+    /// Cancels the parked discards that overlap bytes `start..end`, which a
+    /// write from `queue` is about to change, so that none of them runs
+    /// after the write. Wakes the other queues that parked them to complete
+    /// them; returns whether `queue` parked any.
+    fn cancel_overlapping(&self, queue: usize, start: u64, end: u64) -> bool {
+        if self.parked_count.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        let mut own = false;
+        for parked in state.parked.iter_mut() {
+            if parked.cancelled || parked.start >= end || start >= parked.end {
+                continue;
+            }
+            parked.cancelled = true;
+            if parked.queue == queue {
+                own = true;
+            } else {
+                self.wake(parked.queue);
             }
         }
+        own
+    }
+
+    /// Removes and returns the heads of the cancelled parked discards of
+    /// `queue`.
+    fn take_cancelled(&self, queue: usize) -> Vec<u16> {
+        let mut state = self.state.lock().unwrap();
+        let mut heads = Vec::new();
+        state.parked.retain(|parked| {
+            let take = parked.queue == queue && parked.cancelled;
+            if take {
+                heads.push(parked.head);
+            }
+            !take
+        });
+        self.parked_count
+            .store(state.parked.len(), Ordering::SeqCst);
+        heads
+    }
+
+    /// Takes a slot for the parked discard `head` of `queue`, unless a write
+    /// has cancelled it.
+    fn start_parked(&self, queue: usize, head: u16) -> ParkedStart {
+        let mut state = self.state.lock().unwrap();
+        let Some(index) = state
+            .parked
+            .iter()
+            .position(|parked| parked.queue == queue && parked.head == head)
+        else {
+            // Not recorded: nothing can cancel it.
+            return if self.acquire_locked(&mut state, queue, OffloadKind::Discard) {
+                ParkedStart::Run
+            } else {
+                ParkedStart::NoSlot
+            };
+        };
+        let start = if state.parked[index].cancelled {
+            ParkedStart::Cancelled
+        } else if self.acquire_locked(&mut state, queue, OffloadKind::Discard) {
+            ParkedStart::Run
+        } else {
+            return ParkedStart::NoSlot;
+        };
+        state.parked.swap_remove(index);
+        self.parked_count
+            .store(state.parked.len(), Ordering::SeqCst);
+        start
+    }
+
+    /// Forgets the parked discards of `queue`, for a pause that completes
+    /// them without running them.
+    fn forget_parked(&self, queue: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.parked.retain(|parked| parked.queue != queue);
+        self.parked_count
+            .store(state.parked.len(), Ordering::SeqCst);
+    }
+
+    /// Ends the wait of `queue` for a slot, once it needs none, so that it
+    /// does not hold up the queues waiting after it.
+    fn withdraw(&self, queue: usize) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(position) = state.waiters.iter().position(|(q, _)| *q == queue) {
+            state.waiters.remove(position);
+            self.wake_waiters(&state);
+        }
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.state.lock().unwrap().in_flight
     }
 }
 
@@ -323,14 +546,18 @@ impl BlockEpollHandler {
         let mut batch_requests = Vec::new();
         let mut batch_inflight_requests = Vec::new();
         let mut processed = 0;
+        // Whether this pass leaves requests on the virtqueue.
+        let mut left_on_queue = false;
 
         loop {
             // Cap a single drain at the virtqueue size. A compliant driver won't submit more that
             // queue_size, but a buggy or malicious one can keep adding as the VMM is reading.
             if processed >= queue_size {
+                left_on_queue = true;
                 break;
             }
             if draining_active_requests.load(Ordering::SeqCst) {
+                left_on_queue = true;
                 break;
             }
             processed += 1;
@@ -397,6 +624,7 @@ impl BlockEpollHandler {
                     // Stop processing the queue and return this descriptor chain to the
                     // avail ring, for later processing.
                     queue.go_to_previous_position();
+                    left_on_queue = true;
                     break;
                 }
                 // Exercise the rate limiter only if this request is of data transfer type.
@@ -416,6 +644,7 @@ impl BlockEpollHandler {
                         // Stop processing the queue and return this descriptor chain to the
                         // avail ring, for later processing.
                         queue.go_to_previous_position();
+                        left_on_queue = true;
                         break;
                     }
                 }
@@ -423,24 +652,30 @@ impl BlockEpollHandler {
 
             // Discard and write zeroes running on the backend's worker threads
             // each take one of the device's offload slots.
-            let offload_budget = self.offload_budget.as_deref().filter(|_| {
-                matches!(
-                    request.request_type(),
-                    RequestType::Discard | RequestType::WriteZeroes
-                )
-            });
-            if let Some(budget) = offload_budget {
-                let queue_index = usize::from(self.queue_index);
-                if request.request_type() == RequestType::Discard {
+            let offload_kind = self
+                .offload_budget
+                .as_ref()
+                .and_then(|_| OffloadKind::of(request.request_type()));
+            let queue_index = usize::from(self.queue_index);
+            if let Some(budget) = self.offload_budget.as_deref()
+                && let Some(kind) = offload_kind
+            {
+                if kind == OffloadKind::Discard {
                     // Without a slot, or behind discards already waiting for
                     // one, take the discard off the queue anyway and park it,
                     // so that the reads and writes behind it go on.
-                    if !self.parked_discards.is_empty() || !budget.try_acquire(queue_index) {
+                    if !self.parked_discards.is_empty() || !budget.try_acquire(queue_index, kind) {
                         let status = match request.check_discard(
                             desc_chain.memory(),
                             self.disk_nsectors.load(Ordering::SeqCst),
                         ) {
-                            Ok(()) => {
+                            Ok((offset, length)) => {
+                                budget.park(
+                                    queue_index,
+                                    head,
+                                    offset,
+                                    offset.saturating_add(length),
+                                );
                                 self.parked_discards.push_back((head, request));
                                 self.active_request_count.fetch_add(1, Ordering::SeqCst);
                                 continue;
@@ -462,20 +697,41 @@ impl BlockEpollHandler {
                             .map_err(Error::QueueEnableNotification)?;
                         continue;
                     }
-                } else if !budget.try_acquire(queue_index) {
+                } else if !budget.try_acquire(queue_index, kind) {
                     // Write zeroes must have run once it completes, and a
                     // pause cannot wait for an unbounded number of them, so
                     // it is not parked: leave it and the requests behind it
                     // on the queue until a slot is released, which processes
-                    // the queue again.
+                    // the queue again. Discards never take the last slot, so
+                    // it waits only for other write zeroes.
                     if let Some(rate_limiter) = &mut self.rate_limiter {
                         rate_limiter.manual_replenish(1, TokenType::Ops);
                     }
                     queue.go_to_previous_position();
+                    left_on_queue = true;
                     break;
                 }
             }
-            let holds_offload_slot = offload_budget.is_some();
+
+            // A parked discard must not run after a later write to its range
+            // and destroy the new data: complete it without running it, as a
+            // discard allows ("the device MAY deallocate", virtio 1.2
+            // 5.2.6.2). Parked discards of other queues are only marked, so
+            // that they never run, and their queues complete them.
+            if let Some(budget) = self.offload_budget.as_deref()
+                && let Some((offset, length)) =
+                    Self::write_range(&request, desc_chain.memory(), &self.disk_nsectors)
+                && budget.cancel_overlapping(queue_index, offset, offset.saturating_add(length))
+            {
+                Self::complete_cancelled_discards(
+                    queue,
+                    desc_chain.memory(),
+                    &mut self.parked_discards,
+                    budget,
+                    queue_index,
+                    &self.active_request_count,
+                )?;
+            }
 
             request.writeback = self.writeback.load(Ordering::Acquire);
 
@@ -501,8 +757,10 @@ impl BlockEpollHandler {
                     self.active_request_count.fetch_add(1, Ordering::SeqCst);
                 }
             } else {
-                if holds_offload_slot && let Some(budget) = &self.offload_budget {
-                    budget.release();
+                if let Some(kind) = offload_kind
+                    && let Some(budget) = &self.offload_budget
+                {
+                    budget.release(kind);
                 }
                 let status = match result {
                     Ok(_) => VIRTIO_BLK_S_OK,
@@ -566,8 +824,62 @@ impl BlockEpollHandler {
             self.complete_parked_discards();
         } else {
             self.submit_parked_discards()?;
+            if !left_on_queue
+                && self.parked_discards.is_empty()
+                && let Some(budget) = &self.offload_budget
+            {
+                budget.withdraw(usize::from(self.queue_index));
+            }
         }
 
+        Ok(())
+    }
+
+    /// The byte range a write or write zeroes request changes.
+    fn write_range(
+        request: &Request,
+        mem: &GuestMemoryMmap,
+        disk_nsectors: &AtomicU64,
+    ) -> Option<(u64, u64)> {
+        match request.request_type() {
+            RequestType::Out => {
+                let length = request
+                    .data_descriptors()
+                    .iter()
+                    .map(|(_, len)| u64::from(*len))
+                    .sum();
+                Some((request.sector().checked_mul(SECTOR_SIZE)?, length))
+            }
+            RequestType::WriteZeroes => request
+                .check_discard(mem, disk_nsectors.load(Ordering::SeqCst))
+                .ok(),
+            _ => None,
+        }
+    }
+
+    /// Completes, without running them, the parked discards of this queue
+    /// that a write has cancelled.
+    fn complete_cancelled_discards(
+        queue: &mut Queue,
+        mem: &GuestMemoryMmap,
+        parked_discards: &mut VecDeque<(u16, Request)>,
+        budget: &OffloadBudget,
+        queue_index: usize,
+        active_request_count: &Arc<AtomicUsize>,
+    ) -> Result<()> {
+        for head in budget.take_cancelled(queue_index) {
+            let Some(index) = parked_discards.iter().position(|(h, _)| *h == head) else {
+                continue;
+            };
+            let (head, request) = parked_discards.remove(index).unwrap();
+            let _active_request = ActiveRequestGuard::new(active_request_count);
+            mem.write_obj(VIRTIO_BLK_S_OK as u8, request.status_addr())
+                .map_err(Error::RequestStatus)?;
+            queue.add_used(mem, head, 1).map_err(Error::QueueAddUsed)?;
+            queue
+                .enable_notification(mem)
+                .map_err(Error::QueueEnableNotification)?;
+        }
         Ok(())
     }
 
@@ -576,8 +888,26 @@ impl BlockEpollHandler {
         let Some(budget) = self.offload_budget.clone() else {
             return Ok(());
         };
-        while !self.parked_discards.is_empty() && budget.try_acquire(usize::from(self.queue_index))
-        {
+        let queue_index = usize::from(self.queue_index);
+        Self::complete_cancelled_discards(
+            &mut self.queue,
+            &self.mem.memory(),
+            &mut self.parked_discards,
+            &budget,
+            queue_index,
+            &self.active_request_count,
+        )?;
+        while let Some(&(head, _)) = self.parked_discards.front() {
+            match budget.start_parked(queue_index, head) {
+                ParkedStart::NoSlot => break,
+                ParkedStart::Cancelled => {
+                    let (head, request) = self.parked_discards.pop_front().unwrap();
+                    let _active_request = ActiveRequestGuard::new(&self.active_request_count);
+                    self.return_parked_discard(head, &request, VIRTIO_BLK_S_OK as u8)?;
+                    continue;
+                }
+                ParkedStart::Run => {}
+            }
             let (head, mut request) = self.parked_discards.pop_front().unwrap();
             let result = request.execute_async(
                 self.mem.memory().into_inner(),
@@ -595,7 +925,7 @@ impl BlockEpollHandler {
                 self.inflight_requests.push_back((head, request));
                 continue;
             }
-            budget.release();
+            budget.release(OffloadKind::Discard);
             let _active_request = ActiveRequestGuard::new(&self.active_request_count);
             let status = match result {
                 Ok(_) => VIRTIO_BLK_S_OK as u8,
@@ -627,6 +957,11 @@ impl BlockEpollHandler {
     /// allows the device to deallocate the range ("the device MAY
     /// deallocate", virtio 1.2 5.2.6.2), so leaving it undone is valid.
     fn complete_parked_discards(&mut self) {
+        if let Some(budget) = &self.offload_budget {
+            let queue_index = usize::from(self.queue_index);
+            budget.forget_parked(queue_index);
+            budget.withdraw(queue_index);
+        }
         while let Some((head, request)) = self.parked_discards.pop_front() {
             let _active_request = ActiveRequestGuard::new(&self.active_request_count);
             if let Err(e) = self.return_parked_discard(head, &request, VIRTIO_BLK_S_OK as u8) {
@@ -700,8 +1035,14 @@ impl BlockEpollHandler {
         // their offload slots, for an unrelated completion.
         while let Some(completion) = self.disk_image.next_completed_request() {
             if let Err(e) = self.complete_request(completion, &mut totals) {
-                if result.is_ok() {
-                    result = Err(e);
+                // A completion for no request is a device error: report it
+                // rather than another error.
+                let fatal = matches!(e, Error::MissingEntryRequestList)
+                    && !matches!(result, Err(Error::MissingEntryRequestList));
+                if result.is_ok() || fatal {
+                    if let Err(previous) = mem::replace(&mut result, Err(e)) {
+                        warn!("Failed to process queue (complete): {previous:?}");
+                    }
                 } else {
                     warn!("Failed to process queue (complete): {e:?}");
                 }
@@ -734,15 +1075,23 @@ impl BlockEpollHandler {
         let result = completion.result;
         let desc_index = completion.user_data as u16;
 
-        let mut request = self.find_inflight_request(desc_index)?;
+        // An offloaded completion releases its slot even without a request,
+        // so that the other queues of the device keep their slots.
+        let budget = self.offload_budget.clone().filter(|_| completion.offloaded);
+        let mut request = match self.find_inflight_request(desc_index) {
+            Ok(request) => request,
+            Err(e) => {
+                if let Some(budget) = budget {
+                    budget.release_unknown();
+                }
+                return Err(e);
+            }
+        };
         let _active_request = ActiveRequestGuard::new(&self.active_request_count);
-        if let Some(budget) = &self.offload_budget
-            && matches!(
-                request.request_type(),
-                RequestType::Discard | RequestType::WriteZeroes
-            )
-        {
-            budget.release();
+        if let Some(budget) = budget {
+            budget.release(
+                OffloadKind::of(request.request_type()).unwrap_or(OffloadKind::WriteZeroes),
+            );
         }
 
         request
@@ -943,11 +1292,22 @@ impl EpollHelperHandler for BlockEpollHandler {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {e:?}"))
                 })?;
 
-                if let Err(e) = self.process_queue_complete() {
-                    warn!("Failed to process queue (complete): {e:?}");
-                }
+                let completed = self.process_queue_complete();
 
                 self.try_signal_used_queue()?;
+
+                match completed {
+                    Ok(()) => {}
+                    Err(e @ Error::MissingEntryRequestList) => {
+                        // The backend completed a request the device does
+                        // not have: exit the worker so spawn_worker marks the
+                        // device NEEDS_RESET.
+                        return Err(EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process queue (complete): {e}"
+                        )));
+                    }
+                    Err(e) => warn!("Failed to process queue (complete): {e:?}"),
+                }
 
                 let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
 
@@ -1640,7 +2000,11 @@ impl Pausable for Block {
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
         self.draining_active_requests.store(false, Ordering::SeqCst);
-        self.common.resume()
+        self.common.resume()?;
+        // A queue that waited for an offload slot stopped waiting while
+        // draining, and may hold requests on its virtqueue.
+        kick_queues(&self.queue_evts);
+        Ok(())
     }
 }
 
@@ -1749,7 +2113,8 @@ mod tests {
         assert_eq!(vq.used.idx.get(), 1);
     }
 
-    const SLOW_DEPTH: usize = 4;
+    // The discards a device runs at once: one slot is kept for write zeroes.
+    const SLOW_DEPTH: usize = OFFLOAD_DEPTH - 1;
     const SLOW_LATENCY: Duration = Duration::from_millis(200);
     const WRITE_DATA: u64 = 0xe000;
     const WRITE_SECTOR: u64 = 16;
@@ -1764,6 +2129,26 @@ mod tests {
         executed: AtomicUsize,
         // The disk the writes land on.
         disk: Mutex<Vec<u8>>,
+        // Write zeroes finished by the workers.
+        write_zeroes_done: AtomicUsize,
+    }
+
+    impl BackendStats {
+        fn zero(&self, offset: u64, length: u64) {
+            let mut disk = self.disk.lock().unwrap();
+            let end = disk.len().min((offset + length) as usize);
+            if let Some(range) = disk.get_mut(offset as usize..end) {
+                range.fill(0);
+            }
+        }
+
+        /// The sector of the disk at `sector`.
+        fn sector(&self, sector: u64) -> Vec<u8> {
+            let disk = self.disk.lock().unwrap();
+            let offset = (sector * 512) as usize;
+            disk.get(offset..offset + 512)
+                .map_or_else(|| vec![0; 512], <[u8]>::to_vec)
+        }
     }
 
     type Completions = Arc<Mutex<VecDeque<AsyncIoCompletion>>>;
@@ -1772,7 +2157,7 @@ mod tests {
     /// worker thread, and whose writes complete at once.
     struct SlowDiscards {
         notifier: EventFd,
-        jobs: Sender<u64>,
+        jobs: Sender<(u64, u64, u64)>,
         completions: Completions,
         stats: Arc<BackendStats>,
     }
@@ -1784,15 +2169,17 @@ mod tests {
             let completions = Arc::new(Mutex::new(VecDeque::new()));
             let worker_completions = Arc::clone(&completions);
             let worker_stats = Arc::clone(stats);
-            let (jobs, receiver) = mpsc::channel::<u64>();
+            let (jobs, receiver) = mpsc::channel::<(u64, u64, u64)>();
             thread::spawn(move || {
-                for user_data in receiver {
+                for (offset, length, user_data) in receiver {
                     thread::sleep(SLOW_LATENCY);
+                    // The discarded range reads back as zeroes.
+                    worker_stats.zero(offset, length);
                     worker_stats.in_flight.fetch_sub(1, Ordering::SeqCst);
                     worker_completions
                         .lock()
                         .unwrap()
-                        .push_back(AsyncIoCompletion::new(user_data, 0, None));
+                        .push_back(AsyncIoCompletion::from_offload(user_data, 0));
                     worker_notifier.write(1).unwrap();
                 }
             });
@@ -1843,7 +2230,7 @@ mod tests {
             }
             Ok(())
         }
-        fn punch_hole(&mut self, _: u64, _: u64, user_data: u64) -> AsyncIoResult<()> {
+        fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
             // Record rather than refuse, so a test sees how far the bound is
             // exceeded.
             let in_flight = self.stats.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1851,11 +2238,25 @@ mod tests {
                 .max_in_flight
                 .fetch_max(in_flight, Ordering::SeqCst);
             self.stats.executed.fetch_add(1, Ordering::SeqCst);
-            self.jobs.send(user_data).unwrap();
+            self.jobs.send((offset, length, user_data)).unwrap();
             Ok(())
         }
-        fn write_zeroes(&mut self, _: u64, _: u64, _: u64) -> AsyncIoResult<()> {
-            unreachable!()
+        fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
+            // Each on its own worker, taking `SLOW_LATENCY`.
+            let stats = Arc::clone(&self.stats);
+            let completions = Arc::clone(&self.completions);
+            let notifier = self.notifier.try_clone().unwrap();
+            thread::spawn(move || {
+                thread::sleep(SLOW_LATENCY);
+                stats.zero(offset, length);
+                stats.write_zeroes_done.fetch_add(1, Ordering::SeqCst);
+                completions
+                    .lock()
+                    .unwrap()
+                    .push_back(AsyncIoCompletion::from_offload(user_data, 0));
+                notifier.write(1).unwrap();
+            });
+            Ok(())
         }
         fn offloads_punch_hole_or_write_zeroes(&self) -> bool {
             true
@@ -1897,11 +2298,18 @@ mod tests {
     }
 
     fn push_discard(mem: &GuestMemoryMmap, vq: &GuestQ, base: u64) {
+        push_segment(mem, vq, base, VIRTIO_BLK_T_DISCARD, 0);
+    }
+
+    /// Makes a discard or write zeroes request of 8 sectors at `sector`
+    /// available.
+    fn push_segment(mem: &GuestMemoryMmap, vq: &GuestQ, base: u64, request_type: u32, sector: u64) {
         let segment = base + u64::from(vq.avail.idx.get()) * 0x100 + 0x20;
-        // Segment: sector 0, 8 sectors, no flags.
-        mem.write_obj(0u64, GuestAddress(segment)).unwrap();
+        // Segment: sector, 8 sectors, no flags.
+        mem.write_obj(sector, GuestAddress(segment)).unwrap();
         mem.write_obj(8u32, GuestAddress(segment + 8)).unwrap();
-        push_request(mem, vq, base, VIRTIO_BLK_T_DISCARD, (segment, 16));
+        mem.write_obj(0u32, GuestAddress(segment + 12)).unwrap();
+        push_request(mem, vq, base, request_type, (segment, 16));
     }
 
     /// Writes one sector of `byte` at `WRITE_SECTOR`.
@@ -2111,24 +2519,35 @@ mod tests {
     }
 
     /// A queue that finds no free offload slot is woken, once, when one is
-    /// released; a queue that did not wait is not.
+    /// released; a queue that did not wait is not. Discards leave the last
+    /// slot to write zeroes, and slots go to the queues in the order they
+    /// waited.
     #[test]
     fn offload_budget_wakes_a_queue_waiting_for_a_slot() {
         let evts = [
             EventFd::new(EFD_NONBLOCK).unwrap(),
             EventFd::new(EFD_NONBLOCK).unwrap(),
         ];
-        let budget = OffloadBudget::new(1, evts.iter().map(|e| e.try_clone().unwrap()).collect());
-        assert!(budget.try_acquire(0));
-        assert!(!budget.try_acquire(1));
+        let budget = OffloadBudget::new(2, evts.iter().map(|e| e.try_clone().unwrap()).collect());
+        assert!(budget.try_acquire(0, OffloadKind::Discard));
+        assert!(!budget.try_acquire(1, OffloadKind::Discard));
+        assert!(budget.try_acquire(0, OffloadKind::WriteZeroes));
         evts[1].read().unwrap_err();
-        budget.release();
+        budget.release(OffloadKind::WriteZeroes);
+        // Only a discard slot was waited for, and none is free.
+        evts[1].read().unwrap_err();
+        budget.release(OffloadKind::Discard);
         assert_eq!(evts[1].read().unwrap(), 1);
         evts[0].read().unwrap_err();
-        assert!(budget.try_acquire(1));
-        budget.release();
+        // Queue 1 waited first: queue 0 does not take its slot.
+        assert!(!budget.try_acquire(0, OffloadKind::Discard));
+        assert!(budget.try_acquire(1, OffloadKind::Discard));
+        budget.release(OffloadKind::Discard);
+        assert_eq!(evts[0].read().unwrap(), 1);
         evts[1].read().unwrap_err();
-        assert_eq!(budget.in_flight.load(Ordering::SeqCst), 0);
+        assert!(budget.try_acquire(0, OffloadKind::Discard));
+        budget.release(OffloadKind::Discard);
+        assert_eq!(budget.in_flight(), 0);
     }
 
     /// Two queues full of slow discards: the device runs at most
@@ -2149,14 +2568,19 @@ mod tests {
             2 * usize::from(DISCARDS) - SLOW_DEPTH
         );
 
-        // Draining from before the queue threads run, so that they submit no
-        // parked discard.
+        // Drain while the queue threads submit parked discards as slots are
+        // released.
         let draining = Arc::clone(&q0.draining_active_requests);
         let active = Arc::clone(&q0.active_request_count);
-        draining.store(true, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
-        let start = Instant::now();
         let runner = run_queues(vec![q0, q1], Arc::clone(&stop));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stats.executed.load(Ordering::SeqCst) <= SLOW_DEPTH {
+            assert!(Instant::now() < deadline, "No parked discard was submitted");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let executed = stats.executed.load(Ordering::SeqCst);
+        let start = Instant::now();
         drain_for_pause(&draining, &queue_evts, || {
             Block::wait_for_active_requests(&active).map_err(MigratableError::Pause)
         })
@@ -2170,8 +2594,12 @@ mod tests {
             "Drain took {elapsed:?} for {SLOW_DEPTH} discards of {SLOW_LATENCY:?}"
         );
         assert!(stats.max_in_flight.load(Ordering::SeqCst) <= SLOW_DEPTH);
-        // The parked discards were completed without running.
-        assert_eq!(stats.executed.load(Ordering::SeqCst), SLOW_DEPTH);
+        // The parked discards left were completed without running.
+        let executed_after = stats.executed.load(Ordering::SeqCst);
+        assert!(
+            executed_after <= executed + SLOW_DEPTH && executed_after < 2 * usize::from(DISCARDS),
+            "{executed_after} discards ran, {executed} before draining"
+        );
         for (vq, base) in [(&vq0, 0x8000), (&vq1, 0xa000)] {
             assert_eq!(vq.used.idx.get(), DISCARDS);
             for i in 0..DISCARDS {
@@ -2180,7 +2608,7 @@ mod tests {
             }
         }
         assert!(handlers.iter().all(|h| h.parked_discards.is_empty()));
-        assert_eq!(budget.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.in_flight(), 0);
     }
 
     /// A write behind a burst of slow discards does not wait for them.
@@ -2247,10 +2675,11 @@ mod tests {
         assert_eq!(status, VIRTIO_BLK_S_OK as u8);
     }
 
-    /// A completion that fails in the middle of a batch does not keep the
-    /// completions after it, and their offload slots.
+    /// An offloaded completion for no request in flight, in the middle of a
+    /// batch, releases its offload slot, does not keep the completions after
+    /// it, and is a device error, which makes the device NEEDS_RESET.
     #[test]
-    fn failed_completion_releases_every_offload_slot() {
+    fn missing_request_completion_releases_its_slot_and_needs_reset() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let stats: Arc<BackendStats> = Arc::default();
         let depth = SLOW_DEPTH as u16;
@@ -2260,9 +2689,9 @@ mod tests {
         let (_kill_evt, _pause_evt, mut helper) = epoll_helper();
 
         handler.process_queue_submit().unwrap();
-        assert_eq!(budget.in_flight.load(Ordering::SeqCst), SLOW_DEPTH);
-        // All of them completed, and one completion in the middle is for no
-        // request in flight.
+        assert_eq!(budget.in_flight(), SLOW_DEPTH);
+        // All of them completed, and the backend reports one in the middle
+        // for no request in flight.
         let deadline = Instant::now() + Duration::from_secs(10);
         while completions.lock().unwrap().len() < SLOW_DEPTH {
             assert!(
@@ -2271,22 +2700,172 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        completions
-            .lock()
-            .unwrap()
-            .insert(2, AsyncIoCompletion::new(999, 0, None));
-        handle_completion_event(&mut handler, &mut helper);
+        completions.lock().unwrap()[1].user_data = 999;
+        assert!(wait_readable(
+            handler.disk_image.notifier().as_raw_fd(),
+            Duration::from_secs(10)
+        ));
+        let event = epoll::Event::new(epoll::Events::EPOLLIN, u64::from(COMPLETION_EVENT));
+        // An error from handle_event() exits the queue thread, and
+        // spawn_worker marks the device NEEDS_RESET.
+        let err = handler.handle_event(&mut helper, &event).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Missing the expected entry"),
+            "{err:?}"
+        );
 
-        assert_eq!(vq.used.idx.get(), depth);
-        assert_eq!(budget.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(vq.used.idx.get(), depth - 1);
+        assert_eq!(budget.in_flight(), 0);
         // The whole capacity is available again: new discards all run.
         for _ in 0..depth {
             push_discard(&mem, &vq, 0x8000);
         }
         handler.process_queue_submit().unwrap();
         assert!(handler.parked_discards.is_empty());
-        assert_eq!(handler.inflight_requests.len(), SLOW_DEPTH);
+        assert_eq!(handler.inflight_requests.len(), SLOW_DEPTH + 1);
         assert_eq!(stats.executed.load(Ordering::SeqCst), 2 * SLOW_DEPTH);
+    }
+
+    /// Waits up to `timeout` for the status of the `n`th request from `base`
+    /// to be set, and returns it.
+    fn wait_status(mem: &GuestMemoryMmap, base: u64, n: u16, timeout: Duration) -> u8 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status: u8 = mem.read_obj(status_addr(base, n)).unwrap();
+            if status != 0xff || Instant::now() >= deadline {
+                return status;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A write behind a write zeroes behind a burst of slow discards does
+    /// not wait for them: the discards leave a slot to the write zeroes.
+    #[test]
+    fn write_behind_write_zeroes_and_slow_discards_completes_at_once() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        let (mut handler, vq, _) = slow_discard_handler(&mem, 0x1000, 0x8000, DISCARDS, &stats);
+        push_segment(&mem, &vq, 0x8000, VIRTIO_BLK_T_WRITE_ZEROES, 100);
+        push_write(&mem, &vq, 0x8000, 0x5a);
+        let (_kill_evt, _pause_evt, mut helper) = epoll_helper();
+
+        let start = Instant::now();
+        handler.process_queue_submit().unwrap();
+        handle_completion_event(&mut handler, &mut helper);
+        let elapsed = start.elapsed();
+
+        let status: u8 = mem.read_obj(status_addr(0x8000, DISCARDS + 1)).unwrap();
+        assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+        assert!(
+            elapsed < SLOW_LATENCY,
+            "The write took {elapsed:?} behind discards of {SLOW_LATENCY:?}"
+        );
+        assert_eq!(stats.sector(WRITE_SECTOR), [0x5a; 512]);
+    }
+
+    /// A queue with many parked discards and write zeroes does not retake
+    /// every slot it releases: the write zeroes of another queue, which
+    /// waits for one, gets one within about two latencies.
+    #[test]
+    fn write_zeroes_is_not_starved_by_another_queue() {
+        const WRITE_ZEROES: u16 = 8;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        let (mut a, vq_a, _) = slow_discard_handler(&mem, 0x1000, 0x8000, 0, &stats);
+        let (mut b, vq_b, _) = slow_discard_handler(&mem, 0x3000, 0xa000, DISCARDS, &stats);
+        for i in 0..WRITE_ZEROES {
+            push_segment(
+                &mem,
+                &vq_b,
+                0xa000,
+                VIRTIO_BLK_T_WRITE_ZEROES,
+                200 + 8 * u64::from(i),
+            );
+        }
+        push_segment(&mem, &vq_a, 0x8000, VIRTIO_BLK_T_WRITE_ZEROES, 300);
+        push_write(&mem, &vq_a, 0x8000, 0x5a);
+        let (budget, _) = one_device(&mut [&mut a, &mut b]);
+
+        // Queue B fills every slot; queue A waits after it.
+        b.process_queue_submit().unwrap();
+        a.process_queue_submit().unwrap();
+        assert_eq!(budget.in_flight(), OFFLOAD_DEPTH);
+        assert_eq!(vq_a.used.idx.get(), 0);
+
+        let start = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let runner = run_queues(vec![a, b], Arc::clone(&stop));
+        let status = wait_status(&mem, 0x8000, 0, SLOW_LATENCY * 20);
+        let elapsed = start.elapsed();
+        let write_status = wait_status(&mem, 0x8000, 1, Duration::from_secs(1));
+        stop.store(true, Ordering::SeqCst);
+        runner.join().unwrap();
+
+        assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+        assert_eq!(write_status, VIRTIO_BLK_S_OK as u8);
+        assert!(
+            elapsed < SLOW_LATENCY * 3,
+            "The write zeroes took {elapsed:?}, with operations of {SLOW_LATENCY:?}"
+        );
+        assert!(stats.write_zeroes_done.load(Ordering::SeqCst) < usize::from(WRITE_ZEROES));
+    }
+
+    /// A discard parked on queue `discard_queue` and a later write to its
+    /// range: the discard completes without running, and the range keeps
+    /// the written data.
+    fn parked_discard_overlapped_by_write(cross_queue: bool) {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        let depth = SLOW_DEPTH as u16;
+        let (mut q0, vq0, _) = slow_discard_handler(&mem, 0x1000, 0x8000, depth, &stats);
+        let (mut q1, vq1, _) = slow_discard_handler(&mem, 0x3000, 0xa000, 0, &stats);
+        one_device(&mut [&mut q0, &mut q1]);
+        push_segment(&mem, &vq0, 0x8000, VIRTIO_BLK_T_DISCARD, WRITE_SECTOR);
+        q0.process_queue_submit().unwrap();
+        assert_eq!(q0.parked_discards.len(), 1);
+
+        if cross_queue {
+            push_write(&mem, &vq1, 0xa000, 0x5a);
+            q1.process_queue_submit().unwrap();
+        } else {
+            push_write(&mem, &vq0, 0x8000, 0x5a);
+            q0.process_queue_submit().unwrap();
+            // Completed before the write was submitted.
+            assert!(q0.parked_discards.is_empty());
+            let status: u8 = mem.read_obj(status_addr(0x8000, depth)).unwrap();
+            assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let runner = run_queues(vec![q0, q1], Arc::clone(&stop));
+        let used = depth + 1 + u16::from(!cross_queue);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while vq0.used.idx.get() + vq1.used.idx.get() < used {
+            assert!(Instant::now() < deadline, "Timed out waiting for requests");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Long enough for the discard to have run, had it been submitted.
+        thread::sleep(SLOW_LATENCY * 2);
+        stop.store(true, Ordering::SeqCst);
+        runner.join().unwrap();
+
+        for n in 0..=depth {
+            let status: u8 = mem.read_obj(status_addr(0x8000, n)).unwrap();
+            assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+        }
+        assert_eq!(stats.executed.load(Ordering::SeqCst), SLOW_DEPTH);
+        assert_eq!(stats.sector(WRITE_SECTOR), [0x5a; 512]);
+    }
+
+    #[test]
+    fn parked_discard_overlapped_by_write_does_not_run() {
+        parked_discard_overlapped_by_write(false);
+    }
+
+    #[test]
+    fn parked_discard_overlapped_by_write_on_another_queue_does_not_run() {
+        parked_discard_overlapped_by_write(true);
     }
 
     /// Runs what the block offload worker does on a thread under the
