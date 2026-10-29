@@ -508,6 +508,18 @@ impl OffloadBudget {
             .store(state.parked.len(), Ordering::SeqCst);
     }
 
+    /// Lets `queue`, which is processing its queue, be woken again: a pass
+    /// may end, on an error, before it tries for a slot, and a queue left
+    /// marked woken is never woken again while it still holds the line.
+    fn rearm(&self, queue: usize) {
+        let mut state = self.state.lock().unwrap();
+        for (q, _, woken) in state.waiters.iter_mut() {
+            if *q == queue {
+                *woken = false;
+            }
+        }
+    }
+
     /// Ends the wait of `queue` for a slot, once it needs none, so that it
     /// does not hold up the queues waiting after it.
     fn withdraw(&self, queue: usize) {
@@ -603,6 +615,9 @@ impl BlockEpollHandler {
     }
 
     fn process_queue_submit(&mut self) -> Result<()> {
+        if let Some(budget) = &self.offload_budget {
+            budget.rearm(usize::from(self.queue_index));
+        }
         let mut stopped_for_slot = false;
         let result = self.submit_requests(&mut stopped_for_slot);
         // Leave the line for a slot once the queue no longer waits for one,
@@ -3223,6 +3238,46 @@ mod tests {
         assert!(line(&budget).is_empty());
         budget.release(1, OffloadKind::Discard);
         assert!(budget.try_acquire(1, OffloadKind::Discard));
+    }
+
+    /// A queue first in line, woken for a free slot, whose pass fails before
+    /// it tries for one (a request cannot be returned) is woken
+    /// again: the queue behind it, held back for it, does not stall.
+    #[test]
+    fn queue_failing_its_pass_before_its_slot_attempt_is_woken_again() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        let (mut q0, vq0, _) = slow_discard_handler(&mem, 0x1000, 0x8000, 0, &stats);
+        let (mut q1, _vq1, _) = slow_discard_handler(&mem, 0x3000, 0xa000, 0, &stats);
+        let (budget, evts) = one_device(&mut [&mut q0, &mut q1]);
+        // Queue 1 holds every discard slot; queue 0 parks a discard and
+        // waits, first in line.
+        for _ in 0..SLOW_DEPTH {
+            assert!(budget.try_acquire(1, OffloadKind::Discard));
+        }
+        push_discard(&mem, &vq0, 0x8000);
+        q0.process_queue_submit().unwrap();
+        assert_eq!(q0.parked_discards.len(), 1);
+        assert_eq!(line(&budget), vec![0]);
+        budget.release(1, OffloadKind::Discard);
+        assert_eq!(evts[0].read().unwrap(), 1);
+
+        // Its next pass fails, before it tries for the slot, at a request
+        // whose head is past the end of the queue: it cannot be returned.
+        vq0.avail.ring[1].set(64);
+        vq0.avail.idx.set(2);
+        let err = q0.process_queue_submit().unwrap_err();
+        assert!(matches!(err, Error::QueueAddUsed(_)), "{err:?}");
+        assert_eq!(q0.parked_discards.len(), 1);
+        assert_eq!(line(&budget), vec![0]);
+
+        // Queue 1 is held back for it, and wakes it again.
+        assert!(!budget.try_acquire(1, OffloadKind::Discard));
+        assert_eq!(evts[0].read().unwrap(), 1);
+        q0.process_queue_submit().unwrap();
+        assert!(q0.parked_discards.is_empty());
+        assert_eq!(budget.in_flight(), SLOW_DEPTH);
+        assert_eq!(line(&budget), vec![1]);
     }
 
     /// An offloaded discard completion for no request in flight, while a
