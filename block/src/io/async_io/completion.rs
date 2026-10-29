@@ -23,6 +23,9 @@ pub struct AsyncIoCompletion {
     pub result: i32,
     /// The backing buffer that can now be dropped or re-used.
     pub buffer: Option<OwnedIoBuffer>,
+    /// Whether the operation ran on a worker thread through
+    /// [`super::AsyncIo::offloads_punch_hole_or_write_zeroes`].
+    pub offloaded: bool,
 }
 
 impl AsyncIoCompletion {
@@ -32,6 +35,15 @@ impl AsyncIoCompletion {
             user_data,
             result,
             buffer,
+            offloaded: false,
+        }
+    }
+
+    /// Creates the completion of an operation that ran on a worker thread.
+    pub fn from_offload(user_data: u64, result: i32) -> Self {
+        Self {
+            offloaded: true,
+            ..Self::new(user_data, result, None)
         }
     }
 
