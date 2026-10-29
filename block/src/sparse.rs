@@ -58,6 +58,15 @@ pub(crate) fn blkzeroout(fd: RawFd, offset: u64, length: u64) -> io::Result<()> 
     blk_range_ioctl(fd, BLKZEROOUT, offset, length)
 }
 
+/// Maps the result of `BLKDISCARD`: a device that does not support discard
+/// reports success, as discard is only a hint.
+pub(crate) fn discard_result(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(()),
+        result => result,
+    }
+}
+
 // Punch a hole in `fd` over the byte range `[offset, offset + length)`.
 //
 // On block devices the kernel rejects `fallocate(PUNCH_HOLE)` (notably ZFS
@@ -70,11 +79,7 @@ pub(crate) fn punch_hole(
     length: u64,
 ) -> io::Result<()> {
     if is_blkdev {
-        return match blkdiscard(file.as_raw_fd(), offset, length) {
-            Ok(()) => Ok(()),
-            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(()),
-            Err(e) => Err(e),
-        };
+        return discard_result(blkdiscard(file.as_raw_fd(), offset, length));
     }
     match file.punch_hole(offset, length) {
         Ok(()) => Ok(()),

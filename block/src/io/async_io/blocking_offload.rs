@@ -19,21 +19,39 @@
 //! Each request stays in the device's in-flight list until its completion is
 //! consumed, so pause and snapshot wait for it as they do for io_uring and AIO
 //! requests.
+//!
+//! At most [`OFFLOAD_DEPTH`] operations are in flight per worker. The device
+//! checks [`BlockingOffload::has_capacity`] before taking a discard or write
+//! zeroes request off the virtqueue and leaves it there while the worker is
+//! full, so a pause, which stops taking new requests and waits for the ones
+//! in flight, waits for at most `OFFLOAD_DEPTH` operations.
 
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use log::error;
+use log::{error, warn};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::AsyncIoCompletion;
 use super::common::errno_result;
+use super::{AsyncIoCompletion, WorkerThreadInit};
 use crate::sparse::{punch_hole, write_zeroes};
+
+/// Maximum number of offloaded operations in flight per async I/O object.
+///
+/// The worker runs one operation at a time, so a depth above one only keeps
+/// the next operation queued for the worker while the device consumes the
+/// previous completion. Beyond that, the depth trades the time a pause waits
+/// (up to `OFFLOAD_DEPTH` times the device's discard latency, against the
+/// device's 30 s drain timeout) for how long a burst of discards can be
+/// absorbed before the queue thread stops taking requests: 4 keeps a pause
+/// under the timeout for operations of up to 7 s each.
+pub(crate) const OFFLOAD_DEPTH: usize = 4;
 
 /// A blocking operation that can be offloaded.
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +76,12 @@ pub(crate) fn block_device_op(
     }
 }
 
+/// Returns the function to offload discard and write zeroes with, if the
+/// disk is a block device.
+pub(crate) fn offload_fn(is_block_device: bool) -> Option<BlockingOpFn> {
+    is_block_device.then_some(block_device_op as BlockingOpFn)
+}
+
 struct Job {
     op: BlockingOp,
     offset: u64,
@@ -65,7 +89,16 @@ struct Job {
     user_data: u64,
 }
 
+enum Message {
+    Init(WorkerThreadInit),
+    Job(Job),
+}
+
 type CompletionList = Arc<Mutex<VecDeque<AsyncIoCompletion>>>;
+
+fn eio() -> io::Error {
+    io::Error::from_raw_os_error(libc::EIO)
+}
 
 fn complete(
     completions: &CompletionList,
@@ -88,14 +121,56 @@ fn complete(
     }
 }
 
+fn worker_loop(
+    mut file: File,
+    receiver: mpsc::Receiver<Message>,
+    run: BlockingOpFn,
+    completions: &CompletionList,
+    notifier: &EventFd,
+    stop: &AtomicBool,
+) {
+    // Set when the thread init failed: operations then fail rather than run
+    // without the restrictions the init was meant to apply.
+    let mut failed = false;
+    for message in receiver {
+        let job = match message {
+            Message::Init(init) => {
+                if let Err(e) = init() {
+                    error!("Failed to initialize block offload worker: {e}");
+                    failed = true;
+                }
+                continue;
+            }
+            Message::Job(job) => job,
+        };
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let result = if failed {
+            Err(eio())
+        } else {
+            panic::catch_unwind(AssertUnwindSafe(|| {
+                run(&mut file, job.op, job.offset, job.length)
+            }))
+            .unwrap_or_else(|_| {
+                error!("Offloaded block {:?} request panicked", job.op);
+                Err(eio())
+            })
+        };
+        complete(completions, notifier, job.user_data, result);
+    }
+}
+
 /// Worker thread running [`BlockingOp`]s for one async I/O object.
 pub(crate) struct BlockingOffload {
-    run: BlockingOpFn,
-    sender: Option<SyncSender<Job>>,
+    sender: Option<SyncSender<Message>>,
     completions: CompletionList,
     notifier: EventFd,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    // Operations submitted whose completion has not been returned yet.
+    in_flight: usize,
+    depth: usize,
 }
 
 impl BlockingOffload {
@@ -103,80 +178,108 @@ impl BlockingOffload {
     ///
     /// The worker owns `file`, which must refer to the same disk as the
     /// backend, and signals `notifier`, the backend's completion eventfd. At
-    /// most `capacity` operations wait for the worker; the device cannot have
-    /// more requests in flight than its queue size, so a capacity equal to the
-    /// queue size is never exceeded by a compliant driver.
+    /// most `depth` operations are in flight; see [`Self::has_capacity`].
     pub(crate) fn new(
         file: File,
         notifier: &EventFd,
-        capacity: usize,
+        depth: usize,
         run: BlockingOpFn,
     ) -> io::Result<Self> {
         let notifier = notifier.try_clone()?;
         let worker_notifier = notifier.try_clone()?;
-        let (sender, receiver) = mpsc::sync_channel::<Job>(capacity);
+        // Room for every operation in flight and the thread init.
+        let (sender, receiver) = mpsc::sync_channel::<Message>(depth + 1);
         let completions = CompletionList::default();
         let worker_completions = Arc::clone(&completions);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
 
-        // The thread inherits the seccomp filter of the thread creating the
-        // async I/O object, which already allows the block device ioctls.
+        // Until set_thread_init() is called, the thread runs with the seccomp
+        // filter of the thread creating the async I/O object.
         let worker = thread::Builder::new()
             .name("blk_offload".to_string())
             .spawn(move || {
-                let mut file = file;
-                for job in receiver {
-                    if worker_stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let result = run(&mut file, job.op, job.offset, job.length);
-                    complete(&worker_completions, &worker_notifier, job.user_data, result);
-                }
+                worker_loop(
+                    file,
+                    receiver,
+                    run,
+                    &worker_completions,
+                    &worker_notifier,
+                    &worker_stop,
+                );
             })?;
 
         Ok(BlockingOffload {
-            run,
             sender: Some(sender),
             completions,
             notifier,
             stop,
             worker: Some(worker),
+            in_flight: 0,
+            depth,
         })
+    }
+
+    /// Has the worker run `init` before any operation submitted after this
+    /// call, for instance to apply a seccomp filter. If `init` fails, the
+    /// worker fails every operation with `EIO`.
+    pub(crate) fn set_thread_init(&mut self, init: WorkerThreadInit) {
+        let sent = self
+            .sender
+            .as_ref()
+            .map(|sender| sender.try_send(Message::Init(init)));
+        if !matches!(sent, Some(Ok(()))) {
+            error!("Failed to pass the thread init to the block offload worker");
+        }
+    }
+
+    /// Returns whether another operation can be submitted.
+    ///
+    /// Callers must check this before taking a request that ends in
+    /// [`Self::submit`] and keep the request queued while it is false. It
+    /// becomes true again once [`Self::next_completion`] has returned a
+    /// completion, which is signaled through the completion eventfd.
+    pub(crate) fn has_capacity(&self) -> bool {
+        self.in_flight < self.depth
     }
 
     /// Submits `op` and reports its completion through the completion list.
     ///
-    /// When the worker is saturated, the operation runs synchronously on the
-    /// calling thread using `file`. This bounds memory and applies
-    /// backpressure: the queue thread stops taking new descriptors until the
-    /// operation is done, as it did before offloading existed.
-    pub(crate) fn submit(
-        &mut self,
-        file: &mut File,
-        op: BlockingOp,
-        offset: u64,
-        length: u64,
-        user_data: u64,
-    ) {
+    /// If the worker is full, because the caller did not check
+    /// [`Self::has_capacity`], or gone, the operation is not run and
+    /// completes with `EIO`.
+    pub(crate) fn submit(&mut self, op: BlockingOp, offset: u64, length: u64, user_data: u64) {
         let job = Job {
             op,
             offset,
             length,
             user_data,
         };
-        let job = match self.sender.as_ref().map(|sender| sender.try_send(job)) {
-            Some(Ok(())) => return,
-            Some(Err(TrySendError::Full(job) | TrySendError::Disconnected(job))) => job,
+        self.in_flight += 1;
+        let sent = match &self.sender {
+            Some(sender) => sender.try_send(Message::Job(job)),
             None => unreachable!("sender is only taken on drop"),
         };
-        let result = (self.run)(file, job.op, job.offset, job.length);
-        complete(&self.completions, &self.notifier, job.user_data, result);
+        match sent {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                warn!("Block offload worker full, failing {op:?} request");
+                complete(&self.completions, &self.notifier, user_data, Err(eio()));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                error!("Block offload worker gone, failing {op:?} request");
+                complete(&self.completions, &self.notifier, user_data, Err(eio()));
+            }
+        }
     }
 
     /// Returns the next completed offloaded operation, if any.
     pub(crate) fn next_completion(&mut self) -> Option<AsyncIoCompletion> {
-        self.completions.lock().unwrap().pop_front()
+        let completion = self.completions.lock().unwrap().pop_front();
+        if completion.is_some() {
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
+        completion
     }
 }
 
@@ -190,5 +293,209 @@ impl Drop for BlockingOffload {
         {
             error!("Block offload worker thread panicked");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    use vmm_sys_util::eventfd::EFD_NONBLOCK;
+    use vmm_sys_util::tempfile::TempFile;
+
+    use super::*;
+    use crate::sparse::discard_result;
+
+    const SLOW: Duration = Duration::from_millis(300);
+
+    fn temp_file() -> File {
+        TempFile::new().unwrap().into_file()
+    }
+
+    fn offload(depth: usize, run: BlockingOpFn) -> (BlockingOffload, EventFd) {
+        let notifier = EventFd::new(EFD_NONBLOCK).unwrap();
+        let offload = BlockingOffload::new(temp_file(), &notifier, depth, run).unwrap();
+        (offload, notifier)
+    }
+
+    fn wait_completion(offload: &mut BlockingOffload, timeout: Duration) -> AsyncIoCompletion {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(completion) = offload.next_completion() {
+                return completion;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Timed out waiting for completion"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn enospc(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+
+    fn other_error(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        Err(io::Error::other("no errno"))
+    }
+
+    fn unsupported_discard(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        discard_result(Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)))
+    }
+
+    fn panics(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        panic!("offloaded operation panicked");
+    }
+
+    fn slow(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        thread::sleep(SLOW);
+        Ok(())
+    }
+
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_slow(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(SLOW);
+        Ok(())
+    }
+
+    #[test]
+    fn offload_only_for_block_devices() {
+        assert!(offload_fn(true).is_some());
+        assert!(offload_fn(false).is_none());
+    }
+
+    #[test]
+    fn errors_reach_the_completion() {
+        for (run, expected) in [
+            (enospc as BlockingOpFn, -libc::ENOSPC),
+            (other_error, -libc::EIO),
+            (unsupported_discard, 0),
+            // BLKDISCARD on a regular file fails with ENOTTY.
+            (block_device_op, -libc::ENOTTY),
+        ] {
+            let (mut offload, notifier) = offload(OFFLOAD_DEPTH, run);
+            offload.submit(BlockingOp::PunchHole, 0, 4096, 7);
+            let completion = wait_completion(&mut offload, Duration::from_secs(5));
+            assert_eq!((completion.user_data, completion.result), (7, expected));
+            assert_eq!(notifier.read().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn panic_completes_with_eio_and_worker_keeps_running() {
+        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, panics);
+        offload.submit(BlockingOp::PunchHole, 0, 4096, 1);
+        offload.submit(BlockingOp::WriteZeroes, 0, 4096, 2);
+        for user_data in [1, 2] {
+            let completion = wait_completion(&mut offload, Duration::from_secs(5));
+            assert_eq!(
+                (completion.user_data, completion.result),
+                (user_data, -libc::EIO)
+            );
+        }
+        assert!(offload.has_capacity());
+    }
+
+    #[test]
+    fn failed_thread_init_fails_requests() {
+        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, slow);
+        offload.set_thread_init(Box::new(|| Err(io::Error::other("init failed"))));
+        offload.submit(BlockingOp::PunchHole, 0, 4096, 1);
+        let start = Instant::now();
+        let completion = wait_completion(&mut offload, Duration::from_secs(5));
+        assert_eq!((completion.user_data, completion.result), (1, -libc::EIO));
+        assert!(start.elapsed() < SLOW, "Operation ran after a failed init");
+    }
+
+    #[test]
+    fn thread_init_runs_on_the_worker_before_operations() {
+        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, slow);
+        let ran_on = Arc::new(Mutex::new(None));
+        let ran_on_worker = Arc::clone(&ran_on);
+        offload.set_thread_init(Box::new(move || {
+            *ran_on_worker.lock().unwrap() = thread::current().name().map(str::to_owned);
+            Ok(())
+        }));
+        offload.submit(BlockingOp::PunchHole, 0, 4096, 1);
+        let completion = wait_completion(&mut offload, Duration::from_secs(5));
+        assert_eq!(completion.result, 0);
+        assert_eq!(ran_on.lock().unwrap().as_deref(), Some("blk_offload"));
+    }
+
+    #[test]
+    fn capacity_is_bounded_by_depth() {
+        let (mut offload, _notifier) = offload(2, slow);
+        assert!(offload.has_capacity());
+        offload.submit(BlockingOp::PunchHole, 0, 4096, 1);
+        assert!(offload.has_capacity());
+        offload.submit(BlockingOp::PunchHole, 0, 4096, 2);
+        assert!(!offload.has_capacity());
+        // Capacity comes back only once a completion has been returned.
+        wait_completion(&mut offload, Duration::from_secs(5));
+        assert!(offload.has_capacity());
+    }
+
+    #[test]
+    fn full_worker_fails_request_instead_of_running_it() {
+        // Depth 1: the channel holds one job and the thread init. With one
+        // job running and two queued, a fourth submission finds it full.
+        let (mut offload, _notifier) = offload(1, slow);
+        for user_data in 1..=3 {
+            offload.submit(BlockingOp::PunchHole, 0, 4096, user_data);
+            if user_data == 1 {
+                // Let the worker take the first job.
+                thread::sleep(SLOW / 4);
+            }
+        }
+        let start = Instant::now();
+        offload.submit(BlockingOp::PunchHole, 0, 4096, 4);
+        assert!(
+            start.elapsed() < SLOW / 4,
+            "Submission ran the operation inline"
+        );
+        let completion = wait_completion(&mut offload, Duration::from_secs(5));
+        assert_eq!((completion.user_data, completion.result), (4, -libc::EIO));
+    }
+
+    #[test]
+    fn disconnected_worker_fails_request() {
+        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, slow);
+        // Stop the worker as if it had died.
+        offload.stop.store(true, Ordering::Release);
+        offload.submit(BlockingOp::PunchHole, 0, 4096, 1);
+        offload.worker.take().unwrap().join().unwrap();
+        // Drain the completion of the skipped job: there is none.
+        assert!(offload.next_completion().is_none());
+        let start = Instant::now();
+        offload.submit(BlockingOp::WriteZeroes, 0, 4096, 2);
+        assert!(
+            start.elapsed() < SLOW / 4,
+            "Submission ran the operation inline"
+        );
+        let completion = wait_completion(&mut offload, Duration::from_secs(5));
+        assert_eq!((completion.user_data, completion.result), (2, -libc::EIO));
+    }
+
+    #[test]
+    fn drop_skips_queued_operations() {
+        RUNS.store(0, Ordering::SeqCst);
+        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, counting_slow);
+        for user_data in 0..OFFLOAD_DEPTH as u64 {
+            offload.submit(BlockingOp::PunchHole, 0, 4096, user_data);
+        }
+        // Let the worker start the first operation.
+        thread::sleep(SLOW / 4);
+        let start = Instant::now();
+        drop(offload);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < SLOW,
+            "Drop waited {elapsed:?} for queued operations"
+        );
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1);
     }
 }
