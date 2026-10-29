@@ -349,7 +349,7 @@ impl Request {
 
                 if wz_flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP != 0 {
                     disk_image
-                        .punch_hole(wz_offset, wz_length, user_data)
+                        .write_zeroes_unmap(wz_offset, wz_length, user_data)
                         .map_err(ExecuteError::AsyncPunchHole)?;
                 } else {
                     disk_image
@@ -524,11 +524,40 @@ impl Request {
         self.discard_range(mem, disk_nsectors)
     }
 
+    /// Checks a write zeroes request as [`Self::execute_async`] does, with
+    /// or without [`VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP`], and returns the
+    /// byte offset and length it changes.
+    pub fn check_write_zeroes<B: Bitmap + 'static>(
+        &self,
+        mem: &vm_memory::GuestMemoryMmap<B>,
+        disk_nsectors: u64,
+    ) -> Result<(u64, u64), ExecuteError> {
+        self.segment_range(
+            mem,
+            disk_nsectors,
+            VIRTIO_BLK_T_WRITE_ZEROES,
+            VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP,
+        )
+    }
+
     /// Returns the byte range of a discard request.
     fn discard_range<B: Bitmap + 'static>(
         &self,
         mem: &vm_memory::GuestMemoryMmap<B>,
         disk_nsectors: u64,
+    ) -> Result<(u64, u64), ExecuteError> {
+        // Per virtio spec v1.2 reject discard if any flag is set, including unmap.
+        self.segment_range(mem, disk_nsectors, VIRTIO_BLK_T_DISCARD, 0)
+    }
+
+    /// Returns the byte range of the single segment of a discard or write
+    /// zeroes request, rejecting any flag outside `allowed_flags`.
+    fn segment_range<B: Bitmap + 'static>(
+        &self,
+        mem: &vm_memory::GuestMemoryMmap<B>,
+        disk_nsectors: u64,
+        request_type: u32,
+        allowed_flags: u32,
     ) -> Result<(u64, u64), ExecuteError> {
         let (data_addr, data_len) = if self.data_descriptors.len() == 1 {
             (self.data_descriptors[0].0, self.data_descriptors[0].1)
@@ -564,11 +593,10 @@ impl Request {
             .map_err(ExecuteError::Read)?;
 
         let discard_flags = u32::from_le_bytes(discard_flags);
-        // Per virtio spec v1.2 reject discard if any flag is set, including unmap.
-        if discard_flags != 0 {
-            warn!("Unsupported flags {discard_flags:#x} in discard request");
+        if discard_flags & !allowed_flags != 0 {
+            warn!("Unsupported flags {discard_flags:#x} in request of type {request_type}");
             return Err(ExecuteError::UnsupportedFlags {
-                request_type: VIRTIO_BLK_T_DISCARD,
+                request_type,
                 flags: discard_flags,
             });
         }

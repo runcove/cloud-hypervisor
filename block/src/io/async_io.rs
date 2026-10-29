@@ -23,8 +23,8 @@ pub(crate) use blocking_offload::fail_next_spawn;
 pub(crate) use blocking_offload::{
     BlockingOffload, BlockingOp, BlockingOpFn, offload_fn, spawn_offload,
 };
-pub use completion::AsyncIoCompletion;
 pub(crate) use completion::CompletionCommon;
+pub use completion::{AsyncIoCompletion, OffloadedOp};
 pub use guest_memory_target::GuestMemoryTarget;
 pub use operation::AsyncIoOperation;
 pub use owned_io_buffer::OwnedIoBuffer;
@@ -164,6 +164,17 @@ pub trait AsyncIo: Send {
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()>;
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
+
+    /// Submits a write zeroes that may unmap the range: a punch hole, which
+    /// a backend running it on a worker thread reports as a write zeroes.
+    fn write_zeroes_unmap(
+        &mut self,
+        offset: u64,
+        length: u64,
+        user_data: u64,
+    ) -> AsyncIoResult<()> {
+        self.punch_hole(offset, length, user_data)
+    }
 
     /// Returns whether discard and write zeroes requests run on a worker
     /// thread rather than on the calling thread.
