@@ -17,8 +17,11 @@ mod uring_data_io;
 use std::{io, result};
 
 pub use aio_data_io::AioDataIo;
+pub use blocking_offload::OFFLOAD_DEPTH;
+#[cfg(test)]
+pub(crate) use blocking_offload::fail_next_spawn;
 pub(crate) use blocking_offload::{
-    BlockingOffload, BlockingOp, BlockingOpFn, OFFLOAD_DEPTH, offload_fn,
+    BlockingOffload, BlockingOp, BlockingOpFn, offload_fn, spawn_offload,
 };
 pub use completion::AsyncIoCompletion;
 pub(crate) use completion::CompletionCommon;
@@ -162,14 +165,15 @@ pub trait AsyncIo: Send {
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
 
-    /// Returns whether a discard or write zeroes request can be submitted now.
+    /// Returns whether discard and write zeroes requests run on a worker
+    /// thread rather than on the calling thread.
     ///
-    /// Backends that run these requests on a worker thread with a bounded
-    /// number in flight return false while it is full. The caller then keeps
-    /// the request queued and retries once a completion has been returned by
-    /// [`AsyncIo::next_completed_request`].
-    fn can_submit_punch_hole_or_write_zeroes(&self) -> bool {
-        true
+    /// Such a backend accepts at most [`OFFLOAD_DEPTH`] of them whose
+    /// completion has not been returned by
+    /// [`AsyncIo::next_completed_request`]; it fails further ones with `EIO`.
+    /// The caller bounds them, and keeps the rest queued.
+    fn offloads_punch_hole_or_write_zeroes(&self) -> bool {
+        false
     }
 
     /// Passes `init` to run on every worker thread this backend has spawned,
