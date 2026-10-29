@@ -10,6 +10,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::Wrapping;
@@ -536,6 +538,22 @@ impl OffloadBudget {
     }
 }
 
+/// The passes `process_queue_submit` makes at most before it lets the
+/// other events of the queue thread in.
+const MAX_SUBMIT_PASSES: usize = 16;
+
+/// How many times a submit pass found requests made available while it ran,
+/// for a rate-limited diagnostic.
+static SUBMIT_RECHECK_PICKUPS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// Run once, by the next submit pass on this thread, after its last pop
+    /// and before it handles the parked discards: a guest making requests
+    /// available meanwhile.
+    static AFTER_POP_LOOP: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+}
+
 #[derive(Default)]
 struct CompletionTotals {
     read_bytes: Wrapping<u64>,
@@ -615,11 +633,59 @@ impl BlockEpollHandler {
     }
 
     fn process_queue_submit(&mut self) -> Result<()> {
-        if let Some(budget) = &self.offload_budget {
-            budget.rearm(usize::from(self.queue_index));
-        }
         let mut stopped_for_slot = false;
-        let result = self.submit_requests(&mut stopped_for_slot);
+        let mut result;
+        let mut passes = 0;
+        loop {
+            if let Some(budget) = &self.offload_budget {
+                budget.rearm(usize::from(self.queue_index));
+            }
+            result = self.submit_requests(&mut stopped_for_slot);
+            passes += 1;
+            // A pass that stops for a slot, a pause or the rate limiter is
+            // processed again by the event it waits for.
+            if result.is_err()
+                || stopped_for_slot
+                || self.draining_active_requests.load(Ordering::SeqCst)
+                || self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked())
+            {
+                break;
+            }
+            // A pass can re-enable notifications after its last pop, as it
+            // completes parked discards. With VIRTIO_RING_F_EVENT_IDX that
+            // moves avail_event past the requests the guest made available
+            // since, which it did not notify, as the avail_event it saw was
+            // older: look at the queue again until it is empty with
+            // notifications enabled, the virtio idiom.
+            let mem = self.mem.memory();
+            match self.queue.enable_notification(mem.deref()) {
+                Ok(false) => break,
+                Ok(true) => {}
+                Err(e) => {
+                    result = Err(Error::QueueEnableNotification(e));
+                    break;
+                }
+            }
+            let arrived = self
+                .queue
+                .avail_idx(mem.deref(), Ordering::Acquire)
+                .map_or(0, |idx| (idx - Wrapping(self.queue.next_avail())).0);
+            let total = SUBMIT_RECHECK_PICKUPS.fetch_add(1, Ordering::Relaxed) + 1;
+            if total == 1 || total.is_multiple_of(1000) {
+                info!(
+                    "virtio-blk q{}: {} requests arrived during a submit pass and were picked up by the recheck (total {})",
+                    self.queue_index, arrived, total
+                );
+            }
+            if passes >= MAX_SUBMIT_PASSES {
+                // A guest that keeps the queue busy: let the other events
+                // in, and come back to the queue after them.
+                if let Err(e) = self.queue_evt.write(1) {
+                    warn!("Failed to re-notify the queue: {e}");
+                }
+                break;
+            }
+        }
         // Leave the line for a slot once the queue no longer waits for one,
         // also after an error, so that it does not hold up the queues
         // waiting after it.
@@ -919,6 +985,11 @@ impl BlockEpollHandler {
                     }
                 }
             }
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = AFTER_POP_LOOP.take() {
+            hook();
         }
 
         if draining_active_requests.load(Ordering::SeqCst) {
@@ -3991,6 +4062,264 @@ mod tests {
                 panic!("The request mix of seed {seed} failed: rerun it with MIX_SEED={seed}");
             }
         }
+    }
+
+    /// A guest that negotiated VIRTIO_RING_F_EVENT_IDX, as Linux does: it
+    /// notifies the device only when the avail index it publishes crosses the
+    /// avail_event the device last wrote, and otherwise relies on the device
+    /// to look at the virtqueue again on its own.
+    struct EventIdxGuest<'a> {
+        mem: &'a GuestMemoryMmap,
+        vq: GuestQ<'a>,
+        // The avail index at the last notification check.
+        checked: u16,
+        // Per request: (kind, sector) for the trace.
+        requests: Vec<(&'static str, u64)>,
+        kicks: usize,
+        // The used index the guest has seen, through interrupts only.
+        seen: u16,
+        irq: EventFd,
+    }
+
+    /// An interrupt the guest sees on an eventfd.
+    struct Irq(EventFd);
+    impl VirtioInterrupt for Irq {
+        fn trigger(&self, _: VirtioInterruptType) -> IoResult<()> {
+            self.0.write(1)
+        }
+        fn set_notifier(&self, _: u32, _: Option<EventFd>, _: &dyn Vm) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    const EIDX_REQUESTS: u64 = 0x10000;
+    const EIDX_DATA: u64 = 0x40000;
+
+    impl EventIdxGuest<'_> {
+        fn publish(&mut self, request_type: u32, sector: u64) {
+            let n = self.vq.avail.idx.get();
+            assert!(n < 80, "out of descriptors");
+            let addr = EIDX_REQUESTS + u64::from(n) * 0x100;
+            let desc = n * 3;
+            let next = VRING_DESC_F_NEXT as u16;
+            self.mem
+                .write_obj(request_type, GuestAddress(addr))
+                .unwrap();
+            self.mem.write_obj(0u32, GuestAddress(addr + 4)).unwrap();
+            self.mem.write_obj(sector, GuestAddress(addr + 8)).unwrap();
+            self.mem
+                .write_obj(0xffu8, GuestAddress(addr + 0x40))
+                .unwrap();
+            let kind = match request_type {
+                VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES => {
+                    let segment = addr + 0x20;
+                    self.mem.write_obj(sector, GuestAddress(segment)).unwrap();
+                    self.mem.write_obj(8u32, GuestAddress(segment + 8)).unwrap();
+                    self.mem
+                        .write_obj(0u32, GuestAddress(segment + 12))
+                        .unwrap();
+                    self.vq.dtable[usize::from(desc) + 1].set(segment, 16, next, desc + 2);
+                    if request_type == VIRTIO_BLK_T_DISCARD {
+                        "discard"
+                    } else {
+                        "write zeroes"
+                    }
+                }
+                _ => {
+                    let data = EIDX_DATA + u64::from(n) * 0x1000;
+                    self.mem
+                        .write_slice(&[n as u8; 4096], GuestAddress(data))
+                        .unwrap();
+                    self.vq.dtable[usize::from(desc) + 1].set(data, 4096, next, desc + 2);
+                    "write"
+                }
+            };
+            self.vq.dtable[usize::from(desc)].set(addr, 16, next, desc + 1);
+            self.vq.dtable[usize::from(desc) + 2].set(addr + 0x40, 1, VRING_DESC_F_WRITE as u16, 0);
+            self.vq.avail.ring[usize::from(n)].set(desc);
+            self.vq.avail.idx.set(n + 1);
+            self.requests.push((kind, sector));
+        }
+
+        /// virtqueue_kick_prepare(): notify only if avail_event lies in
+        /// the indexes published since the last check (vring_need_event).
+        fn kick(&mut self, queue_evt: &EventFd) {
+            let new = self.vq.avail.idx.get();
+            let old = self.checked;
+            let event = self.vq.used.event.get();
+            self.checked = new;
+            if new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old) {
+                self.kicks += 1;
+                queue_evt.write(1).unwrap();
+            }
+        }
+
+        /// The interrupt handler: virtblk_done() takes the used entries and
+        /// re-enables callbacks, writing used_event, until no more are used.
+        fn interrupt(&mut self) {
+            if self.irq.read().is_err() {
+                return;
+            }
+            loop {
+                self.seen = self.vq.used.idx.get();
+                self.vq.avail.event.set(self.seen);
+                if self.vq.used.idx.get() == self.seen {
+                    break;
+                }
+            }
+        }
+
+        fn outstanding(&self) -> Vec<String> {
+            let used: Vec<u32> = (0..self.vq.used.idx.get())
+                .map(|i| used_id(&self.vq, i))
+                .collect();
+            (0..self.vq.avail.idx.get())
+                .filter(|n| !used.contains(&(u32::from(*n) * 3)))
+                .map(|n| format!("#{n} {:?}", self.requests[usize::from(n)]))
+                .collect()
+        }
+    }
+
+    /// The guest from homelab's hang: online discard around O_DIRECT
+    /// writes, on one queue, with EVENT_IDX. It publishes small bursts of
+    /// discards and writes over the same few ranges, notifying the device
+    /// only as EVENT_IDX lets it, and then waits for every request, as dd
+    /// and the journal do. No request may be left incomplete while the
+    /// device sits idle waiting for a notification.
+    #[test]
+    fn event_idx_guest_with_parked_discards_does_not_stall() {
+        let seeds: Vec<u64> = match env::var("EIDX_SEED") {
+            Ok(seed) => vec![seed.parse().unwrap()],
+            Err(_) => (0..16).collect(),
+        };
+        for seed in seeds {
+            let mut rng = Rng::new(seed);
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
+            let stats: Arc<BackendStats> = Arc::default();
+            let vq = GuestQ::new(GuestAddress(0x1000), &mem, 256);
+            let mut handler = handler_on(
+                &mem,
+                &vq,
+                SlowDiscards::with_latency(&stats, Duration::from_millis(20)),
+            );
+            handler.queue.set_event_idx(true);
+            let irq = EventFd::new(EFD_NONBLOCK).unwrap();
+            handler.interrupt_cb = Arc::new(Irq(irq.try_clone().unwrap()));
+            let (_budget, queue_evts) = one_device(&mut [&mut handler]);
+            let mut handlers = vec![handler];
+            let (_kill_evt, _pause_evt, mut helper) = epoll_helper();
+            let mut guest = EventIdxGuest {
+                mem: &mem,
+                vq,
+                checked: 0,
+                requests: Vec::new(),
+                kicks: 0,
+                seen: 0,
+                irq,
+            };
+            while guest.vq.avail.idx.get() < 72 {
+                let burst = 1 + rng.below(6);
+                for _ in 0..burst {
+                    let sector = rng.below(8) * 8;
+                    let request_type = match rng.below(10) {
+                        0..=4 => VIRTIO_BLK_T_DISCARD,
+                        5..=8 => VIRTIO_BLK_T_OUT,
+                        _ => VIRTIO_BLK_T_WRITE_ZEROES,
+                    };
+                    guest.publish(request_type, sector);
+                }
+                guest.kick(&queue_evts[0]);
+                // The device runs for a while before the next burst.
+                let until = Instant::now() + Duration::from_millis(rng.below(30));
+                while Instant::now() < until {
+                    poll_queues(&mut handlers, &mut helper, 1);
+                    guest.interrupt();
+                }
+            }
+            // The guest now waits for everything it submitted, notifying
+            // nothing more: a device that waits for a notification here hangs
+            // the guest.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while guest.seen != guest.vq.avail.idx.get() && Instant::now() < deadline {
+                poll_queues(&mut handlers, &mut helper, 10);
+                guest.interrupt();
+            }
+            assert_eq!(
+                (guest.seen, guest.vq.used.idx.get()),
+                (guest.vq.avail.idx.get(), guest.vq.avail.idx.get()),
+                "seed {seed}: (seen, used) != published; device idle with requests outstanding: \
+                 {:?}; next_avail {}, avail_event {}, kicks {}, parked {}, in flight {}",
+                guest.outstanding(),
+                handlers[0].queue.next_avail(),
+                guest.vq.used.event.get(),
+                guest.kicks,
+                handlers[0].parked_discards.len(),
+                handlers[0].inflight_requests.len(),
+            );
+        }
+    }
+
+    /// An EVENT_IDX guest that makes a write available while a submit pass
+    /// runs, after its last pop, sees the old avail_event and does not
+    /// notify. The pass then completes a discard that another queue's
+    /// write cancelled, which re-enables notifications past the write. The
+    /// pass must look at the queue again and take the write: nothing else
+    /// is in flight on the queue to process it later.
+    #[test]
+    fn event_idx_write_made_available_during_a_pass_is_taken() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let stats: Arc<BackendStats> = Arc::default();
+        // Queue 1's discards take every slot a discard may take.
+        let depth = SLOW_DEPTH as u16;
+        let (mut other, other_vq, _) = slow_discard_handler(&mem, 0x1000, 0x8000, depth, &stats);
+        let vq = GuestQ::new(GuestAddress(0x4000), &mem, 64);
+        let mut handler = handler_on(&mem, &vq, SlowDiscards::new(&stats));
+        handler.queue.set_event_idx(true);
+        let (_budget, _) = one_device(&mut [&mut handler, &mut other]);
+        other.process_queue_submit().unwrap();
+
+        // Queue 0 parks a discard of the range, which queue 1's write
+        // cancels: only marked, for queue 0 to complete.
+        push_segment(&mem, &vq, 0xc000, VIRTIO_BLK_T_DISCARD, WRITE_SECTOR);
+        handler.process_queue_submit().unwrap();
+        assert_eq!(handler.parked_discards.len(), 1);
+        push_write(&mem, &other_vq, 0x8000, 1);
+        other.process_queue_submit().unwrap();
+
+        // The guest makes a write of another range available, and
+        // notifies; queue 0's next pass takes it and runs it without
+        // re-enabling notifications. After that pop the guest makes a
+        // second write available, ready but for the avail index.
+        push_write(&mem, &vq, 0xc000, 2);
+        mem.write_obj(64u64, GuestAddress(0xc000 + 0x100 + 8))
+            .unwrap();
+        push_write(&mem, &vq, 0xc000, 3);
+        vq.avail.idx.set(2);
+        let avail_idx = GuestAddress(vq.avail_start().0 + 2);
+        let avail_event = GuestAddress(vq.used_start().0 + 4 + 8 * 64);
+        let guest_mem = mem.clone();
+        AFTER_POP_LOOP.set(Some(Box::new(move || {
+            guest_mem.write_obj(3u16, avail_idx).unwrap();
+            // vring_need_event(avail_event, 3, 2): the guest notifies only
+            // if the device moved avail_event past the write it took.
+            let event: u16 = guest_mem.read_obj(avail_event).unwrap();
+            assert!(
+                3u16.wrapping_sub(event).wrapping_sub(1) >= 1,
+                "the guest would notify"
+            );
+        })));
+        handler.process_queue_submit().unwrap();
+        assert!(AFTER_POP_LOOP.take().is_none());
+        assert!(handler.parked_discards.is_empty());
+        assert_eq!(
+            handler.queue.next_avail(),
+            3,
+            "the write made available during the pass was left on the queue"
+        );
+
+        run_until(vec![handler], || vq.used.idx.get() >= 3, Duration::ZERO);
+        let status: u8 = mem.read_obj(status_addr(0xc000, 2)).unwrap();
+        assert_eq!(status, VIRTIO_BLK_S_OK as u8);
     }
 
     /// Runs what the block offload worker does on a thread under the
