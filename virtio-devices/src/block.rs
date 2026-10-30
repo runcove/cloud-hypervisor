@@ -4349,6 +4349,20 @@ mod tests {
                         Some(libc::ENOTTY)
                     );
                 }
+                // A write zeroes that may unmap. Whether the file's filesystem
+                // can punch holes does not matter: the filter comes first.
+                // SAFETY: FFI call with a valid fd.
+                let ret = unsafe {
+                    libc::fallocate(
+                        file.as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        0,
+                        4096,
+                    )
+                };
+                assert!(
+                    ret == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EOPNOTSUPP)
+                );
                 // A panic in an operation is caught and logged.
                 let caught = panic::catch_unwind(|| panic!("offloaded operation panicked"));
                 assert!(caught.is_err());

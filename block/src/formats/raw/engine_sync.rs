@@ -12,7 +12,7 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::async_io::{
     AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, CompletionCommon,
 };
-use crate::sparse::{punch_hole, write_zeroes};
+use crate::sparse::{punch_hole, write_zeroes, write_zeroes_unmap};
 use crate::{AlignedFile, is_block_device};
 
 pub(crate) struct RawSync {
@@ -110,6 +110,24 @@ impl AsyncIo for RawSync {
             .complete(AsyncIoCompletion::new(user_data, 0, None));
         Ok(())
     }
+
+    fn write_zeroes_unmap(
+        &mut self,
+        offset: u64,
+        length: u64,
+        user_data: u64,
+    ) -> AsyncIoResult<()> {
+        write_zeroes_unmap(
+            self.raw_file.file_mut(),
+            self.is_block_device,
+            offset,
+            length,
+        )
+        .map_err(AsyncIoError::WriteZeroes)?;
+        self.completions
+            .complete(AsyncIoCompletion::new(user_data, 0, None));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -141,5 +159,31 @@ mod tests {
         let mut file = temp_file.into_file();
         let mut async_io = RawSync::new(AlignedFile::new(file.try_clone().unwrap(), false));
         test_helpers::test_punch_hole_multiple_operations(&mut async_io, &mut file);
+    }
+
+    #[test]
+    fn test_write_zeroes_unmap_regular_file() {
+        let mut file = TempFile::new().unwrap().into_file();
+        let mut async_io = RawSync::new(AlignedFile::new(file.try_clone().unwrap(), false));
+        test_helpers::test_write_zeroes_unmap(&mut async_io, &mut file);
+    }
+
+    #[test]
+    fn test_write_zeroes_unmap_block_device_route() {
+        let mut file = TempFile::new().unwrap().into_file();
+        let mut async_io = RawSync::new(AlignedFile::new(file.try_clone().unwrap(), false));
+        async_io.is_block_device = true;
+        test_helpers::test_write_zeroes_unmap_block_device_route(&mut async_io, &mut file);
+    }
+
+    #[test]
+    fn test_write_zeroes_unmap_loop_device() {
+        let Some(device) = test_helpers::LoopDevice::new() else {
+            return;
+        };
+        let mut file = device.open();
+        let mut async_io = RawSync::new(AlignedFile::new(file.try_clone().unwrap(), false));
+        assert!(async_io.is_block_device);
+        test_helpers::test_write_zeroes_unmap(&mut async_io, &mut file);
     }
 }

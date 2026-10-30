@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 // Helpers for issuing `BLKDISCARD` / `BLKZEROOUT` ioctls on block devices,
-// and the `punch_hole` / `write_zeroes` dispatchers used by the raw I/O
-// backends.
+// and the `punch_hole` / `write_zeroes` / `write_zeroes_unmap` dispatchers
+// used by the raw I/O backends.
 //
 // The kernel ioctl numbers and argument layout are stable userspace ABI
 // (see `include/uapi/linux/fs.h`):
@@ -67,11 +67,60 @@ pub(crate) fn discard_result(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
+// The kernel interfaces that clear a range of a block device. Tests implement
+// this to stand in for devices that a regular file cannot imitate.
+trait BlockDevice {
+    // `BLKDISCARD`: a hint, after which the range need not read back as zeroes.
+    fn discard(&mut self, offset: u64, length: u64) -> io::Result<()>;
+    // `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`: the device's
+    // write zeroes command, allowed to deallocate the range. EOPNOTSUPP if the
+    // device has none.
+    fn fallocate_punch_hole(&mut self, offset: u64, length: u64) -> io::Result<()>;
+    // `BLKZEROOUT`: the device's write zeroes command without deallocating,
+    // or else the kernel writes zero pages.
+    fn zeroout(&mut self, offset: u64, length: u64) -> io::Result<()>;
+}
+
+impl BlockDevice for File {
+    fn discard(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        blkdiscard(self.as_raw_fd(), offset, length)
+    }
+
+    fn fallocate_punch_hole(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        PunchHole::punch_hole(self, offset, length)
+    }
+
+    fn zeroout(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        blkzeroout(self.as_raw_fd(), offset, length)
+    }
+}
+
+fn block_device_discard(device: &mut impl BlockDevice, offset: u64, length: u64) -> io::Result<()> {
+    discard_result(device.discard(offset, length))
+}
+
+// A failure other than EOPNOTSUPP is not retried: the device has the command
+// and it failed, so the guest gets the error. EOPNOTSUPP from `BLKZEROOUT` is
+// an error too: unlike a discard, a write zeroes must not report success when
+// nothing was zeroed.
+fn block_device_write_zeroes_unmap(
+    device: &mut impl BlockDevice,
+    offset: u64,
+    length: u64,
+) -> io::Result<()> {
+    match device.fallocate_punch_hole(offset, length) {
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => device.zeroout(offset, length),
+        result => result,
+    }
+}
+
 // Punch a hole in `fd` over the byte range `[offset, offset + length)`.
 //
-// On block devices the kernel rejects `fallocate(PUNCH_HOLE)` (notably ZFS
-// zvols), so route through `BLKDISCARD` instead. On regular files use
-// `PunchHole`, falling back to `WriteZeroesAt` on EOPNOTSUPP (e.g. tmpfs).
+// On block devices this is a discard: route through `BLKDISCARD`, which may
+// leave the range reading back as anything, and report success if the device
+// does not support it, as a discard is only a hint. Use [`write_zeroes_unmap`]
+// when the range must read back as zeroes. On regular files use `PunchHole`,
+// falling back to `WriteZeroesAt` on EOPNOTSUPP (e.g. tmpfs).
 pub(crate) fn punch_hole(
     file: &mut File,
     is_blkdev: bool,
@@ -79,7 +128,7 @@ pub(crate) fn punch_hole(
     length: u64,
 ) -> io::Result<()> {
     if is_blkdev {
-        return discard_result(blkdiscard(file.as_raw_fd(), offset, length));
+        return block_device_discard(file, offset, length);
     }
     match file.punch_hole(offset, length) {
         Ok(()) => Ok(()),
@@ -93,9 +142,9 @@ pub(crate) fn punch_hole(
 
 // Zero the byte range `[offset, offset + length)` in `fd`.
 //
-// Uses `BLKZEROOUT` on block devices (see [`punch_hole`] for the rationale)
-// and `WriteZeroesAt` on regular files, which tries fallocate and falls
-// back to positional writes on EOPNOTSUPP (e.g. tmpfs).
+// Uses `BLKZEROOUT` on block devices, which never deallocates the range, and
+// `WriteZeroesAt` on regular files, which tries fallocate and falls back to
+// positional writes on EOPNOTSUPP (e.g. tmpfs).
 pub(crate) fn write_zeroes(
     file: &mut File,
     is_blkdev: bool,
@@ -107,6 +156,30 @@ pub(crate) fn write_zeroes(
     }
     file.write_all_zeroes_at(offset, length as usize)?;
     Ok(())
+}
+
+// Zero the byte range `[offset, offset + length)` in `fd`, deallocating it if
+// possible: the range reads back as zeroes on success, and deallocating it is
+// only preferred.
+//
+// On block devices `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`
+// issues the device's write zeroes command, without `REQ_NOUNMAP` and without
+// a fallback to writing zero pages, and returns EOPNOTSUPP if the device has
+// no such command. `BLKZEROOUT` then zeroes the range the slow way, keeping it
+// allocated. `BLKDISCARD` is not an option: it does not guarantee zeroes (a
+// partial dm-thin block, a device without discard zeroes data), and the kernel
+// itself drops EOPNOTSUPP from the device. On regular files a punched hole
+// reads as zeroes, so use [`punch_hole`].
+pub(crate) fn write_zeroes_unmap(
+    file: &mut File,
+    is_blkdev: bool,
+    offset: u64,
+    length: u64,
+) -> io::Result<()> {
+    if is_blkdev {
+        return block_device_write_zeroes_unmap(file, offset, length);
+    }
+    punch_hole(file, false, offset, length)
 }
 
 #[cfg(test)]
@@ -157,5 +230,167 @@ mod tests {
         assert!(buf[..1024].iter().all(|&b| b == 0xBB));
         assert!(buf[1024..3072].iter().all(|&b| b == 0));
         assert!(buf[3072..].iter().all(|&b| b == 0xBB));
+    }
+
+    // What the tests below can show: which kernel interfaces the block device
+    // paths call and how they treat the results, against a device whose
+    // behaviour is scripted here, namely one whose discard succeeds without
+    // zeroing. It is not a block device, so it cannot show that the kernel
+    // keeps its side of the bargain; the loop device tests in
+    // `formats::raw` run the real syscalls.
+    const FAKE_SIZE: usize = 4096;
+
+    #[derive(Default)]
+    struct FakeBlockDevice {
+        data: Vec<u8>,
+        // The errno each interface fails with, if any.
+        discard_errno: Option<i32>,
+        punch_hole_errno: Option<i32>,
+        zeroout_errno: Option<i32>,
+        calls: Vec<&'static str>,
+    }
+
+    impl FakeBlockDevice {
+        fn new() -> Self {
+            FakeBlockDevice {
+                data: vec![0xAA; FAKE_SIZE],
+                ..Default::default()
+            }
+        }
+
+        fn zero(
+            &mut self,
+            call: &'static str,
+            errno: Option<i32>,
+            offset: u64,
+            length: u64,
+        ) -> io::Result<()> {
+            self.calls.push(call);
+            if let Some(errno) = errno {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            self.data[offset as usize..(offset + length) as usize].fill(0);
+            Ok(())
+        }
+
+        fn is_zeroed(&self) -> bool {
+            self.data[..512].iter().all(|&b| b == 0xAA)
+                && self.data[512..1536].iter().all(|&b| b == 0)
+                && self.data[1536..].iter().all(|&b| b == 0xAA)
+        }
+
+        fn is_untouched(&self) -> bool {
+            self.data.iter().all(|&b| b == 0xAA)
+        }
+    }
+
+    impl BlockDevice for FakeBlockDevice {
+        // Succeeds and leaves the old data in place, as a discard may.
+        fn discard(&mut self, _: u64, _: u64) -> io::Result<()> {
+            self.calls.push("discard");
+            match self.discard_errno {
+                Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                None => Ok(()),
+            }
+        }
+
+        fn fallocate_punch_hole(&mut self, offset: u64, length: u64) -> io::Result<()> {
+            self.zero("fallocate", self.punch_hole_errno, offset, length)
+        }
+
+        fn zeroout(&mut self, offset: u64, length: u64) -> io::Result<()> {
+            self.zero("zeroout", self.zeroout_errno, offset, length)
+        }
+    }
+
+    #[test]
+    fn write_zeroes_unmap_does_not_rely_on_discard() {
+        let mut device = FakeBlockDevice::new();
+        block_device_write_zeroes_unmap(&mut device, 512, 1024).unwrap();
+        assert_eq!(device.calls, ["fallocate"]);
+        assert!(device.is_zeroed());
+    }
+
+    #[test]
+    fn write_zeroes_unmap_falls_back_to_zeroout() {
+        let mut device = FakeBlockDevice {
+            punch_hole_errno: Some(libc::EOPNOTSUPP),
+            ..FakeBlockDevice::new()
+        };
+        block_device_write_zeroes_unmap(&mut device, 512, 1024).unwrap();
+        assert_eq!(device.calls, ["fallocate", "zeroout"]);
+        assert!(device.is_zeroed());
+    }
+
+    #[test]
+    fn write_zeroes_unmap_fails_if_nothing_can_zero() {
+        let mut device = FakeBlockDevice {
+            discard_errno: Some(libc::EOPNOTSUPP),
+            punch_hole_errno: Some(libc::EOPNOTSUPP),
+            zeroout_errno: Some(libc::EOPNOTSUPP),
+            ..FakeBlockDevice::new()
+        };
+        let error = block_device_write_zeroes_unmap(&mut device, 512, 1024).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(device.calls, ["fallocate", "zeroout"]);
+        assert!(device.is_untouched());
+    }
+
+    #[test]
+    fn write_zeroes_unmap_returns_other_errors() {
+        // The command exists and failed: writing zero pages over a device
+        // that just reported an error, or no space, is not a fallback.
+        let mut device = FakeBlockDevice {
+            punch_hole_errno: Some(libc::ENOSPC),
+            ..FakeBlockDevice::new()
+        };
+        let error = block_device_write_zeroes_unmap(&mut device, 512, 1024).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(device.calls, ["fallocate"]);
+
+        let mut device = FakeBlockDevice {
+            punch_hole_errno: Some(libc::EOPNOTSUPP),
+            zeroout_errno: Some(libc::EIO),
+            ..FakeBlockDevice::new()
+        };
+        let error = block_device_write_zeroes_unmap(&mut device, 512, 1024).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn discard_stays_a_hint() {
+        let mut device = FakeBlockDevice::new();
+        block_device_discard(&mut device, 512, 1024).unwrap();
+        assert_eq!(device.calls, ["discard"]);
+        assert!(device.is_untouched());
+
+        let mut device = FakeBlockDevice {
+            discard_errno: Some(libc::EOPNOTSUPP),
+            ..FakeBlockDevice::new()
+        };
+        block_device_discard(&mut device, 512, 1024).unwrap();
+        assert_eq!(device.calls, ["discard"]);
+
+        let mut device = FakeBlockDevice {
+            discard_errno: Some(libc::EIO),
+            ..FakeBlockDevice::new()
+        };
+        let error = block_device_discard(&mut device, 512, 1024).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn write_zeroes_unmap_on_a_regular_file_punches_a_hole() {
+        let mut f = memfd_file();
+        f.write_all_at(&vec![0xCC; 4096], 0).unwrap();
+
+        write_zeroes_unmap(&mut f, false, 1024, 2048).unwrap();
+
+        let mut buf = vec![0xFFu8; 4096];
+        f.read_exact_at(&mut buf, 0).unwrap();
+
+        assert!(buf[..1024].iter().all(|&b| b == 0xCC));
+        assert!(buf[1024..3072].iter().all(|&b| b == 0));
+        assert!(buf[3072..].iter().all(|&b| b == 0xCC));
     }
 }

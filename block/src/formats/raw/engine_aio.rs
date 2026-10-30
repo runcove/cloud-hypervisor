@@ -17,7 +17,7 @@ use crate::async_io::{
     BlockingOffload, BlockingOp, BlockingOpFn, WorkerThreadInit, offload_fn, spawn_offload,
 };
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
-use crate::sparse::{punch_hole, write_zeroes};
+use crate::sparse::{punch_hole, write_zeroes, write_zeroes_unmap};
 use crate::{SECTOR_SIZE, is_block_device, probe_direct_alignment};
 
 pub(super) struct RawAio {
@@ -143,7 +143,13 @@ impl AsyncIo for RawAio {
             offload.submit(BlockingOp::WriteZeroesUnmap, offset, length, user_data);
             return Ok(());
         }
-        self.punch_hole(offset, length, user_data)
+        // Same as punch_hole().
+        write_zeroes_unmap(&mut self.raw_file, self.is_block_device, offset, length)
+            .map_err(AsyncIoError::WriteZeroes)?;
+        self.data_io
+            .inject_completion(AsyncIoCompletion::new(user_data, 0, None));
+
+        Ok(())
     }
 
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
@@ -226,5 +232,34 @@ mod tests {
         )
         .unwrap();
         test_helpers::test_slow_discard_does_not_block_queue(&mut async_io, &mut file);
+    }
+
+    #[test]
+    fn test_write_zeroes_unmap_regular_file() {
+        let mut file = TempFile::new().unwrap().into_file();
+        let mut async_io = RawAio::new(file.try_clone().unwrap(), false, 128).unwrap();
+        test_helpers::test_write_zeroes_unmap(&mut async_io, &mut file);
+    }
+
+    #[test]
+    fn test_write_zeroes_unmap_block_device_route() {
+        let mut file = TempFile::new().unwrap().into_file();
+        let mut async_io = RawAio::new(file.try_clone().unwrap(), false, 128).unwrap();
+        async_io.is_block_device = true;
+        test_helpers::test_write_zeroes_unmap_block_device_route(&mut async_io, &mut file);
+    }
+
+    #[test]
+    fn test_write_zeroes_unmap_loop_device() {
+        let Some(device) = test_helpers::LoopDevice::new() else {
+            return;
+        };
+        let mut file = device.open();
+        for offload_fn in [None, offload_fn(true)] {
+            let mut async_io =
+                RawAio::with_offload(file.try_clone().unwrap(), false, 128, offload_fn).unwrap();
+            assert!(async_io.is_block_device);
+            test_helpers::test_write_zeroes_unmap(&mut async_io, &mut file);
+        }
     }
 }

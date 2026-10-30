@@ -5,8 +5,9 @@
 //! Runs blocking discard and write zeroes requests off the queue thread.
 //!
 //! On block devices, discard and write zeroes are the `BLKDISCARD` and
-//! `BLKZEROOUT` ioctls, which only return once the device has processed the
-//! whole range. Linux AIO has no command for them and io_uring only gained an
+//! `BLKZEROOUT` ioctls, and a write zeroes that may unmap is `fallocate()`
+//! before `BLKZEROOUT`. All of these only return once the device has processed
+//! the whole range. Linux AIO has no command for them and io_uring only gained an
 //! asynchronous discard (`BLOCK_URING_CMD_DISCARD`) in Linux 6.12, with no
 //! write zeroes counterpart, so issuing them from the virtio queue thread
 //! stalls every other request on that queue for the device's discard latency. A slow
@@ -42,7 +43,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::common::errno_result;
 use super::{AsyncIoCompletion, OffloadedOp, WorkerThreadInit};
-use crate::sparse::{punch_hole, write_zeroes};
+use crate::sparse::{punch_hole, write_zeroes, write_zeroes_unmap};
 
 /// Maximum number of offloaded operations in flight, per async I/O object
 /// and, as the device bounds them, per device.
@@ -60,7 +61,7 @@ pub const OFFLOAD_DEPTH: usize = 4;
 pub(crate) enum BlockingOp {
     PunchHole,
     WriteZeroes,
-    /// A punch hole for a write zeroes that may unmap the range.
+    /// A write zeroes that may unmap the range.
     WriteZeroesUnmap,
 }
 
@@ -85,10 +86,9 @@ pub(crate) fn block_device_op(
     length: u64,
 ) -> io::Result<()> {
     match op {
-        BlockingOp::PunchHole | BlockingOp::WriteZeroesUnmap => {
-            punch_hole(file, true, offset, length)
-        }
+        BlockingOp::PunchHole => punch_hole(file, true, offset, length),
         BlockingOp::WriteZeroes => write_zeroes(file, true, offset, length),
+        BlockingOp::WriteZeroesUnmap => write_zeroes_unmap(file, true, offset, length),
     }
 }
 
@@ -348,6 +348,7 @@ impl Drop for BlockingOffload {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::FileExt;
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
@@ -393,6 +394,10 @@ mod tests {
 
     fn unsupported_discard(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
         discard_result(Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)))
+    }
+
+    fn unsupported_write_zeroes(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
     }
 
     fn panics(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
@@ -447,6 +452,44 @@ mod tests {
             assert_eq!((completion.user_data, completion.result), (7, expected));
             assert_eq!(notifier.read().unwrap(), 1);
         }
+    }
+
+    #[test]
+    fn unsupported_write_zeroes_unmap_reaches_the_completion() {
+        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, unsupported_write_zeroes);
+        offload.submit(BlockingOp::WriteZeroesUnmap, 0, 4096, 7);
+        let completion = wait_completion(&mut offload, Duration::from_secs(5));
+        assert_eq!(
+            (
+                completion.user_data,
+                completion.result,
+                completion.offloaded
+            ),
+            (7, -libc::EOPNOTSUPP, Some(OffloadedOp::WriteZeroes))
+        );
+    }
+
+    /// On a regular file `BLKDISCARD` fails with `ENOTTY` and `fallocate()`
+    /// works, so this tells which of them the worker ran.
+    #[test]
+    fn write_zeroes_unmap_does_not_discard() {
+        let file = temp_file();
+        file.write_all_at(&[0xAA; 8192], 0).unwrap();
+        let notifier = EventFd::new(EFD_NONBLOCK).unwrap();
+        let mut offload = BlockingOffload::new(
+            file.try_clone().unwrap(),
+            &notifier,
+            OFFLOAD_DEPTH,
+            block_device_op,
+        )
+        .unwrap();
+        offload.submit(BlockingOp::WriteZeroesUnmap, 0, 4096, 7);
+        let completion = wait_completion(&mut offload, Duration::from_secs(5));
+        assert_eq!((completion.user_data, completion.result), (7, 0));
+        let mut read_buf = [0xFF; 8192];
+        file.read_exact_at(&mut read_buf, 0).unwrap();
+        assert!(read_buf[..4096].iter().all(|&b| b == 0));
+        assert!(read_buf[4096..].iter().all(|&b| b == 0xAA));
     }
 
     #[test]
