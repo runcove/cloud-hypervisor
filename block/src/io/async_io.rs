@@ -165,8 +165,10 @@ pub trait AsyncIo: Send {
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
 
-    /// Submits a write zeroes that may unmap the range: a punch hole, which
-    /// a backend running it on a worker thread reports as a write zeroes.
+    /// Submits a write zeroes that may unmap the range. By default that is a
+    /// punch hole. The raw backends override it, as on a block device a punch
+    /// hole is a discard, which does not guarantee zeroes, and report it as a
+    /// write zeroes when running it on a worker thread.
     fn write_zeroes_unmap(
         &mut self,
         offset: u64,
