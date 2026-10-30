@@ -296,8 +296,9 @@ mod tests {
     use crate::disk_file::AsyncDiskFile;
     use crate::formats::qcow::common::tests::{
         WZ_ACROSS_BOUNDARY, WZ_PARTIAL_ACROSS_BOUNDARY, WZ_PARTIAL_INSIDE_CLUSTER,
-        WZ_WHOLE_CLUSTER, check_discard_uncovers_backing, check_write_zeroes_unmap,
-        check_write_zeroes_unmap_through_chain, compress_allocated_clusters,
+        WZ_WHOLE_CLUSTER, check_discard_uncovers_backing, check_v2_image_gets_no_zero_flag,
+        check_write_zeroes_unmap, check_write_zeroes_unmap_through_chain,
+        compress_allocated_clusters,
     };
     use crate::formats::qcow::{BackingFileConfig, ImageType, QcowDisk, QcowTempDisk};
     use crate::test_util::require_direct_io;
@@ -922,5 +923,10 @@ mod tests {
     #[test]
     fn test_qcow_async_discard_still_uncovers_backing_file() {
         check_discard_uncovers_backing(true);
+    }
+
+    #[test]
+    fn test_qcow_async_v2_image_gets_no_zero_flag() {
+        check_v2_image_gets_no_zero_flag(true);
     }
 }

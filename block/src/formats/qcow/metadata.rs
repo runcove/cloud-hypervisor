@@ -897,6 +897,11 @@ impl QcowState {
     /// possible. If `zero_marker` is true, empty entries are replaced with
     /// logical-zero entries so reads do not fall through to backing data.
     ///
+    /// The zero flag only exists from version 3, and qemu treats it as
+    /// corruption on a version 2 image. There, what would carry the flag holds
+    /// a zeroed data cluster instead, which reads the same on its own and over
+    /// a backing file.
+    ///
     /// Returns None if no host punch_hole is needed.
     fn deallocate_cluster(
         &mut self,
@@ -923,7 +928,7 @@ impl QcowState {
         if l2_addr_disk == 0 {
             if zero_marker {
                 self.cache_l2_cluster_alloc(l1_index, l2_addr_disk)?;
-                self.l2_cache.get_mut(l1_index).unwrap()[l2_index] = dealloc_entry;
+                self.mark_cluster_zero(l1_index, l2_index)?;
             }
             return Ok(None);
         }
@@ -933,15 +938,20 @@ impl QcowState {
         let l2_entry = self.l2_cache.get(l1_index).unwrap()[l2_index];
         if l2_entry_is_empty(l2_entry) {
             if zero_marker {
-                self.l2_cache.get_mut(l1_index).unwrap()[l2_index] = dealloc_entry;
+                self.mark_cluster_zero(l1_index, l2_index)?;
             }
             return Ok(None);
         }
         // Compressed entries may use bit 0 as part of their layout, so they
         // must be classified before zero-flagged standard entries.
         if l2_entry_is_compressed(l2_entry) {
-            self.deallocate_compressed_cluster(l2_entry)?;
-            self.l2_cache.get_mut(l1_index).unwrap()[l2_index] = dealloc_entry;
+            if zero_marker {
+                self.mark_cluster_zero(l1_index, l2_index)?;
+                self.deallocate_compressed_cluster(l2_entry)?;
+            } else {
+                self.deallocate_compressed_cluster(l2_entry)?;
+                self.l2_cache.get_mut(l1_index).unwrap()[l2_index] = 0;
+            }
             return Ok(None);
         }
         if l2_entry_is_zero(l2_entry) {
@@ -966,6 +976,18 @@ impl QcowState {
             return Err(io::Error::from_raw_os_error(EINVAL));
         }
 
+        if !self.has_zero_flag() {
+            if refcount == 1 && (zero_marker || !sparse) {
+                self.raw_file.zero_cluster(cluster_addr)?;
+                return Ok(None);
+            }
+            if zero_marker {
+                self.mark_cluster_zero(l1_index, l2_index)?;
+                self.set_cluster_refcount_track_freed(cluster_addr, refcount - 1)?;
+                return Ok(None);
+            }
+        }
+
         if sparse {
             let new_refcount = refcount - 1;
             self.set_cluster_refcount_track_freed(cluster_addr, new_refcount)?;
@@ -984,6 +1006,23 @@ impl QcowState {
             self.l2_cache.get_mut(l1_index).unwrap()[l2_index] = dealloc_entry;
         }
         Ok(None)
+    }
+
+    /// Whether this image's version has the L2 entry zero flag.
+    fn has_zero_flag(&self) -> bool {
+        self.header.version >= 3
+    }
+
+    /// Makes an L2 entry whose cluster is not held read as zeroes, without
+    /// falling through to backing data: with the zero flag where the image has
+    /// it, otherwise with a zeroed data cluster. The L2 table must be cached.
+    fn mark_cluster_zero(&mut self, l1_index: usize, l2_index: usize) -> io::Result<()> {
+        if self.has_zero_flag() {
+            self.l2_cache.get_mut(l1_index).unwrap()[l2_index] = l2_entry_make_zero_plain();
+            return Ok(());
+        }
+        let cluster_addr = self.append_zeroed_data_cluster()?;
+        self.update_cluster_addr(l1_index, l2_index, cluster_addr)
     }
 
     /// Sets refcount for a cluster, tracking any newly freed clusters.
@@ -1177,6 +1216,10 @@ impl QcowState {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::FileExt;
+
+    use vmm_sys_util::tempfile::TempFile;
+
     // Regression for the ENOSPC unwind on the relocate-on-write path: when
     // the allocation for the relocated table fails, the still-referenced old
     // L2 table must not be left on the free lists (issue #8606).
@@ -1653,6 +1696,97 @@ mod tests {
             refcounts.get_cluster_refcount(raw_file, live_l2).unwrap()
         };
         assert_eq!(refcount, 1);
+    }
+
+    /// An open version 2 image with one data cluster, cached and with its
+    /// metadata flushed, at guest address 0. Returns its host address too.
+    fn v2_state_with_data_cluster(temp: &TempFile) -> (super::QcowState, u64) {
+        let cluster_size: u64 = 1 << 16;
+        let header =
+            super::super::QcowHeader::create_for_size_and_path(2, 4 * cluster_size, None).unwrap();
+        let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
+        header.write_to(&raw).unwrap();
+        let (mut inner, _backing, _sparse) =
+            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+        let super::ClusterWriteMapping::Allocated { offset } =
+            inner.map_write(0, None).expect("initial write");
+        inner.sync_caches().expect("flush");
+        (inner, offset)
+    }
+
+    fn cluster_refcount(inner: &mut super::QcowState, cluster_addr: u64) -> u64 {
+        let super::QcowState {
+            refcounts,
+            raw_file,
+            ..
+        } = inner;
+        refcounts
+            .get_cluster_refcount(raw_file, cluster_addr)
+            .unwrap()
+    }
+
+    // Marks a compressed entry zero on an image without the zero flag: the
+    // compressed data goes, and the entry holds a data cluster of zeroes.
+    #[test]
+    fn v2_zero_marker_replaces_compressed_cluster_with_zeroed_cluster() {
+        let temp = TempFile::new().unwrap();
+        let (mut inner, _data_cluster) = v2_state_with_data_cluster(&temp);
+        let compressed_cluster = inner.append_data_cluster(None).unwrap();
+        let cluster_size = inner.raw_file.cluster_size() as usize;
+        // One sector of compressed data, which deallocation does not read.
+        inner.l2_cache.get_mut(0).unwrap()[0] =
+            super::super::util::COMPRESSED_FLAG | compressed_cluster;
+
+        assert_eq!(inner.deallocate_cluster(0, true, true).unwrap(), None);
+
+        let l2_entry = inner.l2_cache.get(0).unwrap()[0];
+        assert_eq!(l2_entry & super::super::util::ZERO_FLAG, 0);
+        assert_eq!(l2_entry & super::super::util::COMPRESSED_FLAG, 0);
+        let new_cluster = super::l2_entry_std_cluster_addr(l2_entry);
+        assert_ne!(new_cluster, 0);
+        assert_eq!(cluster_refcount(&mut inner, new_cluster), 1);
+        assert_eq!(cluster_refcount(&mut inner, compressed_cluster), 0);
+        let mut data = vec![0xFF; cluster_size];
+        inner
+            .raw_file
+            .file_mut()
+            .read_exact_at(&mut data, new_cluster)
+            .unwrap();
+        assert_eq!(data, vec![0; cluster_size]);
+    }
+
+    // A cluster with another reference, such as from an internal snapshot,
+    // cannot be zeroed in place: the entry moves to a cluster of its own.
+    #[test]
+    fn v2_zero_marker_leaves_shared_cluster_data_alone() {
+        let temp = TempFile::new().unwrap();
+        let (mut inner, shared_cluster) = v2_state_with_data_cluster(&temp);
+        let cluster_size = inner.raw_file.cluster_size() as usize;
+        inner
+            .raw_file
+            .file_mut()
+            .write_all_at(&vec![0xEE; cluster_size], shared_cluster)
+            .unwrap();
+        inner
+            .set_cluster_refcount_track_freed(shared_cluster, 2)
+            .unwrap();
+
+        assert_eq!(inner.deallocate_cluster(0, true, true).unwrap(), None);
+
+        let l2_entry = inner.l2_cache.get(0).unwrap()[0];
+        assert_eq!(l2_entry & super::super::util::ZERO_FLAG, 0);
+        let new_cluster = super::l2_entry_std_cluster_addr(l2_entry);
+        assert_ne!(new_cluster, 0);
+        assert_ne!(new_cluster, shared_cluster);
+        assert_eq!(cluster_refcount(&mut inner, new_cluster), 1);
+        assert_eq!(cluster_refcount(&mut inner, shared_cluster), 1);
+        let mut data = vec![0; cluster_size];
+        inner
+            .raw_file
+            .file_mut()
+            .read_exact_at(&mut data, shared_cluster)
+            .unwrap();
+        assert_eq!(data, vec![0xEE; cluster_size]);
     }
 
     // Allocate past the refcount limit of the virtual size, then reopen after
