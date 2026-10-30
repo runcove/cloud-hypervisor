@@ -134,6 +134,19 @@ impl AsyncIo for QcowSync {
             .complete(AsyncIoCompletion::new(user_data, result, None));
         Ok(())
     }
+
+    fn write_zeroes_unmap(
+        &mut self,
+        offset: u64,
+        length: u64,
+        user_data: u64,
+    ) -> AsyncIoResult<()> {
+        // The trait's default is a punch hole, which on an overlay uncovers
+        // the backing file. A write zeroes also deallocates the range, where
+        // sparse allows, and leaves a zero marker when a backing file needs
+        // one.
+        self.write_zeroes(offset, length, user_data)
+    }
 }
 
 #[cfg(test)]
@@ -156,7 +169,11 @@ mod tests {
     use crate::error::BlockErrorKind;
     use crate::formats::qcow;
     use crate::formats::qcow::common::apply_dealloc_action;
-    use crate::formats::qcow::common::tests::compress_allocated_clusters;
+    use crate::formats::qcow::common::tests::{
+        WZ_ACROSS_BOUNDARY, WZ_PARTIAL_ACROSS_BOUNDARY, WZ_PARTIAL_INSIDE_CLUSTER,
+        WZ_WHOLE_CLUSTER, check_discard_uncovers_backing, check_write_zeroes_unmap,
+        compress_allocated_clusters,
+    };
     use crate::formats::qcow::metadata::{ClusterReadMapping, DeallocAction};
     use crate::formats::qcow::{
         BackingFileConfig, Error as QcowError, ImageType, QcowDisk, QcowHeader, QcowTempDisk,
@@ -2261,5 +2278,26 @@ mod tests {
         let reopened = QcowDisk::new(file.try_clone().unwrap(), false, false, true, false).unwrap();
         let read_back = async_read(&reopened, new_guest_offset, CLUSTER_SIZE as usize);
         assert!(read_back.iter().all(|&byte| byte == 0x5a));
+    }
+
+    #[test]
+    fn test_qcow_write_zeroes_unmap_whole_cluster_reads_zero() {
+        check_write_zeroes_unmap(false, WZ_WHOLE_CLUSTER);
+    }
+
+    #[test]
+    fn test_qcow_write_zeroes_unmap_across_cluster_boundary_reads_zero() {
+        check_write_zeroes_unmap(false, WZ_ACROSS_BOUNDARY);
+    }
+
+    #[test]
+    fn test_qcow_write_zeroes_unmap_partial_clusters_read_zero() {
+        check_write_zeroes_unmap(false, WZ_PARTIAL_ACROSS_BOUNDARY);
+        check_write_zeroes_unmap(false, WZ_PARTIAL_INSIDE_CLUSTER);
+    }
+
+    #[test]
+    fn test_qcow_discard_still_uncovers_backing_file() {
+        check_discard_uncovers_backing(false);
     }
 }

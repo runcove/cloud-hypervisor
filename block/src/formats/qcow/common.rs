@@ -248,6 +248,7 @@ pub(super) fn scatter_read_sync(
 pub(crate) mod tests {
     use std::fs::File;
     use std::io::Write;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::FileExt;
 
     use flate2::Compression;
@@ -259,7 +260,9 @@ pub(crate) mod tests {
     use super::super::qcow_raw_file::QcowRawFile;
     use super::{decompress_cluster, scatter_read_sync};
     use crate::aligned_file::AlignedFile;
-    use crate::async_io::{AsyncIoOperation, OwnedIoBuffer};
+    use crate::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoOperation, OwnedIoBuffer};
+    use crate::disk_file::{AsyncDiskFile, MetadataSync};
+    use crate::formats::qcow::{BackingFileConfig, ImageType, QcowDisk, QcowTempDisk};
 
     const COMPRESSED_FLAG: u64 = 1 << 62;
     const CLUSTER_USED_FLAG: u64 = 1 << 63;
@@ -279,6 +282,179 @@ pub(crate) mod tests {
         let addr_part = host_offset & ((1 << compressed_size_shift) - 1);
         let size_part = (nsectors - 1) << compressed_size_shift;
         COMPRESSED_FLAG | size_part | addr_part
+    }
+
+    const WZ_CLUSTER: u64 = 1 << 16;
+    const WZ_DISK_SIZE: u64 = 6 * WZ_CLUSTER;
+    const WZ_BACKING_BYTE: u8 = 0xAB;
+    const WZ_OVERLAY_BYTE: u8 = 0xCD;
+
+    /// `(offset, length)` of one whole cluster.
+    pub(crate) const WZ_WHOLE_CLUSTER: (u64, u64) = (WZ_CLUSTER, WZ_CLUSTER);
+    /// The end of one cluster, a whole cluster and the start of the next.
+    pub(crate) const WZ_ACROSS_BOUNDARY: (u64, u64) = (WZ_CLUSTER + WZ_CLUSTER / 2, 2 * WZ_CLUSTER);
+    /// The end of one cluster and the start of the next, nothing whole.
+    pub(crate) const WZ_PARTIAL_ACROSS_BOUNDARY: (u64, u64) = (2 * WZ_CLUSTER - 4096, 8192);
+    /// A range inside one cluster.
+    pub(crate) const WZ_PARTIAL_INSIDE_CLUSTER: (u64, u64) = (WZ_CLUSTER + 4096, 4096);
+
+    fn wz_wait(async_io: &mut dyn AsyncIo) -> AsyncIoCompletion {
+        loop {
+            if let Some(completion) = async_io.next_completed_request() {
+                return completion;
+            }
+            // Only io_uring gets here: the sync engine completes on submit.
+            let fd = async_io.notifier().as_raw_fd();
+            let mut val = 0u64;
+            // SAFETY: reading 8 bytes from a valid eventfd.
+            unsafe {
+                libc::read(fd, (&raw mut val).cast(), 8);
+            }
+        }
+    }
+
+    fn wz_read_all(disk: &QcowDisk) -> Vec<u8> {
+        let mut async_io = disk.create_async_io(1).unwrap();
+        let buffer = OwnedIoBuffer::from_vec(vec![0x5A; WZ_DISK_SIZE as usize]);
+        async_io.read_to_vec(0, buffer, 1).unwrap();
+        let mut completion = wz_wait(async_io.as_mut());
+        assert_eq!(completion.result as u64, WZ_DISK_SIZE);
+        completion.buffer.take().unwrap().as_slice().to_vec()
+    }
+
+    fn wz_used_clusters(file: &File, disk: &QcowDisk) -> u64 {
+        let clusters = file.metadata().unwrap().len() / WZ_CLUSTER;
+        (0..clusters)
+            .filter(|c| disk.metadata().cluster_refcount(c * WZ_CLUSTER).unwrap() != 0)
+            .count() as u64
+    }
+
+    /// Reports where `actual` differs from `expected`, if it does.
+    fn wz_difference(actual: &[u8], expected: &[u8]) -> Option<String> {
+        let at = actual.iter().zip(expected).position(|(a, e)| a != e)?;
+        Some(format!(
+            "byte {at:#x} is {:#x}, expected {:#x}",
+            actual[at], expected[at]
+        ))
+    }
+
+    /// An image over a backing file of [`WZ_BACKING_BYTE`] if `backing`, with
+    /// every cluster holding [`WZ_OVERLAY_BYTE`] if `allocated`. Returns the
+    /// open disk, the bytes it holds and the files to keep alive.
+    fn wz_disk(
+        backing: bool,
+        allocated: bool,
+        sparse: bool,
+        use_io_uring: bool,
+    ) -> (QcowDisk, Vec<u8>, TempFile, TempFile) {
+        let backing_temp = TempFile::new().unwrap();
+        backing_temp
+            .as_file()
+            .write_all(&vec![WZ_BACKING_BYTE; WZ_DISK_SIZE as usize])
+            .unwrap();
+        let config = BackingFileConfig {
+            path: backing_temp.as_path().to_str().unwrap().to_string(),
+            format: Some(ImageType::Raw),
+        };
+        let overlay_temp = QcowTempDisk::new(
+            WZ_DISK_SIZE,
+            backing.then_some(&config),
+            false,
+            sparse,
+            false,
+        )
+        .unwrap()
+        .into_tempfile();
+        let disk = wz_open(&overlay_temp, sparse, use_io_uring);
+
+        let mut contents = vec![if backing { WZ_BACKING_BYTE } else { 0 }; WZ_DISK_SIZE as usize];
+        if allocated {
+            contents.fill(WZ_OVERLAY_BYTE);
+            let mut async_io = disk.create_async_io(1).unwrap();
+            async_io
+                .write_from_vec(0, OwnedIoBuffer::from_vec(contents.clone()), 1)
+                .unwrap();
+            assert_eq!(wz_wait(async_io.as_mut()).result as u64, WZ_DISK_SIZE);
+        }
+        (disk, contents, backing_temp, overlay_temp)
+    }
+
+    fn wz_open(overlay: &TempFile, sparse: bool, use_io_uring: bool) -> QcowDisk {
+        let file = overlay.as_file().try_clone().unwrap();
+        QcowDisk::new(file, false, true, sparse, use_io_uring).unwrap()
+    }
+
+    /// Runs a write zeroes with UNMAP on `(offset, length)` with and without
+    /// a backing file, sparse on and off, on allocated and unallocated
+    /// clusters, and checks what reads back, before and after a reopen, and
+    /// that whole clusters are deallocated when sparse is on.
+    pub(crate) fn check_write_zeroes_unmap(use_io_uring: bool, (offset, length): (u64, u64)) {
+        let (start, end) = (offset as usize, (offset + length) as usize);
+        let whole_clusters =
+            ((offset + length) / WZ_CLUSTER).saturating_sub(offset.div_ceil(WZ_CLUSTER));
+        let mut failures = Vec::new();
+
+        for backing in [true, false] {
+            for sparse in [true, false] {
+                for allocated in [true, false] {
+                    let (disk, mut expected, _backing, overlay) =
+                        wz_disk(backing, allocated, sparse, use_io_uring);
+                    let case = format!("backing={backing} sparse={sparse} allocated={allocated}");
+                    let used_before = wz_used_clusters(overlay.as_file(), &disk);
+
+                    let mut async_io = disk.create_async_io(1).unwrap();
+                    async_io.write_zeroes_unmap(offset, length, 7).unwrap();
+                    assert_eq!(wz_wait(async_io.as_mut()).result, 0, "{case}");
+                    drop(async_io);
+
+                    expected[start..end].fill(0);
+                    if let Some(difference) = wz_difference(&wz_read_all(&disk), &expected) {
+                        failures.push(format!("{case}: {difference}"));
+                    }
+
+                    if allocated {
+                        let freed = if sparse { whole_clusters } else { 0 };
+                        let used_after = wz_used_clusters(overlay.as_file(), &disk);
+                        assert_eq!(used_before - used_after, freed, "{case}");
+                    }
+
+                    disk.sync_metadata().unwrap();
+                    let reopened = wz_open(&overlay, sparse, use_io_uring);
+                    if let Some(difference) = wz_difference(&wz_read_all(&reopened), &expected) {
+                        failures.push(format!("{case} after reopen: {difference}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "write zeroes with UNMAP at {offset:#x}+{length:#x} did not read back zeroes:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// A discard is only a hint: with sparse on, its whole clusters still read
+    /// from the backing file, while its partial ones are zeroed in the overlay.
+    pub(crate) fn check_discard_uncovers_backing(use_io_uring: bool) {
+        let (offset, length) = WZ_ACROSS_BOUNDARY;
+        let whole = (2 * WZ_CLUSTER) as usize..(3 * WZ_CLUSTER) as usize;
+
+        for allocated in [true, false] {
+            let (disk, mut expected, _backing, _overlay) =
+                wz_disk(true, allocated, true, use_io_uring);
+            let mut async_io = disk.create_async_io(1).unwrap();
+            async_io.punch_hole(offset, length, 7).unwrap();
+            assert_eq!(wz_wait(async_io.as_mut()).result, 0);
+            drop(async_io);
+
+            expected[offset as usize..(offset + length) as usize].fill(0);
+            expected[whole.clone()].fill(WZ_BACKING_BYTE);
+            assert_eq!(
+                wz_difference(&wz_read_all(&disk), &expected),
+                None,
+                "allocated={allocated}"
+            );
+        }
     }
 
     /// Compress every allocated cluster in a QCOW2 image file in place.
