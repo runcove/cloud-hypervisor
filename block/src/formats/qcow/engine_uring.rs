@@ -197,6 +197,19 @@ impl AsyncIo for QcowAsync {
         Ok(())
     }
 
+    fn write_zeroes_unmap(
+        &mut self,
+        offset: u64,
+        length: u64,
+        user_data: u64,
+    ) -> AsyncIoResult<()> {
+        // The trait's default is a punch hole, which on an overlay uncovers
+        // the backing file. A write zeroes also deallocates the range, where
+        // sparse allows, and leaves a zero marker when a backing file needs
+        // one.
+        self.write_zeroes(offset, length, user_data)
+    }
+
     fn batch_requests_enabled(&self) -> bool {
         true
     }
@@ -294,7 +307,11 @@ mod tests {
     use crate::SECTOR_SIZE;
     use crate::async_io::{AsyncIoCompletion, AsyncIoOperation, GuestMemoryTarget, OwnedIoBuffer};
     use crate::disk_file::AsyncDiskFile;
-    use crate::formats::qcow::common::tests::compress_allocated_clusters;
+    use crate::formats::qcow::common::tests::{
+        WZ_ACROSS_BOUNDARY, WZ_PARTIAL_ACROSS_BOUNDARY, WZ_PARTIAL_INSIDE_CLUSTER,
+        WZ_WHOLE_CLUSTER, check_discard_uncovers_backing, check_write_zeroes_unmap,
+        compress_allocated_clusters,
+    };
     use crate::formats::qcow::{BackingFileConfig, ImageType, QcowDisk, QcowTempDisk};
     use crate::test_util::require_direct_io;
 
@@ -892,5 +909,26 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_qcow_async_write_zeroes_unmap_whole_cluster_reads_zero() {
+        check_write_zeroes_unmap(true, WZ_WHOLE_CLUSTER);
+    }
+
+    #[test]
+    fn test_qcow_async_write_zeroes_unmap_across_cluster_boundary_reads_zero() {
+        check_write_zeroes_unmap(true, WZ_ACROSS_BOUNDARY);
+    }
+
+    #[test]
+    fn test_qcow_async_write_zeroes_unmap_partial_clusters_read_zero() {
+        check_write_zeroes_unmap(true, WZ_PARTIAL_ACROSS_BOUNDARY);
+        check_write_zeroes_unmap(true, WZ_PARTIAL_INSIDE_CLUSTER);
+    }
+
+    #[test]
+    fn test_qcow_async_discard_still_uncovers_backing_file() {
+        check_discard_uncovers_backing(true);
     }
 }
