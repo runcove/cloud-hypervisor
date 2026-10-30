@@ -350,7 +350,7 @@ impl Request {
                 if wz_flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP != 0 {
                     disk_image
                         .write_zeroes_unmap(wz_offset, wz_length, user_data)
-                        .map_err(ExecuteError::AsyncPunchHole)?;
+                        .map_err(ExecuteError::AsyncWriteZeroes)?;
                 } else {
                     disk_image
                         .write_zeroes(wz_offset, wz_length, user_data)

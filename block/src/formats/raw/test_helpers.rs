@@ -10,13 +10,18 @@
 //! that backs the I/O object, so the same logic exercises every backend with
 //! only the constructor differing.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use vmm_sys_util::tempfile::TempFile;
+
 use crate::async_io::{AsyncIo, AsyncIoCompletion, BlockingOp, OwnedIoBuffer};
-use crate::sparse::{punch_hole, write_zeroes};
+use crate::sparse::{write_zeroes, write_zeroes_unmap};
 
 fn next_completion(async_io: &mut dyn AsyncIo) -> (u64, i32) {
     let completion = async_io.next_completed_request().expect("No completion");
@@ -160,6 +165,107 @@ pub(crate) fn test_punch_hole_multiple_operations(async_io: &mut dyn AsyncIo, fi
     assert!(read_buf.iter().all(|&b| b == 0));
 }
 
+/// Tests that a write zeroes that may unmap leaves zeroes in the range it
+/// covers and nothing else changed, whatever `file` is.
+pub(crate) fn test_write_zeroes_unmap(async_io: &mut dyn AsyncIo, file: &mut File) {
+    const SIZE: usize = 1024 * 1024;
+    const OFFSET: usize = 256 * 1024;
+    const LENGTH: usize = 512 * 1024;
+
+    file.write_all_at(&vec![0xAA; SIZE], 0).unwrap();
+    file.sync_all().unwrap();
+
+    async_io
+        .write_zeroes_unmap(OFFSET as u64, LENGTH as u64, 7)
+        .unwrap();
+    let completion = wait_for_completion(async_io);
+    assert_eq!((completion.user_data, completion.result), (7, 0));
+
+    let mut read_buf = vec![0xFF; SIZE];
+    file.read_exact_at(&mut read_buf, 0).unwrap();
+    assert!(read_buf[..OFFSET].iter().all(|&b| b == 0xAA));
+    assert!(read_buf[OFFSET..OFFSET + LENGTH].iter().all(|&b| b == 0));
+    assert!(read_buf[OFFSET + LENGTH..].iter().all(|&b| b == 0xAA));
+}
+
+/// Tests that a backend's write zeroes that may unmap on a block device does
+/// not go through `BLKDISCARD`, for a backend that was told that `file`, a
+/// regular file, is one: `BLKDISCARD` fails on it with `ENOTTY`, whereas the
+/// `fallocate` a write zeroes uses works.
+pub(crate) fn test_write_zeroes_unmap_block_device_route(
+    async_io: &mut dyn AsyncIo,
+    file: &mut File,
+) {
+    // SAFETY: FFI call with a valid fd.
+    let ret = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            0,
+            4096,
+        )
+    };
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        eprintln!("Skipping: the temporary file cannot have holes punched: {err}");
+        return;
+    }
+    test_write_zeroes_unmap(async_io, file);
+}
+
+/// A loop device over a temporary file, removed on drop. Its file lives in
+/// `TMPDIR`, which decides what the device supports.
+pub(crate) struct LoopDevice {
+    path: String,
+    _backing: TempFile,
+}
+
+impl LoopDevice {
+    const SIZE: u64 = 4 * 1024 * 1024;
+
+    /// Creates the device, or returns `None`, saying why, if this environment
+    /// cannot: it takes root and the `losetup` tool.
+    pub(crate) fn new() -> Option<Self> {
+        // SAFETY: FFI call without arguments.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping: creating a loop device needs root");
+            return None;
+        }
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(Self::SIZE).unwrap();
+        let output = match Command::new("losetup")
+            .args(["-f", "--show", "--"])
+            .arg(backing.as_path())
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            result => {
+                eprintln!("Skipping: losetup failed: {result:?}");
+                return None;
+            }
+        };
+        let path = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        Some(LoopDevice {
+            path,
+            _backing: backing,
+        })
+    }
+
+    pub(crate) fn open(&self) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .unwrap()
+    }
+}
+
+impl Drop for LoopDevice {
+    fn drop(&mut self) {
+        let _ = Command::new("losetup").args(["-d", &self.path]).status();
+    }
+}
+
 /// How long [`slow_file_op`] takes, standing in for a slow block device.
 const SLOW_OP_DELAY: Duration = Duration::from_secs(1);
 
@@ -174,7 +280,7 @@ pub(crate) fn slow_file_op(
     thread::sleep(SLOW_OP_DELAY);
     match op {
         BlockingOp::PunchHole | BlockingOp::WriteZeroesUnmap => {
-            punch_hole(file, false, offset, length)
+            write_zeroes_unmap(file, false, offset, length)
         }
         BlockingOp::WriteZeroes => write_zeroes(file, false, offset, length),
     }
