@@ -348,6 +348,7 @@ impl Drop for BlockingOffload {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::FileExt;
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
@@ -474,6 +475,23 @@ mod tests {
     #[test]
     fn write_zeroes_unmap_does_not_discard() {
         let file = temp_file();
+        file.write_all_at(&[0xAA; 8192], 0).unwrap();
+        // Without hole punching the fallback is BLKZEROOUT, which fails on a
+        // regular file with ENOTTY, so the test cannot tell anything.
+        // SAFETY: FFI call with a valid fd.
+        let ret = unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                0,
+                4096,
+            )
+        };
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            eprintln!("Skipping: the temporary file cannot have holes punched: {err}");
+            return;
+        }
         file.write_all_at(&[0xAA; 8192], 0).unwrap();
         let notifier = EventFd::new(EFD_NONBLOCK).unwrap();
         let mut offload = BlockingOffload::new(
