@@ -160,7 +160,7 @@ mod tests {
         WZ_ACROSS_BOUNDARY, WZ_PARTIAL_ACROSS_BOUNDARY, WZ_PARTIAL_INSIDE_CLUSTER,
         WZ_WHOLE_CLUSTER, check_discard_uncovers_backing, check_v2_image_gets_no_zero_flag,
         check_write_zeroes_unmap, check_write_zeroes_unmap_through_chain,
-        compress_allocated_clusters,
+        check_zero_then_write_cycles_do_not_grow_file, compress_allocated_clusters,
     };
     use crate::formats::qcow::metadata::{ClusterReadMapping, DeallocAction};
     use crate::formats::qcow::{
@@ -2297,5 +2297,10 @@ mod tests {
     #[test]
     fn test_qcow_v2_image_gets_no_zero_flag() {
         check_v2_image_gets_no_zero_flag(false);
+    }
+
+    #[test]
+    fn test_qcow_zero_then_write_cycles_do_not_grow_file() {
+        check_zero_then_write_cycles_do_not_grow_file(false);
     }
 }

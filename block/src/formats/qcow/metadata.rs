@@ -586,6 +586,12 @@ impl QcowState {
             self.update_cluster_addr(l1_index, l2_index, cluster_addr)?;
             self.deallocate_compressed_cluster(l2_entry)?;
             cluster_addr
+        } else if l2_entry_is_zero(l2_entry) && l2_entry_std_cluster_addr(l2_entry) != 0 {
+            self.take_preallocated_zero_cluster(
+                l1_index,
+                l2_index,
+                l2_entry_std_cluster_addr(l2_entry),
+            )?
         } else if l2_entry_is_empty(l2_entry) || l2_entry_is_zero(l2_entry) {
             let cluster_addr = if l2_entry_is_zero(l2_entry) {
                 self.append_zeroed_data_cluster()?
@@ -742,6 +748,49 @@ impl QcowState {
         Ok(new_addr)
     }
 
+    /// Turns a zero entry that holds a host cluster into a standard entry for
+    /// a write, returning the cluster to write to. The entry's cluster is
+    /// reused when nothing else references it, so that zeroing and rewriting
+    /// a cluster does not allocate another one. A cluster referenced from
+    /// elsewhere keeps its data and loses this entry's reference.
+    fn take_preallocated_zero_cluster(
+        &mut self,
+        l1_index: usize,
+        l2_index: usize,
+        preallocated: u64,
+    ) -> io::Result<u64> {
+        self.reject_invalid_cluster_offset(preallocated)?;
+        let refcount = self
+            .refcounts
+            .get_cluster_refcount(&mut self.raw_file, preallocated)
+            .map_err(|e| {
+                if matches!(e, refcount::Error::RefblockUnaligned(_)) {
+                    self.set_corrupt_bit_best_effort();
+                }
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to get cluster refcount: {e}"),
+                )
+            })?;
+
+        if refcount == 1 {
+            // The cluster keeps the data it had before it was zeroed. If the
+            // table cannot be relocated the entry still holds it, so unlike
+            // in update_cluster_addr() it stays off the free lists.
+            self.raw_file.zero_cluster(preallocated)?;
+            let relocation = self.allocate_l2_relocation(l1_index)?;
+            self.publish_cluster_addr(l1_index, l2_index, preallocated, relocation)?;
+            return Ok(preallocated);
+        }
+
+        let cluster_addr = self.append_zeroed_data_cluster()?;
+        self.update_cluster_addr(l1_index, l2_index, cluster_addr)?;
+        if refcount > 1 {
+            self.set_cluster_refcount_track_freed(preallocated, refcount - 1)?;
+        }
+        Ok(cluster_addr)
+    }
+
     /// Updates the L1 and L2 tables to point to a new cluster address.
     // Publishes cluster_addr in the L2 table, relocating the table first when
     // it is not already dirty. A failure before the entry is published returns
@@ -753,25 +802,41 @@ impl QcowState {
         l2_index: usize,
         cluster_addr: u64,
     ) -> io::Result<()> {
-        let relocation = if self.l2_cache.get(l1_index).unwrap().dirty() {
-            None
-        } else {
-            // Allocate the new cluster for the relocated L2 table before
-            // releasing the old one: if this allocation fails (ENOSPC at
-            // allocator exhaustion) the old table must stay off the free
-            // lists, or a later allocation would hand it out and overwrite a
-            // live L2 table (issue #8606). The cluster will be written when
-            // the cache is flushed.
-            let new_addr = match self.append_data_cluster(None) {
-                Ok(new_addr) => new_addr,
-                Err(e) => {
-                    self.release_unreferenced_cluster(cluster_addr);
-                    return Err(e);
-                }
-            };
-            Some((self.l1_table[l1_index], new_addr))
+        let relocation = match self.allocate_l2_relocation(l1_index) {
+            Ok(relocation) => relocation,
+            Err(e) => {
+                self.release_unreferenced_cluster(cluster_addr);
+                return Err(e);
+            }
         };
+        self.publish_cluster_addr(l1_index, l2_index, cluster_addr, relocation)
+    }
 
+    /// Returns the old and new addresses of the L2 table when it has to be
+    /// relocated before its next change, which is when it is not already dirty.
+    fn allocate_l2_relocation(&mut self, l1_index: usize) -> io::Result<Option<(u64, u64)>> {
+        if self.l2_cache.get(l1_index).unwrap().dirty() {
+            return Ok(None);
+        }
+        // Allocate the new cluster for the relocated L2 table before
+        // releasing the old one: if this allocation fails (ENOSPC at
+        // allocator exhaustion) the old table must stay off the free
+        // lists, or a later allocation would hand it out and overwrite a
+        // live L2 table (issue #8606). The cluster will be written when
+        // the cache is flushed.
+        let new_addr = self.append_data_cluster(None)?;
+        Ok(Some((self.l1_table[l1_index], new_addr)))
+    }
+
+    /// Writes cluster_addr to the L2 entry and switches L1 to the relocated
+    /// table, if there is one, releasing the old table.
+    fn publish_cluster_addr(
+        &mut self,
+        l1_index: usize,
+        l2_index: usize,
+        cluster_addr: u64,
+        relocation: Option<(u64, u64)>,
+    ) -> io::Result<()> {
         // Prepare the replacement L2 contents before switching L1. If the
         // old-table refcount drop then fails, sync_caches() can still write a
         // complete replacement table rather than publishing an empty cluster.
@@ -1696,6 +1761,125 @@ mod tests {
             refcounts.get_cluster_refcount(raw_file, live_l2).unwrap()
         };
         assert_eq!(refcount, 1);
+    }
+
+    /// An open version 3 image whose first entry is a zero entry holding a
+    /// cluster of stale data. Returns the cluster's host address too.
+    fn state_with_preallocated_zero_entry(temp: &TempFile) -> (super::QcowState, u64) {
+        let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
+        let (mut inner, _backing, _sparse) =
+            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+        let super::ClusterWriteMapping::Allocated { offset } =
+            inner.map_write(0, None).expect("initial write");
+        let cluster_size = inner.raw_file.cluster_size() as usize;
+        inner
+            .raw_file
+            .file_mut()
+            .write_all_at(&vec![0xEE; cluster_size], offset)
+            .unwrap();
+        assert_eq!(inner.deallocate_cluster(0, false, false).unwrap(), None);
+        assert_eq!(
+            inner.l2_cache.get(0).unwrap()[0],
+            super::l2_entry_make_zero(offset)
+        );
+        (inner, offset)
+    }
+
+    #[test]
+    fn write_reuses_preallocated_zero_cluster_and_clears_it() {
+        let temp = super::super::QcowTempDisk::new(1 << 18, None, false, false, false)
+            .unwrap()
+            .into_tempfile();
+        let (mut inner, preallocated) = state_with_preallocated_zero_entry(&temp);
+        let cluster_size = inner.raw_file.cluster_size() as usize;
+        let file_len = inner.raw_file.physical_size().unwrap();
+
+        let super::ClusterWriteMapping::Allocated { offset } = inner.map_write(0, None).unwrap();
+
+        assert_eq!(offset, preallocated);
+        assert_eq!(inner.raw_file.physical_size().unwrap(), file_len);
+        assert_eq!(cluster_refcount(&mut inner, preallocated), 1);
+        assert_eq!(
+            inner.l2_cache.get(0).unwrap()[0],
+            super::l2_entry_make_std(preallocated)
+        );
+        let mut data = vec![0xFF; cluster_size];
+        inner
+            .raw_file
+            .file_mut()
+            .read_exact_at(&mut data, preallocated)
+            .unwrap();
+        assert_eq!(data, vec![0; cluster_size]);
+    }
+
+    // A cluster with another reference, such as from an internal snapshot,
+    // keeps its data: the write gets a cluster of its own and only this
+    // entry's reference goes.
+    #[test]
+    fn write_leaves_shared_preallocated_zero_cluster_alone() {
+        let temp = super::super::QcowTempDisk::new(1 << 18, None, false, false, false)
+            .unwrap()
+            .into_tempfile();
+        let (mut inner, shared) = state_with_preallocated_zero_entry(&temp);
+        let cluster_size = inner.raw_file.cluster_size() as usize;
+        inner.set_cluster_refcount_track_freed(shared, 2).unwrap();
+
+        let super::ClusterWriteMapping::Allocated { offset } = inner.map_write(0, None).unwrap();
+
+        assert_ne!(offset, shared);
+        assert_eq!(cluster_refcount(&mut inner, offset), 1);
+        assert_eq!(cluster_refcount(&mut inner, shared), 1);
+        let mut data = vec![0; cluster_size];
+        inner
+            .raw_file
+            .file_mut()
+            .read_exact_at(&mut data, shared)
+            .unwrap();
+        assert_eq!(data, vec![0xEE; cluster_size]);
+    }
+
+    // The entry still holds the cluster when the table cannot be relocated, so
+    // the cluster must not reach the free lists.
+    #[test]
+    fn failed_l2_relocate_keeps_preallocated_zero_cluster_off_free_lists() {
+        let temp = super::super::QcowTempDisk::new(1 << 18, None, false, false, false)
+            .unwrap()
+            .into_tempfile();
+        let (mut inner, preallocated) = state_with_preallocated_zero_entry(&temp);
+        inner.sync_caches().expect("flush");
+        let cluster_size = inner.raw_file.cluster_size();
+        let file_clusters = inner
+            .raw_file
+            .physical_size()
+            .unwrap()
+            .div_ceil(cluster_size);
+        inner.refcounts = super::super::refcount::RefCount::new(
+            &mut inner.raw_file,
+            inner.header.refcount_table_offset,
+            1,
+            file_clusters,
+            cluster_size,
+            16,
+        )
+        .unwrap();
+        inner.avail_clusters.clear();
+        inner.unref_clusters.clear();
+
+        let err = inner
+            .map_write(0, None)
+            .expect_err("relocation must fail with the allocator exhausted");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOSPC));
+
+        assert_eq!(
+            inner.l2_cache.get(0).unwrap()[0],
+            super::l2_entry_make_zero(preallocated)
+        );
+        assert_eq!(cluster_refcount(&mut inner, preallocated), 1);
+        assert!(
+            !inner.unref_clusters.contains(&preallocated)
+                && !inner.avail_clusters.contains(&preallocated),
+            "a cluster the entry still holds must never enter the free lists"
+        );
     }
 
     /// An open version 2 image with one data cluster, cached and with its
