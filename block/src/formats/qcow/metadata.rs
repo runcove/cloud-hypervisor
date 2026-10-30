@@ -1862,6 +1862,37 @@ mod tests {
             16,
         )
         .unwrap();
+        // Make the refblock dirty. Changing a refcount in a clean block needs a
+        // new cluster, which would fail here and make a release of the cluster
+        // a silent no-op.
+        let refblock =
+            match inner
+                .refcounts
+                .set_cluster_refcount(&mut inner.raw_file, preallocated, 1, None)
+            {
+                Err(super::super::refcount::Error::NeedCluster(addr)) => addr,
+                other => panic!("unexpected {other:?}"),
+            };
+        let contents = inner.raw_file.read_refcount_block(refblock).unwrap();
+        let cache = super::VecCache::from_vec(contents);
+        inner
+            .refcounts
+            .set_cluster_refcount(
+                &mut inner.raw_file,
+                preallocated,
+                1,
+                Some((refblock, cache)),
+            )
+            .expect_err("cached clean block");
+        inner
+            .refcounts
+            .set_cluster_refcount(
+                &mut inner.raw_file,
+                preallocated,
+                1,
+                Some((refblock, super::VecCache::new(1))),
+            )
+            .unwrap();
         inner.avail_clusters.clear();
         inner.unref_clusters.clear();
 
