@@ -197,19 +197,6 @@ impl AsyncIo for QcowAsync {
         Ok(())
     }
 
-    fn write_zeroes_unmap(
-        &mut self,
-        offset: u64,
-        length: u64,
-        user_data: u64,
-    ) -> AsyncIoResult<()> {
-        // The trait's default is a punch hole, which on an overlay uncovers
-        // the backing file. A write zeroes also deallocates the range, where
-        // sparse allows, and leaves a zero marker when a backing file needs
-        // one.
-        self.write_zeroes(offset, length, user_data)
-    }
-
     fn batch_requests_enabled(&self) -> bool {
         true
     }

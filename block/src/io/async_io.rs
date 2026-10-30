@@ -165,17 +165,19 @@ pub trait AsyncIo: Send {
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
 
-    /// Submits a write zeroes that may unmap the range. By default that is a
-    /// punch hole. The raw backends override it, as on a block device a punch
-    /// hole is a discard, which does not guarantee zeroes, and report it as a
-    /// write zeroes when running it on a worker thread.
+    /// Submits a write zeroes that may unmap the range. The range must read
+    /// back as zeroes, which a punch hole does not guarantee: on a block
+    /// device it is a discard, and on a qcow2 overlay it uncovers the backing
+    /// file. By default that is therefore a plain write zeroes. The raw
+    /// backends override it, to unmap the range where the file allows it and
+    /// to report it as a write zeroes when running it on a worker thread.
     fn write_zeroes_unmap(
         &mut self,
         offset: u64,
         length: u64,
         user_data: u64,
     ) -> AsyncIoResult<()> {
-        self.punch_hole(offset, length, user_data)
+        self.write_zeroes(offset, length, user_data)
     }
 
     /// Returns whether discard and write zeroes requests run on a worker
