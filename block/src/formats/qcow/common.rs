@@ -433,6 +433,110 @@ pub(crate) mod tests {
         );
     }
 
+    /// Writes `byte` over the clusters `first..first + count` of `disk`.
+    fn wz_fill_clusters(disk: &QcowDisk, first: u64, count: u64, byte: u8) {
+        let mut async_io = disk.create_async_io(1).unwrap();
+        let length = count * WZ_CLUSTER;
+        let buffer = OwnedIoBuffer::from_vec(vec![byte; length as usize]);
+        async_io
+            .write_from_vec((first * WZ_CLUSTER) as libc::off_t, buffer, 1)
+            .unwrap();
+        assert_eq!(wz_wait(async_io.as_mut()).result as u64, length);
+    }
+
+    /// A write zeroes with UNMAP through the top of a chain three levels deep
+    /// must read back as zeroes even when only the middle layer holds data
+    /// for the cluster, whether the base is a raw or a qcow2 file. The base
+    /// holds [`WZ_BACKING_BYTE`] everywhere and the middle layer holds
+    /// [`WZ_OVERLAY_BYTE`] in clusters 1 and 2, which the top does not
+    /// allocate. Zeroing cluster 1 must leave cluster 2 reading the middle
+    /// layer, before and after a reopen.
+    pub(crate) fn check_write_zeroes_unmap_through_chain(use_io_uring: bool) {
+        let (offset, length) = WZ_WHOLE_CLUSTER;
+        let mut failures = Vec::new();
+
+        for qcow2_base in [false, true] {
+            for sparse in [true, false] {
+                let case = format!("qcow2_base={qcow2_base} sparse={sparse}");
+
+                // The base.
+                let base = if qcow2_base {
+                    let base =
+                        QcowTempDisk::new(WZ_DISK_SIZE, None, false, sparse, use_io_uring).unwrap();
+                    wz_fill_clusters(base.disk(), 0, WZ_DISK_SIZE / WZ_CLUSTER, WZ_BACKING_BYTE);
+                    base.disk().sync_metadata().unwrap();
+                    base.into_tempfile()
+                } else {
+                    let base = TempFile::new().unwrap();
+                    base.as_file()
+                        .write_all(&vec![WZ_BACKING_BYTE; WZ_DISK_SIZE as usize])
+                        .unwrap();
+                    base
+                };
+                let base_format = if qcow2_base {
+                    ImageType::Qcow2
+                } else {
+                    ImageType::Raw
+                };
+
+                // The middle layer, with data in clusters 1 and 2.
+                let middle_config = BackingFileConfig {
+                    path: base.as_path().to_str().unwrap().to_string(),
+                    format: Some(base_format),
+                };
+                let middle = QcowTempDisk::new(
+                    WZ_DISK_SIZE,
+                    Some(&middle_config),
+                    false,
+                    sparse,
+                    use_io_uring,
+                )
+                .unwrap();
+                wz_fill_clusters(middle.disk(), 1, 2, WZ_OVERLAY_BYTE);
+                middle.disk().sync_metadata().unwrap();
+                let middle = middle.into_tempfile();
+
+                // The top, which allocates nothing.
+                let top_config = BackingFileConfig {
+                    path: middle.as_path().to_str().unwrap().to_string(),
+                    format: Some(ImageType::Qcow2),
+                };
+                let top =
+                    QcowTempDisk::new(WZ_DISK_SIZE, Some(&top_config), false, sparse, use_io_uring)
+                        .unwrap()
+                        .into_tempfile();
+                let disk = wz_open(&top, sparse, use_io_uring);
+
+                let mut expected = vec![WZ_BACKING_BYTE; WZ_DISK_SIZE as usize];
+                expected[WZ_CLUSTER as usize..3 * WZ_CLUSTER as usize].fill(WZ_OVERLAY_BYTE);
+                if let Some(difference) = wz_difference(&wz_read_all(&disk), &expected) {
+                    failures.push(format!("{case} before zeroing: {difference}"));
+                }
+
+                let mut async_io = disk.create_async_io(1).unwrap();
+                async_io.write_zeroes_unmap(offset, length, 7).unwrap();
+                assert_eq!(wz_wait(async_io.as_mut()).result, 0, "{case}");
+                drop(async_io);
+
+                expected[offset as usize..(offset + length) as usize].fill(0);
+                if let Some(difference) = wz_difference(&wz_read_all(&disk), &expected) {
+                    failures.push(format!("{case}: {difference}"));
+                }
+
+                disk.sync_metadata().unwrap();
+                let reopened = wz_open(&top, sparse, use_io_uring);
+                if let Some(difference) = wz_difference(&wz_read_all(&reopened), &expected) {
+                    failures.push(format!("{case} after reopen: {difference}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "write zeroes with UNMAP through a three level chain did not read back as expected:\n{}",
+            failures.join("\n")
+        );
+    }
+
     /// A discard is only a hint: with sparse on, its whole clusters still read
     /// from the backing file, while its partial ones are zeroed in the overlay.
     pub(crate) fn check_discard_uncovers_backing(use_io_uring: bool) {

@@ -159,7 +159,7 @@ mod tests {
     use crate::formats::qcow::common::tests::{
         WZ_ACROSS_BOUNDARY, WZ_PARTIAL_ACROSS_BOUNDARY, WZ_PARTIAL_INSIDE_CLUSTER,
         WZ_WHOLE_CLUSTER, check_discard_uncovers_backing, check_write_zeroes_unmap,
-        compress_allocated_clusters,
+        check_write_zeroes_unmap_through_chain, compress_allocated_clusters,
     };
     use crate::formats::qcow::metadata::{ClusterReadMapping, DeallocAction};
     use crate::formats::qcow::{
@@ -2281,6 +2281,11 @@ mod tests {
     fn test_qcow_write_zeroes_unmap_partial_clusters_read_zero() {
         check_write_zeroes_unmap(false, WZ_PARTIAL_ACROSS_BOUNDARY);
         check_write_zeroes_unmap(false, WZ_PARTIAL_INSIDE_CLUSTER);
+    }
+
+    #[test]
+    fn test_qcow_write_zeroes_unmap_through_three_level_chain() {
+        check_write_zeroes_unmap_through_chain(false);
     }
 
     #[test]
