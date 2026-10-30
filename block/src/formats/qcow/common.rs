@@ -732,6 +732,81 @@ pub(crate) mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// With sparse off, a write zeroes keeps the host cluster in the zero
+    /// entry. A partial write after it must take that cluster back rather than
+    /// append another one and leak it, so that repeating the two does not grow
+    /// the file, and must still read zeroes in the rest of the cluster.
+    pub(crate) fn check_zero_then_write_cycles_do_not_grow_file(use_io_uring: bool) {
+        const SETTLING_CYCLES: usize = 2;
+        const MEASURED_CYCLES: usize = 16;
+        let (offset, length) = WZ_WHOLE_CLUSTER;
+        let written = (offset + 4096) as usize..(offset + 8192) as usize;
+        let mut failures = Vec::new();
+
+        for backing in [true, false] {
+            for flush_between in [true, false] {
+                let case = format!("backing={backing} flush_between={flush_between}");
+                let (disk, mut expected, _backing, overlay) =
+                    wz_disk(backing, true, false, use_io_uring);
+                disk.sync_metadata().unwrap();
+                let mut async_io = disk.create_async_io(1).unwrap();
+                expected[offset as usize..(offset + length) as usize].fill(0);
+                expected[written.clone()].fill(WZ_OVERLAY_BYTE);
+
+                let mut settled = None;
+                for cycle in 0..SETTLING_CYCLES + MEASURED_CYCLES {
+                    async_io.write_zeroes(offset, length, 7).unwrap();
+                    assert_eq!(wz_wait(async_io.as_mut()).result, 0, "{case}");
+                    if flush_between {
+                        disk.sync_metadata().unwrap();
+                    }
+                    let buffer = OwnedIoBuffer::from_vec(vec![WZ_OVERLAY_BYTE; written.len()]);
+                    async_io
+                        .write_from_vec(written.start as libc::off_t, buffer, 8)
+                        .unwrap();
+                    assert_eq!(
+                        wz_wait(async_io.as_mut()).result as usize,
+                        written.len(),
+                        "{case}"
+                    );
+                    disk.sync_metadata().unwrap();
+
+                    if let Some(difference) = wz_difference(&wz_read_all(&disk), &expected) {
+                        failures.push(format!("{case} cycle {cycle}: {difference}"));
+                    }
+                    if cycle + 1 == SETTLING_CYCLES {
+                        settled = Some((
+                            overlay.as_file().metadata().unwrap().len(),
+                            wz_used_clusters(overlay.as_file(), &disk),
+                        ));
+                    }
+                }
+                drop(async_io);
+
+                let (settled_len, settled_used) = settled.unwrap();
+                let len = overlay.as_file().metadata().unwrap().len();
+                let used = wz_used_clusters(overlay.as_file(), &disk);
+                if (len, used) != (settled_len, settled_used) {
+                    failures.push(format!(
+                        "{case}: after {MEASURED_CYCLES} cycles the file went from {settled_len} \
+                         to {len} bytes and from {settled_used} to {used} clusters in use"
+                    ));
+                }
+                drop(disk);
+
+                let reopened = wz_open(&overlay, false, use_io_uring);
+                if let Some(difference) = wz_difference(&wz_read_all(&reopened), &expected) {
+                    failures.push(format!("{case} after reopen: {difference}"));
+                }
+                drop(reopened);
+                if let Some(objection) = wz_qemu_img_objection(&overlay, &expected) {
+                    failures.push(format!("{case}: {objection}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// Compress every allocated cluster in a QCOW2 image file in place.
     pub(crate) fn compress_allocated_clusters(file: &mut File) {
         let mut buf4 = [0u8; 4];

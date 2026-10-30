@@ -298,7 +298,7 @@ mod tests {
         WZ_ACROSS_BOUNDARY, WZ_PARTIAL_ACROSS_BOUNDARY, WZ_PARTIAL_INSIDE_CLUSTER,
         WZ_WHOLE_CLUSTER, check_discard_uncovers_backing, check_v2_image_gets_no_zero_flag,
         check_write_zeroes_unmap, check_write_zeroes_unmap_through_chain,
-        compress_allocated_clusters,
+        check_zero_then_write_cycles_do_not_grow_file, compress_allocated_clusters,
     };
     use crate::formats::qcow::{BackingFileConfig, ImageType, QcowDisk, QcowTempDisk};
     use crate::test_util::require_direct_io;
@@ -928,5 +928,10 @@ mod tests {
     #[test]
     fn test_qcow_async_v2_image_gets_no_zero_flag() {
         check_v2_image_gets_no_zero_flag(true);
+    }
+
+    #[test]
+    fn test_qcow_async_zero_then_write_cycles_do_not_grow_file() {
+        check_zero_then_write_cycles_do_not_grow_file(true);
     }
 }
