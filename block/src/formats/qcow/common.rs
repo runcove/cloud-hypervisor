@@ -246,23 +246,26 @@ pub(super) fn scatter_read_sync(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::fs::File;
-    use std::io::Write;
+    use std::fs::{self, File};
+    use std::io::{self, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::FileExt;
+    use std::process::Command;
 
     use flate2::Compression;
     use flate2::write::DeflateEncoder;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::super::decoder::ZlibDecoder;
-    use super::super::metadata::ClusterReadMapping;
+    use super::super::metadata::{ClusterReadMapping, QcowMetadata};
+    use super::super::parser::parse_qcow;
     use super::super::qcow_raw_file::QcowRawFile;
+    use super::super::util::{MAX_NESTING_DEPTH, ZERO_FLAG};
     use super::{decompress_cluster, scatter_read_sync};
     use crate::aligned_file::AlignedFile;
     use crate::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoOperation, OwnedIoBuffer};
     use crate::disk_file::{AsyncDiskFile, MetadataSync};
-    use crate::formats::qcow::{BackingFileConfig, ImageType, QcowDisk, QcowTempDisk};
+    use crate::formats::qcow::{BackingFileConfig, ImageType, QcowDisk, QcowHeader, QcowTempDisk};
 
     const COMPRESSED_FLAG: u64 = 1 << 62;
     const CLUSTER_USED_FLAG: u64 = 1 << 63;
@@ -559,6 +562,174 @@ pub(crate) mod tests {
                 "allocated={allocated}"
             );
         }
+    }
+
+    /// A version 2 image over a backing file of [`WZ_BACKING_BYTE`] if
+    /// `backing`, with every cluster holding [`WZ_OVERLAY_BYTE`] if `allocated`.
+    /// Returns the same as [`wz_disk`].
+    fn wz_v2_disk(
+        backing: bool,
+        allocated: bool,
+        sparse: bool,
+        use_io_uring: bool,
+    ) -> (QcowDisk, Vec<u8>, TempFile, TempFile) {
+        let backing_temp = TempFile::new().unwrap();
+        backing_temp
+            .as_file()
+            .write_all(&vec![WZ_BACKING_BYTE; WZ_DISK_SIZE as usize])
+            .unwrap();
+        let path = backing_temp.as_path().to_str().unwrap();
+
+        let overlay_temp = TempFile::new().unwrap();
+        let header =
+            QcowHeader::create_for_size_and_path(2, WZ_DISK_SIZE, backing.then_some(path)).unwrap();
+        let raw = AlignedFile::new(overlay_temp.as_file().try_clone().unwrap(), false);
+        header.write_to(&raw).unwrap();
+        let (inner, _backing, _sparse) = parse_qcow(raw, MAX_NESTING_DEPTH, true).unwrap();
+        QcowMetadata::new(inner).shutdown();
+
+        let disk = wz_open(&overlay_temp, sparse, use_io_uring);
+        assert_eq!(disk.metadata().header().version, 2);
+        let mut contents = vec![if backing { WZ_BACKING_BYTE } else { 0 }; WZ_DISK_SIZE as usize];
+        if allocated {
+            wz_fill_clusters(&disk, 0, WZ_DISK_SIZE / WZ_CLUSTER, WZ_OVERLAY_BYTE);
+            contents.fill(WZ_OVERLAY_BYTE);
+        }
+        (disk, contents, backing_temp, overlay_temp)
+    }
+
+    /// The L2 entries in `file` with the zero flag set.
+    fn wz_zero_flagged_l2_entries(file: &File) -> Vec<u64> {
+        let read_u64 = |offset| {
+            let mut bytes = [0u8; 8];
+            file.read_exact_at(&mut bytes, offset).unwrap();
+            u64::from_be_bytes(bytes)
+        };
+        let mut l1_size = [0u8; 4];
+        file.read_exact_at(&mut l1_size, HEADER_L1_SIZE_OFFSET)
+            .unwrap();
+        let l1_table = read_u64(HEADER_L1_TABLE_OFFSET);
+
+        let mut flagged = Vec::new();
+        for l1_index in 0..u64::from(u32::from_be_bytes(l1_size)) {
+            let l2_table = read_u64(l1_table + l1_index * 8) & L1_L2_ADDR_MASK;
+            if l2_table == 0 {
+                continue;
+            }
+            for l2_index in 0..WZ_CLUSTER / 8 {
+                let l2_entry = read_u64(l2_table + l2_index * 8);
+                if l2_entry & COMPRESSED_FLAG == 0 && l2_entry & ZERO_FLAG != 0 {
+                    flagged.push(l2_entry);
+                }
+            }
+        }
+        flagged
+    }
+
+    /// Asks qemu-img, when it is installed, what it makes of a closed image:
+    /// whether `qemu-img check` is clean and whether it reads `expected`.
+    /// Returns what it objected to.
+    fn wz_qemu_img_objection(image: &TempFile, expected: &[u8]) -> Option<String> {
+        let path = image.as_path();
+        let check = match Command::new("qemu-img")
+            .args(["check", "-f", "qcow2"])
+            .arg(path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                eprintln!("skipping the qemu-img comparison: qemu-img unavailable");
+                return None;
+            }
+            Err(e) => panic!("cannot run qemu-img: {e}"),
+        };
+        if !check.status.success() {
+            return Some(format!(
+                "qemu-img check: {}{}",
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr)
+            ));
+        }
+
+        let raw = TempFile::new().unwrap();
+        let convert = Command::new("qemu-img")
+            .args(["convert", "-f", "qcow2", "-O", "raw"])
+            .arg(path)
+            .arg(raw.as_path())
+            .output()
+            .unwrap();
+        if !convert.status.success() {
+            return Some(format!(
+                "qemu-img convert: {}",
+                String::from_utf8_lossy(&convert.stderr)
+            ));
+        }
+        wz_difference(&fs::read(raw.as_path()).unwrap(), expected)
+            .map(|difference| format!("qemu-img reads: {difference}"))
+    }
+
+    /// The zero flag only exists from version 3: qemu treats it on a version 2
+    /// image as corruption. A write zeroes and a discard must leave a version 2
+    /// image without it, keep reading back as they do on version 3, also over a
+    /// backing file, and leave an image qemu reads the same.
+    pub(crate) fn check_v2_image_gets_no_zero_flag(use_io_uring: bool) {
+        // Half of cluster 1, all of cluster 2 and half of cluster 3.
+        let (offset, length) = WZ_ACROSS_BOUNDARY;
+        let whole = (2 * WZ_CLUSTER) as usize..(3 * WZ_CLUSTER) as usize;
+        let mut failures = Vec::new();
+
+        for backing in [true, false] {
+            for sparse in [true, false] {
+                for allocated in [true, false] {
+                    for write_zeroes in [true, false] {
+                        let case = format!(
+                            "backing={backing} sparse={sparse} allocated={allocated} \
+                             write_zeroes={write_zeroes}"
+                        );
+                        let (disk, mut expected, _backing, overlay) =
+                            wz_v2_disk(backing, allocated, sparse, use_io_uring);
+
+                        let mut async_io = disk.create_async_io(1).unwrap();
+                        if write_zeroes {
+                            async_io.write_zeroes(offset, length, 7).unwrap();
+                        } else {
+                            async_io.punch_hole(offset, length, 7).unwrap();
+                        }
+                        assert_eq!(wz_wait(async_io.as_mut()).result, 0, "{case}");
+                        drop(async_io);
+
+                        // A discard of a whole cluster is only a hint, and with
+                        // sparse on it uncovers whatever is below.
+                        expected[offset as usize..(offset + length) as usize].fill(0);
+                        if !write_zeroes && (sparse || !allocated) {
+                            let below = if backing { WZ_BACKING_BYTE } else { 0 };
+                            expected[whole.clone()].fill(below);
+                        }
+
+                        if let Some(difference) = wz_difference(&wz_read_all(&disk), &expected) {
+                            failures.push(format!("{case}: {difference}"));
+                        }
+                        disk.sync_metadata().unwrap();
+                        drop(disk);
+
+                        let flagged = wz_zero_flagged_l2_entries(overlay.as_file());
+                        if !flagged.is_empty() {
+                            failures.push(format!("{case}: zero flag in {flagged:#x?}"));
+                        }
+                        let reopened = wz_open(&overlay, sparse, use_io_uring);
+                        if let Some(difference) = wz_difference(&wz_read_all(&reopened), &expected)
+                        {
+                            failures.push(format!("{case} after reopen: {difference}"));
+                        }
+                        drop(reopened);
+                        if let Some(objection) = wz_qemu_img_objection(&overlay, &expected) {
+                            failures.push(format!("{case}: {objection}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Compress every allocated cluster in a QCOW2 image file in place.
