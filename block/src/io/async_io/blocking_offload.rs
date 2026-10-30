@@ -489,6 +489,12 @@ mod tests {
         };
         if ret != 0 {
             let err = io::Error::last_os_error();
+            // Only a filesystem without hole punching may skip the test.
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::EOPNOTSUPP),
+                "fallocate() failed unexpectedly: {err}"
+            );
             eprintln!("Skipping: the temporary file cannot have holes punched: {err}");
             return;
         }
