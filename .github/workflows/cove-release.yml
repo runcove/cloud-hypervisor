@@ -142,8 +142,9 @@ jobs:
   # fails unless the running VMM holds an io_uring ring. On the runner directly:
   # Docker's default seccomp profile refuses io_uring.
   # aarch64 is built and attested, not booted (no KVM on hosted arm runners); development use only
-  # It also wakes the previous release's checkpoint (step 5) and packs this
-  # build's (step 6), which the release job publishes for the next one.
+  # It also packs this build's checkpoint (step 6) and records its sha256 before
+  # waking the previous release's (step 5): the release publishes only that file.
+  # Its attestation proves a release-tag run of this workflow in this repo produced the file and its smoke passed: not that its contents are benign, nor which tag it belongs to.
   # A regression check, not a gate against a hostile tree: the smoke runs from the
   # tree under test, so its token reads this public repo and nothing more.
   smoke:
@@ -153,6 +154,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    outputs:
+      checkpoint_sha256: ${{ steps.pack.outputs.sha256 }}
     defaults:
       run:
         shell: bash
@@ -252,6 +255,11 @@ jobs:
             echo "::error::cannot order version '$VERSION' against release tags"; exit 1
           fi
           bound=$("$v" --sort-key "$base")
+          # gh prints text from the API and the download: none of it runs as a
+          # workflow command; cmd lets this step's own through.
+          tok=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "::stop-commands::$tok"
+          cmd() { echo "::$tok::"; echo "$1"; }
           prev='' prev_key=''
           tags=$(gh release list --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName')
           while IFS= read -r t; do
@@ -261,28 +269,30 @@ jobs:
             if [ -z "$prev" ] || below "$prev_key" "$k"; then prev=$t prev_key=$k; fi
           done <<<"$tags"
           if [ -z "$prev" ]; then
-            echo "::notice::step 5 will be SKIPPED: no GitHub Release below $VERSION"; exit 0
+            cmd "::notice::step 5 will be SKIPPED: no GitHub Release below $VERSION"; exit 0
           fi
           assets=$(gh release view "$prev" --json assets --jq '.assets[].name')
           if ! grep -qxF "$name" <<<"$assets"; then
-            echo "::notice::step 5 will be SKIPPED: release $prev has no $name"; exit 0
+            cmd "::notice::step 5 will be SKIPPED: release $prev has no $name"; exit 0
           fi
           dl="$RUNNER_TEMP/previous"
           mkdir "$dl"
           gh release download "$prev" --dir "$dl" --pattern "$name" --pattern "$name.sha256"
           [ -f "$dl/$name" ] && [ ! -L "$dl/$name" ] && [ -f "$dl/$name.sha256" ] \
-            || { echo "::error::release $prev did not give both $name and $name.sha256"; exit 1; }
+            || { cmd "::error::release $prev did not give both $name and $name.sha256"; exit 1; }
           gh attestation verify "$dl/$name" --repo "$GITHUB_REPOSITORY" \
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/cove-release.yml"
           want=$(awk -v n="$name" 'NF == 2 && $2 == n { print $1 }' "$dl/$name.sha256")
           got=$(sha256sum < "$dl/$name"); got=${got%% *}
           if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]] || [ "$got" != "$want" ]; then
-            echo "::error::$prev's $name is $got, but its $name.sha256 says '$want'"; exit 1
+            cmd "::error::$prev's $name does not match its $name.sha256"; exit 1
           fi
           install -m 0644 "$dl/$name" "$RUNNER_TEMP/smoke/in/previous.tar.gz"
           echo "step 5 will wake $prev's checkpoint, sha256 $got"
 
-      - name: Run the smoke
+      # previous.tar.gz is fetched but not touched until the wake step.
+      - name: Run the smoke up to the pack (steps 0-4 and 6)
+        id: pack
         env:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
@@ -292,8 +302,17 @@ jobs:
           # as a workflow command.
           echo "::stop-commands::$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
           printf '%s\n' "$VERSION" > "$RUNNER_TEMP/smoke/in/VERSION"
-          bash src/.github/cove-ci/smoke.sh --in "$RUNNER_TEMP/smoke/in" --work "$RUNNER_TEMP/smoke/work" \
+          bash src/.github/cove-ci/smoke.sh --pack-only --in "$RUNNER_TEMP/smoke/in" --work "$RUNNER_TEMP/smoke/work" \
             --out "$RUNNER_TEMP/smoke/out"
+          sha=$(sed -nE 's/^([0-9a-f]{64})  ch-smoke-checkpoint\.tar\.gz$/\1/p' "$RUNNER_TEMP/smoke/out/ch-smoke-checkpoint.tar.gz.sha256")
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "the pack wrote no single sha256 line"; exit 1; }
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Wake the previous release's checkpoint (steps 0 and 5)
+        run: |
+          set -euo pipefail
+          echo "::stop-commands::$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          bash src/.github/cove-ci/smoke.sh --wake-only --in "$RUNNER_TEMP/smoke/in" --work "$RUNNER_TEMP/smoke/work"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -365,6 +384,8 @@ jobs:
       # Its own .sha256 file, published beside it: SHA256SUMS stays the build's.
       - name: Verify the smoke's checkpoint
         working-directory: smoke
+        env:
+          PACKED_SHA256: ${{ needs.smoke.outputs.checkpoint_sha256 }}
         run: |
           set -euo pipefail
           want='f ch-smoke-checkpoint.tar.gz
@@ -375,6 +396,9 @@ jobs:
             || { echo "::error::ch-smoke-checkpoint.tar.gz.sha256 is not one line for the checkpoint"; exit 1; }
           sha256sum --strict --status -c ch-smoke-checkpoint.tar.gz.sha256 2>/dev/null \
             || { echo "::error::the checkpoint does not match its .sha256"; exit 1; }
+          got=$(sha256sum < ch-smoke-checkpoint.tar.gz); got=${got%% *}
+          [[ "$PACKED_SHA256" =~ ^[0-9a-f]{64}$ ]] && [ "$got" = "$PACKED_SHA256" ] \
+            || { echo "::error::the checkpoint is not the one the smoke packed before step 5"; exit 1; }
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
