@@ -1,0 +1,51 @@
+name: cove-test
+
+# The block crate's clippy and tests, and the workspace's unit tests, on a
+# GitHub-hosted runner. The advisory gate and the refusal of a tree carrying
+# .cargo or rust-toolchain run first, before any of the tree's code. All of it
+# is the `test` phase of .github/cove-ci/build-static.sh.
+
+on:
+  push:
+    branches:
+      - 'cove-patches-*'
+    tags:
+      - 'ci-test-*'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      SRC: ${{ github.workspace }}/src
+      IS_RELEASE: 'false'
+      FORK_SHA: ${{ github.sha }}
+      REF: ${{ github.ref_name }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      # Plain git and no token: full history and tags, because build.rs runs
+      # `git describe`. A test tag is dropped from the clone: annotated, it would
+      # be what `git describe` says.
+      - name: Check out the pushed commit
+        run: |
+          git init -q "$SRC"
+          cd "$SRC" || exit 1
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --tags origin "$GITHUB_SHA"
+          git checkout -q --detach "$GITHUB_SHA"
+          git tag -l 'ci-test-*' | xargs -r git tag -d >/dev/null
+          git log -1 --format='checked out %H'
+          version=$(git describe --dirty)
+          case "$version" in *[!A-Za-z0-9._-]*|'') echo "::error::version '$version' is not a plain name"; exit 64 ;; esac
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          df -h /
+
+      - name: Clippy, tests and their gates
+        run: src/.github/cove-ci/run-recipe.sh test
