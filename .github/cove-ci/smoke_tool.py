@@ -39,7 +39,7 @@ Subcommands:
       comes from a published release, so it refuses anything pack would not
       have written: a member that is not a plain file or directory (links,
       devices), a path outside checkpoint/ (absolute, '..'), more than
-      SIZE_CAP bytes, or a CHECKPOINT file that does not parse.
+      MEMBER_CAP members or SIZE_CAP bytes, or a CHECKPOINT file that does not parse.
 
   info CHECKPOINT KEY
       Prints one key of a CHECKPOINT file, after checking the whole file.
@@ -68,6 +68,8 @@ VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9._-]+)?$")
 # A checkpoint is guest RAM (256 MiB) plus a 64 MiB disk and a few small files;
 # 4 GiB leaves room for a bigger guest and stops a runaway one.
 SIZE_CAP = 4 << 30
+# pack writes 5 members plus the snapshot's files, a handful.
+MEMBER_CAP = 64
 
 # The guest's /init. busybox sh, no network, no modules (the kernel has none).
 # It prints CH-SMOKE-BOOTED once, after writing a mark to the disk's first
@@ -341,8 +343,14 @@ def cmd_unpack(a):
     except (OSError, tarfile.TarError) as e:
         cannot(f"{a.tarball} is not a gzip'd tar: {e}")
     with tar:
+        # One member at a time, so a huge member count is refused without
+        # reading the whole list.
+        members = []
         try:
-            members = tar.getmembers()
+            while (m := tar.next()) is not None:
+                if len(members) >= MEMBER_CAP:
+                    cannot(f"{a.tarball}: more than {MEMBER_CAP} members")
+                members.append(m)
         except (OSError, tarfile.TarError, EOFError) as e:
             cannot(f"{a.tarball} cannot be read: {e}")
         # Every member is checked before anything is written.
