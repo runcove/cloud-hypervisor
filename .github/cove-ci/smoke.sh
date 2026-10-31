@@ -37,12 +37,14 @@
 #      reboot and 2 disk queues. That proves this binary still restores what
 #      the last release saved. With no previous.tar.gz the step says SKIPPED
 #      and why, and proves nothing: there was no earlier checkpoint to wake;(15)
-#   6. PACK: the step 2 checkpoint (snapshot + the disk as it was at that
-#      moment + CHECKPOINT) becomes OUT/ch-smoke-checkpoint.tar.gz and
+#   6. PACK, run right after step 2, before anything is woken: the step 2
+#      checkpoint (snapshot + the disk as it was at that moment + CHECKPOINT) becomes OUT/ch-smoke-checkpoint.tar.gz and
 #      OUT/ch-smoke-checkpoint.tar.gz.sha256, which the release publishes for
 #      the next release's step 5. This script never publishes anything.    (16)
 #
-# Usage: smoke.sh --in DIR --work DIR --out DIR
+# Usage: smoke.sh [--pack-only | --wake-only] --in DIR --work DIR [--out DIR]
+#   --pack-only  steps 0-4 and 6;  --wake-only  steps 0 and 5, no --out.
+#                The workflow runs the two apart, recording the sha256 between.
 #   --in    holds cloud-hypervisor (the candidate, executable), vmlinux,
 #           initramfs.cpio.gz, VERSION (what the binary prints, one line) and,
 #           optionally, previous.tar.gz
@@ -84,17 +86,21 @@ fail() {
 }
 say() { echo "ch-smoke: $*"; }
 
-IN="" WORK="" OUT=""
+IN="" WORK="" OUT="" MODE=all
 while [ $# -gt 0 ]; do
   case "$1" in
     --in|--work|--out)
       [ $# -ge 2 ] && [ -n "$2" ] || cannot "$1 needs a value"
       case "$1" in --in) IN=$2 ;; --work) WORK=$2 ;; --out) OUT=$2 ;; esac
       shift 2 ;;
+    --pack-only|--wake-only)
+      [ "$MODE" = all ] || cannot "--pack-only and --wake-only exclude each other"
+      MODE=${1#--}; MODE=${MODE%-only}; shift ;;
     *) cannot "unknown argument '$1' (usage: smoke.sh --in DIR --work DIR --out DIR)" ;;
   esac
 done
-[ -n "$IN" ] && [ -n "$WORK" ] && [ -n "$OUT" ] || cannot "--in, --work and --out are all required"
+[ -n "$IN" ] && [ -n "$WORK" ] || cannot "--in and --work are required"
+[ "$MODE" = wake ] || [ -n "$OUT" ] || cannot "--out is required unless --wake-only"
 
 num() { case "$2" in ''|*[!0-9.]*|*.*.*|.*) cannot "$1='$2' is not a number of seconds" ;; esac; }
 BOOT_TIMEOUT=${SMOKE_BOOT_TIMEOUT:-90};     num SMOKE_BOOT_TIMEOUT "$BOOT_TIMEOUT"
@@ -119,8 +125,10 @@ PREVIOUS="$IN/previous.tar.gz"
 [ -f "$IN/VERSION" ] || cannot "no $IN/VERSION"
 VERSION=$(cat "$IN/VERSION")
 [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9._-]+)?$ ]] || cannot "VERSION '$VERSION' is not a release tag or git describe output"
-[ -d "$OUT" ] || cannot "--out $OUT is not a directory"
-[ -z "$(ls -A "$OUT")" ] || cannot "--out $OUT is not empty"
+if [ "$MODE" != wake ]; then
+  [ -d "$OUT" ] || cannot "--out $OUT is not a directory"
+  [ -z "$(ls -A "$OUT")" ] || cannot "--out $OUT is not empty"
+fi
 [ -c "$KVM" ] && [ -r "$KVM" ] && [ -w "$KVM" ] || cannot "$KVM is not a character device this user can read and write"
 # Each VMM's API socket is $WORK/<name>.sock, and a unix socket path has room
 # for 107 bytes.
@@ -285,6 +293,8 @@ passed 0 version "$first"
 KSHA=$(sha256sum "$KERNEL" | cut -d' ' -f1) || cannot "cannot hash $KERNEL"
 ISHA=$(sha256sum "$INITRAMFS" | cut -d' ' -f1) || cannot "cannot hash $INITRAMFS"
 
+# Steps 1-4 and 6 (not indented): skipped with --wake-only.
+if [ "$MODE" != wake ]; then
 # --- 1. boot -------------------------------------------------------------------
 STEP="1 (boot)"
 DISK="$WORK/disk.raw"
@@ -328,6 +338,13 @@ wait_hb b "$((HB_SAVED + 1))" 12 "after restore"
 queues_ok b 12 "after restore"
 not_rebooted b 12 "after restore"
 passed 2 "snapshot and restore" "saved at heartbeat $HB_SAVED, restored to $(hb_of b)"
+
+# --- 6. pack this build's checkpoint, before step 5 wakes anything -------------
+STEP="6 (pack)"
+python3 "$TOOL" pack "$OUT" --snapshot "$WORK/snap1" --disk "$WORK/snap1-disk.raw" --version "$VERSION" \
+  --hb "$HB_SAVED" --kernel-sha256 "$KSHA" --initramfs-sha256 "$ISHA" \
+  || fail 16 "the checkpoint could not be packed"
+passed 6 pack "$(cut -d' ' -f1 "$OUT/ch-smoke-checkpoint.tar.gz.sha256")"
 
 # --- 3. clone -------------------------------------------------------------------
 STEP="3 (clone)"
@@ -377,11 +394,14 @@ mem_note="memory $MEM_BEFORE -> $(hb_field b mem_kb) kB"
 wait_hb b "$(hb_of b)" 14 "after the resizes"
 passed 4 resize "vCPUs $BOOT_CPUS -> $MAX_CPUS -> $BOOT_CPUS; $mem_note"
 stop b
+fi  # steps 1-4 and 6
 
 # --- 5. wake the previous release's checkpoint ----------------------------------
 STEP="5 (previous release's checkpoint)"
 PREV_VERSION=none
-if [ -f "$PREVIOUS" ]; then
+if [ "$MODE" = pack ]; then
+  say "step 5 previous release's checkpoint: not run here (--pack-only)"
+elif [ -f "$PREVIOUS" ]; then
   mkdir -p "$WORK/prev" || cannot "cannot create $WORK/prev"
   python3 "$TOOL" unpack "$PREVIOUS" "$WORK/prev" || cannot "the previous checkpoint is not one this smoke writes"
   P="$WORK/prev/checkpoint"
@@ -398,11 +418,4 @@ else
   say "step 5 previous release's checkpoint: SKIPPED (no $PREVIOUS: no earlier release published a checkpoint to wake)"
 fi
 
-# --- 6. pack this build's checkpoint ---------------------------------------------
-STEP="6 (pack)"
-python3 "$TOOL" pack "$OUT" --snapshot "$WORK/snap1" --disk "$WORK/snap1-disk.raw" --version "$VERSION" \
-  --hb "$HB_SAVED" --kernel-sha256 "$KSHA" --initramfs-sha256 "$ISHA" \
-  || fail 16 "the checkpoint could not be packed"
-passed 6 pack "$(cut -d' ' -f1 "$OUT/ch-smoke-checkpoint.tar.gz.sha256")"
-
-say "PASSED version=$VERSION previous=$PREV_VERSION"
+say "PASSED version=$VERSION previous=$PREV_VERSION mode=$MODE"
