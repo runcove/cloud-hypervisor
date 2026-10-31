@@ -224,6 +224,66 @@ jobs:
           printf '%s\n' "$VERSION" > "$RUNNER_TEMP/smoke/in/VERSION"
           bash src/.github/cove-ci/smoke.sh --in "$RUNNER_TEMP/smoke/in" --work "$RUNNER_TEMP/smoke/work"
 
-  # THE RELEASE JOB GOES HERE, in a later change: `needs: [list, smoke]`, its own
-  # `permissions`, publishing these five files and attesting each binary. This
-  # workflow publishes nothing today and no job in it holds a write token.
+  # The one job holding a write token, and only for a release tag; a ci-test-*
+  # tag never gets here. It runs nothing from the tree and prints nothing from
+  # the artifact. The attestation comes first, so a Release never exists without one.
+  # Next change: also attach the previous release's checkpoint asset.
+  release:
+    name: attest and publish
+    needs: [build, list, smoke]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check the tag is the version that was built
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_NAME" != "$VERSION" ]; then
+            echo "::error::the tag is not the version the build job decided on"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: cloud-hypervisor-static-${{ needs.build.outputs.version }}
+          path: out
+
+      - name: Verify the five files
+        working-directory: out
+        run: |
+          set -euo pipefail
+          want='f BUILDINFO
+          f SHA256SUMS
+          f THIRD-PARTY-NOTICES.txt
+          f cloud-hypervisor-static-aarch64
+          f cloud-hypervisor-static-x86_64'
+          [ "$(find . -mindepth 1 -printf '%y %P\n' | LC_ALL=C sort)" = "$want" ] \
+            || { echo "::error::the build's files are not exactly the five agreed names, all plain files"; exit 1; }
+          sha256sum --strict --status -c SHA256SUMS 2>/dev/null \
+            || { echo "::error::the files do not match SHA256SUMS"; exit 1; }
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            out/cloud-hypervisor-static-x86_64
+            out/cloud-hypervisor-static-aarch64
+
+      - name: Create the Release
+        working-directory: out
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes "Both binaries carry a build provenance attestation: gh attestation verify FILE --repo $GH_REPO" \
+            SHA256SUMS cloud-hypervisor-static-x86_64 cloud-hypervisor-static-aarch64 BUILDINFO THIRD-PARTY-NOTICES.txt
