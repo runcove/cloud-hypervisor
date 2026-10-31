@@ -12,8 +12,7 @@ on:
     tags:
       - 'ci-test-*'
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   test:

@@ -98,7 +98,11 @@ copy_out() { # <path in the container> <new directory here>
 }
 copy_out /out "$OUT"
 copy_out /block-tests "$BLOCK_OUT"
-ls -la "$OUT"
+# The names are the container's: newlines escaped, and commands stopped again
+# because the runner can also read a command from the middle of a line.
+echo "::stop-commands::$tok"
+ls -la --quoting-style=c "$OUT"
+printf '\n::%s::\n' "$tok"
 # --status and no stderr, for the same reason.
 ( cd "$OUT" && sha256sum --strict --status -c SHA256SUMS 2>/dev/null ) \
   || { echo "::error::the build's SHA256SUMS does not match the files in its output"; exit 1; }

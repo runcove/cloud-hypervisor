@@ -23,8 +23,8 @@
 #         be wrong about that (git rev-parse --is-shallow-repository); a
 #         full, non-shallow clone whose fetch simply never brought tags (no
 #         --tags, a checkout step that skipped them) is another, and looks
-#         identical locally -- Round 1 review reproduced exactly that case
-#         and got back an already-released cove.1. Local git state alone
+#         identical locally, and would hand back an already-released
+#         cove.1. Local git state alone
 #         cannot tell the two apart; only the remote's own tag list can, so
 #         --next checks that too (git ls-remote against REMOTE, "origin" by
 #         default -- override with VERSION_SH_REMOTE if that name doesn't
@@ -38,9 +38,9 @@
 # contract ("well-formed or not") that predates this file's use of the
 # 89-99 band, and are unaffected by it.
 #
-# VERSION_SH_SHAPE says whose upstream versions these are,
-# because the one thing that differs is how many parts upstream uses:
-#   warpgate: vX.Y.Z-cove.<n>, as it always was.
+# VERSION_SH_SHAPE picks the tag shape, because the one thing that differs is
+# how many parts the upstream version has:
+#   warpgate: exactly three parts, vX.Y.Z-cove.<n>.
 #   ch (unset or empty): Cloud Hypervisor's vX.Y (v53.0) or vX.Y.Z (v36.0.1) -- so the
 #             describe glob takes two parts, and the base describe returns
 #             must itself be exactly vX.Y or vX.Y.Z (95 otherwise).
@@ -140,8 +140,8 @@ case "${1:-}" in
 
     # Door 2 of 2: a full, non-shallow clone whose fetch simply never brought
     # tags (no --tags, or a checkout step that skipped them). is-shallow-
-    # repository says "false" here too -- Round 1 review reproduced exactly
-    # this and got back an already-released cove.1. Zero local cove tags for
+    # repository says "false" here too, and the search would hand back an
+    # already-released cove.1. Zero local cove tags for
     # $base is legitimately correct before the first release, so the ONLY
     # authoritative answer is the remote's own tag list: if the remote has a
     # release tag this clone lacks, the local view is incomplete, full stop.
