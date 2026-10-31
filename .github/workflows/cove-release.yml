@@ -135,6 +135,8 @@ jobs:
   # fails unless the running VMM holds an io_uring ring. On the runner directly:
   # Docker's default seccomp profile refuses io_uring.
   # aarch64 is built and attested, not booted (no KVM on hosted arm runners); development use only
+  # A regression check, not a gate against a hostile tree: the smoke runs from the
+  # tree under test, and with no token this job reaches no further than its build.
   smoke:
     name: boot on x86_64
     needs: build
@@ -216,6 +218,9 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
+          # What the binary under test prints reaches this log: none of it runs
+          # as a workflow command.
+          echo "::stop-commands::$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
           printf '%s\n' "$VERSION" > "$RUNNER_TEMP/smoke/in/VERSION"
           bash src/.github/cove-ci/smoke.sh --in "$RUNNER_TEMP/smoke/in" --work "$RUNNER_TEMP/smoke/work"
 
