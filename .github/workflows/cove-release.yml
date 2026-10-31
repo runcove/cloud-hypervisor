@@ -15,8 +15,7 @@ on:
       - 'v*-cove.*'
       - 'ci-test-*'
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   build:
