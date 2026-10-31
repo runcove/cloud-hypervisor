@@ -16,8 +16,9 @@
 #      2 blk-mq queues on the disk, the host must find its mark in the disk
 #      image, and the running VMM must hold an io_uring ring: a link to
 #      anon_inode:[io_uring] in /proc/<pid>/fd;                              (11)
-#   2. SNAPSHOT AND RESTORE: pause, snapshot to a local directory, stop the
-#      process, restore into a NEW process and resume. The heartbeat must reach two
+#   2. SNAPSHOT AND RESTORE: pause, snapshot to a local directory (and copy
+#      the disk while paused: that pair is the checkpoint step 6 packs), stop
+#      the process, restore into a NEW process and resume. The heartbeat must reach two
 #      beats past the number it had reached (one may have been queued before
 #      the pause), with no second CH-SMOKE-BOOTED (resumed, not rebooted),
 #      the disk still taking writes and still 2 queues;                      (12)
@@ -28,13 +29,26 @@
 #   4. RESIZE: on the source, vCPUs up to max and back to the boot count, and
 #      memory up by the hotplug size it was booted with (vm.info must show
 #      it). The guest must see each change in its heartbeat and keep
-#      beating.                                                             (14)
+#      beating;                                                             (14)
+#   5. WAKE THE PREVIOUS RELEASE'S CHECKPOINT: when IN/previous.tar.gz is
+#      there (the workflow fetched it from the previous GitHub Release and
+#      checked its attestation and sha256), restore it with this binary: its
+#      heartbeat must reach two beats past the number it was saved at, with no
+#      reboot and 2 disk queues. That proves this binary still restores what
+#      the last release saved. With no previous.tar.gz the step says SKIPPED
+#      and why, and proves nothing: there was no earlier checkpoint to wake;(15)
+#   6. PACK: the step 2 checkpoint (snapshot + the disk as it was at that
+#      moment + CHECKPOINT) becomes OUT/ch-smoke-checkpoint.tar.gz and
+#      OUT/ch-smoke-checkpoint.tar.gz.sha256, which the release publishes for
+#      the next release's step 5. This script never publishes anything.    (16)
 #
-# Usage: smoke.sh --in DIR --work DIR
+# Usage: smoke.sh --in DIR --work DIR --out DIR
 #   --in    holds cloud-hypervisor (the candidate, executable), vmlinux,
-#           initramfs.cpio.gz and VERSION (what the binary prints, one line)
+#           initramfs.cpio.gz, VERSION (what the binary prints, one line) and,
+#           optionally, previous.tar.gz
 #   --work  scratch: created (it must not exist, or be empty) and removed on
 #           exit, success or failure, after every process this started is gone
+#   --out   an existing empty directory for the checkpoint and its sha256
 #
 # Env (all optional; the defaults are the real run's):
 #   SMOKE_BOOT_TIMEOUT    seconds to wait for CH-SMOKE-BOOTED (90)
@@ -50,9 +64,11 @@
 #                         Hypervisor's _disable_io_uring=on puts the disk on
 #                         another backend, so step 1's ring check must fail.
 #
-# Exit: 0 every step passed; 10-14 the step above failed, naming what it saw;
-#       93 could not run safely (an argument or input missing or malformed, no
-#       usable KVM device, a work directory that is not empty, a tool missing).
+# Exit: 0 every step passed (step 5 may say SKIPPED); 10-16 the step above
+#       failed, naming what it saw; 93 could not run safely (an argument or
+#       input missing or malformed, no usable KVM device, a work or out
+#       directory that is not empty, a previous checkpoint that is not what
+#       step 6 writes, a tool missing).
 set -euo pipefail
 export LC_ALL=C
 
@@ -68,17 +84,17 @@ fail() {
 }
 say() { echo "ch-smoke: $*"; }
 
-IN="" WORK=""
+IN="" WORK="" OUT=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --in|--work)
+    --in|--work|--out)
       [ $# -ge 2 ] && [ -n "$2" ] || cannot "$1 needs a value"
-      case "$1" in --in) IN=$2 ;; --work) WORK=$2 ;; esac
+      case "$1" in --in) IN=$2 ;; --work) WORK=$2 ;; --out) OUT=$2 ;; esac
       shift 2 ;;
-    *) cannot "unknown argument '$1' (usage: smoke.sh --in DIR --work DIR)" ;;
+    *) cannot "unknown argument '$1' (usage: smoke.sh --in DIR --work DIR --out DIR)" ;;
   esac
 done
-[ -n "$IN" ] && [ -n "$WORK" ] || cannot "--in and --work are both required"
+[ -n "$IN" ] && [ -n "$WORK" ] && [ -n "$OUT" ] || cannot "--in, --work and --out are all required"
 
 num() { case "$2" in ''|*[!0-9.]*|*.*.*|.*) cannot "$1='$2' is not a number of seconds" ;; esac; }
 BOOT_TIMEOUT=${SMOKE_BOOT_TIMEOUT:-90};     num SMOKE_BOOT_TIMEOUT "$BOOT_TIMEOUT"
@@ -96,12 +112,15 @@ done
 CH="$IN/cloud-hypervisor"
 KERNEL="$IN/vmlinux"
 INITRAMFS="$IN/initramfs.cpio.gz"
+PREVIOUS="$IN/previous.tar.gz"
 [ -f "$CH" ] && [ -x "$CH" ] || cannot "no executable $CH"
 [ -s "$KERNEL" ] || cannot "no kernel at $KERNEL"
 [ -s "$INITRAMFS" ] || cannot "no initramfs at $INITRAMFS"
 [ -f "$IN/VERSION" ] || cannot "no $IN/VERSION"
 VERSION=$(cat "$IN/VERSION")
 [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9._-]+)?$ ]] || cannot "VERSION '$VERSION' is not a release tag or git describe output"
+[ -d "$OUT" ] || cannot "--out $OUT is not a directory"
+[ -z "$(ls -A "$OUT")" ] || cannot "--out $OUT is not empty"
 [ -c "$KVM" ] && [ -r "$KVM" ] && [ -w "$KVM" ] || cannot "$KVM is not a character device this user can read and write"
 # Each VMM's API socket is $WORK/<name>.sock, and a unix socket path has room
 # for 107 bytes.
@@ -263,6 +282,9 @@ first=$("$CH" --version 2>&1 | head -n 1) || true
 [ "$first" = "cloud-hypervisor $VERSION" ] || fail 10 "the binary prints '$first', not 'cloud-hypervisor $VERSION'"
 passed 0 version "$first"
 
+KSHA=$(sha256sum "$KERNEL" | cut -d' ' -f1) || cannot "cannot hash $KERNEL"
+ISHA=$(sha256sum "$INITRAMFS" | cut -d' ' -f1) || cannot "cannot hash $INITRAMFS"
+
 # --- 1. boot -------------------------------------------------------------------
 STEP="1 (boot)"
 DISK="$WORK/disk.raw"
@@ -297,8 +319,11 @@ STEP="2 (snapshot and restore)"
 api a PUT vm.pause > /dev/null || fail 12 "vm.pause was refused"
 HB_SAVED=$(hb_of a)
 snapshot a "$WORK/snap1" 12
+cp --sparse=always "$DISK" "$WORK/snap1-disk.raw" || fail 12 "cannot copy the paused VM's disk"
 stop a
-restore b "$WORK/snap1" "$DISK" 12
+# restore rewrites config.json, so it gets a copy: snap1 stays as taken, for step 6.
+cp -r "$WORK/snap1" "$WORK/run1" || fail 12 "cannot copy the snapshot"
+restore b "$WORK/run1" "$DISK" 12
 wait_hb b "$((HB_SAVED + 1))" 12 "after restore"
 queues_ok b 12 "after restore"
 not_rebooted b 12 "after restore"
@@ -353,4 +378,31 @@ wait_hb b "$(hb_of b)" 14 "after the resizes"
 passed 4 resize "vCPUs $BOOT_CPUS -> $MAX_CPUS -> $BOOT_CPUS; $mem_note"
 stop b
 
-say "PASSED version=$VERSION"
+# --- 5. wake the previous release's checkpoint ----------------------------------
+STEP="5 (previous release's checkpoint)"
+PREV_VERSION=none
+if [ -f "$PREVIOUS" ]; then
+  mkdir -p "$WORK/prev" || cannot "cannot create $WORK/prev"
+  python3 "$TOOL" unpack "$PREVIOUS" "$WORK/prev" || cannot "the previous checkpoint is not one this smoke writes"
+  P="$WORK/prev/checkpoint"
+  PREV_VERSION=$(python3 "$TOOL" info "$P/CHECKPOINT" version) || cannot "the previous checkpoint has no version"
+  PREV_HB=$(python3 "$TOOL" info "$P/CHECKPOINT" hb) || cannot "the previous checkpoint has no heartbeat"
+  [ "$PREV_VERSION" != "$VERSION" ] || cannot "the previous checkpoint is this build's own ($VERSION)"
+  restore d "$P/snapshot" "$P/disk.raw" 15
+  wait_hb d "$((PREV_HB + 1))" 15 "waking $PREV_VERSION's checkpoint"
+  queues_ok d 15 "waking $PREV_VERSION's checkpoint"
+  not_rebooted d 15 "waking $PREV_VERSION's checkpoint"
+  stop d
+  passed 5 "previous release's checkpoint" "$PREV_VERSION's, saved at heartbeat $PREV_HB, woke at $(hb_of d)"
+else
+  say "step 5 previous release's checkpoint: SKIPPED (no $PREVIOUS: no earlier release published a checkpoint to wake)"
+fi
+
+# --- 6. pack this build's checkpoint ---------------------------------------------
+STEP="6 (pack)"
+python3 "$TOOL" pack "$OUT" --snapshot "$WORK/snap1" --disk "$WORK/snap1-disk.raw" --version "$VERSION" \
+  --hb "$HB_SAVED" --kernel-sha256 "$KSHA" --initramfs-sha256 "$ISHA" \
+  || fail 16 "the checkpoint could not be packed"
+passed 6 pack "$(cut -d' ' -f1 "$OUT/ch-smoke-checkpoint.tar.gz.sha256")"
+
+say "PASSED version=$VERSION previous=$PREV_VERSION"
