@@ -8,15 +8,13 @@
 # "-75-g50268b2d" and "-81-ga71a1160" are not comparable.
 #
 # --validate and --is-release are deliberately the same test: a well-formed
-# release tag IS what triggers the ARM build (see ci.yml). One regex, both
-# branches use it below, so they cannot drift apart.
+# release tag IS what triggers a release build. One regex, both branches use
+# it below, so they cannot drift apart.
 #
-# Exit codes 89-99 join the same reserved "could not run safely" band as
-# cache-env.sh, run-check.sh, hardened-run.sh and configure-cache.sh -- the
-# thing never ran, rather than ran and failed. 93 keeps its meaning from
-# those four scripts: a required argument (here, the subcommand or its
-# operand) is missing or unrecognised. This script adds two more of its own
-# (95, 96, below).
+# Exit codes 89-99 are a reserved "could not run safely" band -- the thing
+# never ran, rather than ran and failed. 93 means a required argument (here,
+# the subcommand or its operand) is missing or unrecognised. This script also
+# uses two more (95, 96, below).
 #   95 -- --next found no upstream vX.Y.Z tag reachable from HEAD, so there
 #         is no base to build a version on.
 #   96 -- --next could not establish that its view of existing <base>-cove.*
@@ -30,8 +28,8 @@
 #         cannot tell the two apart; only the remote's own tag list can, so
 #         --next checks that too (git ls-remote against REMOTE, "origin" by
 #         default -- override with VERSION_SH_REMOTE if that name doesn't
-#         point at this fork; in this dev checkout, for instance, "origin"
-#         is upstream's GitHub and the fork is "forge") before trusting
+#         point at this fork; in a checkout where "origin" is upstream,
+#         for instance) before trusting
 #         silence. Reissuing a version number that already exists publishes
 #         over a release, so this refuses rather than guesses. A refusal
 #         costs a rerun; a collision costs a release.
@@ -68,11 +66,9 @@ USAGE="usage: version.sh --validate <tag> | --sort-key <tag> | --is-release <ref
 
 # Not `"${2:?...}"` anywhere below -- that form kills the script via bash's
 # own parameter-expansion error, exit 1, indistinguishable from an ordinary
-# failure and outside this codebase's exit-code contract (the same defect
-# already fixed in cache-env.sh, run-check.sh, hardened-run.sh and
-# configure-cache.sh). A missing required operand is a refusal like theirs,
-# so it gets the same code: 93. $1 here is the subcommand name, only used to
-# name the problem in the message.
+# failure and outside this script's exit-code contract. A missing required
+# operand is a refusal, so it gets the code for one: 93. $1 here is the
+# subcommand name, only used to name the problem in the message.
 require_operand() {
   if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
     echo "version.sh: FATAL -- usage: version.sh $1 <tag> (required argument missing). Refusing to run." >&2
@@ -150,12 +146,11 @@ case "${1:-}" in
     # authoritative answer is the remote's own tag list: if the remote has a
     # release tag this clone lacks, the local view is incomplete, full stop.
     #
-    # REMOTE defaults to the name every workflow's checkout gives its own
-    # remote ("origin", from Forgejo Actions). Override with
-    # VERSION_SH_REMOTE for a different name or a raw URL -- e.g. in *this*
-    # dev clone, "origin" is upstream's GitHub, not the fork, so a real cut
-    # here needs VERSION_SH_REMOTE=forge. A timeout is a refusal, not a hang:
-    # this is exactly the discipline run-check.sh's lookup timeout applies.
+    # REMOTE defaults to the name a workflow's checkout gives its own remote
+    # ("origin"). Override with VERSION_SH_REMOTE for a different name or a
+    # raw URL -- e.g. in a clone where "origin" is upstream, not the fork, a
+    # real cut needs VERSION_SH_REMOTE set to the fork's remote. A timeout is
+    # a refusal, not a hang.
     REMOTE="${VERSION_SH_REMOTE:-origin}"
     REMOTE_TIMEOUT="${VERSION_SH_REMOTE_TIMEOUT:-15}"
     remote_list=$(timeout "$REMOTE_TIMEOUT" git ls-remote --tags --refs "$REMOTE" "${base}-cove.*" 2>/dev/null)
