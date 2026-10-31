@@ -4325,10 +4325,38 @@ mod tests {
 
     /// Runs what the block offload worker does on a thread under the
     /// virtio-block seccomp filter, applied the way activate() has the
-    /// backend apply it. A syscall the filter does not allow raises SIGSYS
-    /// and kills the test binary.
+    /// backend apply it. A syscall the filter does not allow raises SIGSYS.
+    ///
+    /// This runs in a process of its own, so that SIGSYS fails this test
+    /// rather than killing the test binary, and without RUST_BACKTRACE: the
+    /// panic hook then prints the backtrace, which needs getcwd and readlink,
+    /// and the filter allows neither. --nocapture has the hook write to stderr
+    /// as it does in the VMM.
     #[test]
     fn virtio_block_filter_allows_offload_worker() {
+        const IN_CHILD: &str = "VIRTIO_BLOCK_FILTER_TEST_CHILD";
+        if env::var_os(IN_CHILD).is_none() {
+            let output = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "block::tests::virtio_block_filter_allows_offload_worker",
+                    "--nocapture",
+                ])
+                .env(IN_CHILD, "1")
+                .env_remove("RUST_BACKTRACE")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            // A filter on the test name that matched nothing also succeeds.
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
         let filter = get_seccomp_filter(&SeccompAction::Trap, Thread::VirtioBlock).unwrap();
         let notifier = EventFd::new(EFD_NONBLOCK).unwrap();
         let worker_notifier = notifier.try_clone().unwrap();
