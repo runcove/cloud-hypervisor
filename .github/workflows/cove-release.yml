@@ -126,6 +126,13 @@ jobs:
           cloud-hypervisor-static-x86_64'
           [ "$(find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort)" = "$want" ] \
             || { echo "::error::the build's files are not exactly the five agreed names"; exit 1; }
+          # -c checks only the lines there are: it must have one for each other file.
+          listed='BUILDINFO
+          THIRD-PARTY-NOTICES.txt
+          cloud-hypervisor-static-aarch64
+          cloud-hypervisor-static-x86_64'
+          [ "$(LC_ALL=C sort -k2 SHA256SUMS | sed -E 's/^[0-9a-f]{64}  //')" = "$listed" ] \
+            || { echo "::error::SHA256SUMS does not list exactly the other four files"; exit 1; }
           sha256sum --strict --status -c SHA256SUMS 2>/dev/null \
             || { echo "::error::the files do not match SHA256SUMS"; exit 1; }
           ls -l
@@ -268,6 +275,13 @@ jobs:
           f cloud-hypervisor-static-x86_64'
           [ "$(find . -mindepth 1 -printf '%y %P\n' | LC_ALL=C sort)" = "$want" ] \
             || { echo "::error::the build's files are not exactly the five agreed names, all plain files"; exit 1; }
+          # -c checks only the lines there are: it must have one for each other file.
+          listed='BUILDINFO
+          THIRD-PARTY-NOTICES.txt
+          cloud-hypervisor-static-aarch64
+          cloud-hypervisor-static-x86_64'
+          [ "$(LC_ALL=C sort -k2 SHA256SUMS | sed -E 's/^[0-9a-f]{64}  //')" = "$listed" ] \
+            || { echo "::error::SHA256SUMS does not list exactly the other four files"; exit 1; }
           sha256sum --strict --status -c SHA256SUMS 2>/dev/null \
             || { echo "::error::the files do not match SHA256SUMS"; exit 1; }
 
