@@ -5263,7 +5263,14 @@ mod tests {
         let ranges: Box<[UffdRange]> = uffd.ranges().into();
         let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
         let file = snapshot_file(&[(0xa0, page), (0xa1, page), (0xa2, page), (0xa3, page)]);
-        let handler = TestHandler::spawn(uffd, file.reopen().unwrap(), Arc::clone(&served), true);
+        let serve_lock = Arc::new(Mutex::new(()));
+        let handler = TestHandler::spawn_with(
+            uffd,
+            Box::new(FileUffdMemorySource::new(file.reopen().unwrap())),
+            Arc::clone(&served),
+            Arc::clone(&serve_lock),
+            true,
+        );
 
         // Nothing is copied until it is accessed.
         thread::sleep(time::Duration::from_millis(100));
@@ -5272,6 +5279,9 @@ mod tests {
         }
         assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0xa1);
         assert!(gpa_present(&gm, page));
+        // The copy wakes the reader before the handler sets the served bit;
+        // the handler holds `serve_lock` until it has, so taking it waits.
+        drop(serve_lock.lock().unwrap());
         assert!(served[0].is_bit_set(1));
         thread::sleep(time::Duration::from_millis(100));
         for gpa in [0, 2 * page, 3 * page] {
@@ -5295,7 +5305,7 @@ mod tests {
             source: file.reopen().unwrap(),
             ranges,
             served: Arc::clone(&served),
-            serve_lock: Arc::new(Mutex::new(())),
+            serve_lock: Arc::clone(&serve_lock),
         };
         let range = MemoryRange {
             gpa: 0,
