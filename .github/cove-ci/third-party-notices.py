@@ -18,7 +18,8 @@ sorted, so the same Cargo.lock and toolchain give the same bytes):
   3. the notice and copyright files those crates ship (NOTICE*, COPYRIGHT*);
   4. the licence texts, each once, with the crates it applies to;
   5. the licence files of native (C, assembly) code crates bundle and compile
-     in, from NATIVE_CODE below;
+     in, from NATIVE_CODE below, and the notices that code carries in its own
+     source files, from BUNDLED_NOTICES below;
   6. what the toolchain links in: the Rust standard library's own copyright
      notices and licence texts, from the toolchain's share/doc/rust, and the
      notices of the musl C library, compiler runtime and unwinder, from the
@@ -40,6 +41,8 @@ partial file, when:
     C, C++ or assembly source, header, object or library, or a symlink, in
     its package) has no NATIVE_CODE entry for exactly that version from
     crates.io, or a file its entry names is not there;
+  * a file BUNDLED_NOTICES names holds no notice, or a mention of one this
+    cannot cut out whole as a comment (the notice would go missing);
   * a crate is taken under MPL-2.0 from anywhere but crates.io (MPL-2.0
     section 3.2: its entry in part 2 names where its source is, a crates.io
     URL of the exact version);
@@ -128,6 +131,24 @@ NATIVE_CODE = {
     "linux-loader": (("0.13.2", (), "the C++ under docs/ writes test fixtures and is never compiled in"),
                      ("0.14.0", (), "the C++ under docs/ writes test fixtures and is never compiled in")),
 }
+# NOTICES BUNDLED C CARRIES IN ITS SOURCE FILES. Some of the code above has no
+# licence file for part of what it compiles in: zstd's legacy decoders
+# (zstd/lib/legacy/zstd_v01.c to v07.c, compiled in by zstd-sys's default
+# `legacy` feature) are older than zstd's BSD-3-Clause and each carries
+# Yann Collet's BSD 2-Clause notice, with the year of the day it was written,
+# inside the source file, again and again. Here, for the versions NATIVE_CODE
+# lists: (version, the source files, why). Every comment of those files that
+# names "BSD 2-Clause" is copied in verbatim, each distinct one once, with
+# the files it is in. A file with none, or with a mention of the words outside
+# a comment this cut out, fails the build, and so does a version of a crate
+# named here that has no entry.
+BUNDLED_NOTICES = {
+    "zstd-sys": tuple((version, tuple(f"zstd/lib/legacy/zstd_v0{n}.c" for n in range(1, 8)),
+                       "the notices in zstd's legacy decoder sources, compiled in by zstd-sys's `legacy` feature")
+                      for version in ("2.0.16+zstd.1.5.7", "2.1.0+zstd.1.5.7", "2.1.2+zstd.1.5.7")),
+}
+NOTICE_MARK = "BSD 2-Clause"
+C_COMMENT = re.compile(r"/\*(?:(?!\*/).)*\*/", re.S)
 # The toolchain's own notices. The Rust standard library's are one HTML page
 # in the toolchain (it names every crate std is built from, with its notices);
 # RUST_LICENCES are the texts that page refers to by name for std's own tree.
@@ -260,6 +281,27 @@ def read_inside(root, rel, problems, what, may_be_empty=False):
         problems.append(f"{what} is empty")
         return None
     return clean(body)
+
+
+def bundled_notices(directory, rels, problems, label):
+    """The BSD 2-Clause comments of the source files `rels` under `directory`,
+    as [(text, [file, ...])]: each distinct comment once, in the order first
+    met, verbatim, with the files that hold it. A file with none, or with more
+    mentions of the licence than comments cut out, is a problem."""
+    seen = {}
+    for rel in rels:
+        body = read_inside(directory, rel, problems, f"{label}: {rel}")
+        if body is None:
+            continue
+        found = [m.group(0) for m in C_COMMENT.finditer(body) if NOTICE_MARK in m.group(0)]
+        if not found or sum(c.count(NOTICE_MARK) for c in found) != body.count(NOTICE_MARK):
+            problems.append(f"{label}: {rel} holds {body.count(NOTICE_MARK)} mention(s) of {NOTICE_MARK} and "
+                            f"{len(found)} comment(s) with one: its notices cannot be copied in whole")
+        for comment in found:
+            files = seen.setdefault(comment, [])
+            if rel not in files:
+                files.append(rel)
+    return list(seen.items())
 
 
 def may_hold_native_code(directory):
@@ -506,6 +548,17 @@ def build(about, src, rust_doc, rustc_version, zig_dir, zig_version):
                 continue
             _, files, why = audited
             found = [(rel, read_inside(d, rel, problems, f"{label}: {rel}")) for rel in files]
+            carried = next((e for e in BUNDLED_NOTICES.get(key[0], ()) if e[0] == key[1]), None)
+            if key[0] in BUNDLED_NOTICES and carried is None:
+                problems.append(f"{label}: BUNDLED_NOTICES in third-party-notices.py has no entry for this "
+                                f"version: look at the notices its sources carry, then list them")
+            elif carried:
+                blocks = bundled_notices(d, carried[1], problems, label)
+                if blocks:
+                    found.append((f"{len(blocks)} distinct {NOTICE_MARK} notices in {carried[1][0]} to "
+                                  f"{carried[1][-1]}, verbatim",
+                                  "\n\n".join(f"[in {', '.join(f.rpartition('/')[2] for f in fs)}]\n"
+                                               + text for text, fs in blocks) + "\n"))
             if files:
                 native.append((key, why, found))
     if problems:
