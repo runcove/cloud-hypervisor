@@ -2246,8 +2246,9 @@ impl Migratable for Block {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Result as IoResult;
+    use std::io::{Error as IoError, Result as IoResult};
     use std::ops::Range;
+    use std::process::Command;
     use std::sync::Mutex;
     use std::sync::mpsc::{self, Sender};
     use std::{env, mem, panic, slice};
@@ -4379,5 +4380,79 @@ mod tests {
         drop(sender);
         assert_eq!(worker.join().unwrap(), 2);
         assert_eq!(notifier.read().unwrap(), 2);
+    }
+
+    /// A panic on a thread under the virtio-block seccomp filter, with
+    /// RUST_BACKTRACE set, must unwind rather than raise SIGSYS: the panic hook
+    /// prints a backtrace, which needs getcwd and readlink.
+    ///
+    /// This runs in a process of its own, so that the backtrace symbolization
+    /// is not already cached by another test, and so that SIGSYS fails this
+    /// test rather than killing the test binary. --nocapture has the hook write
+    /// to stderr as it does in the VMM.
+    #[test]
+    fn virtio_block_filter_allows_backtrace() {
+        const IN_CHILD: &str = "VIRTIO_BLOCK_BACKTRACE_TEST_CHILD";
+        if env::var_os(IN_CHILD).is_none() {
+            let output = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "block::tests::virtio_block_filter_allows_backtrace",
+                    "--nocapture",
+                ])
+                .env(IN_CHILD, "1")
+                .env("RUST_BACKTRACE", "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{}\n{stderr}", output.status);
+            // A filter on the test name that matched nothing also succeeds.
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            assert!(stderr.contains("stack backtrace"), "{stderr}");
+            return;
+        }
+        let filter = get_seccomp_filter(&SeccompAction::Trap, Thread::VirtioBlock).unwrap();
+        thread::spawn(move || {
+            apply_filter(&filter).unwrap();
+            let caught = panic::catch_unwind(|| panic!("offloaded operation panicked"));
+            assert!(caught.is_err());
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The legacy open that the x86_64 musl backtrace printer calls is allowed
+    /// read-only, with the flags it passes, and a writable open is still refused.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn virtio_block_filter_refuses_writable_open() {
+        let filter = get_seccomp_filter(
+            &SeccompAction::Errno(libc::EPERM as u32),
+            Thread::VirtioBlock,
+        )
+        .unwrap();
+        let (read_only, writable) = thread::spawn(move || {
+            apply_filter(&filter).unwrap();
+            let open = |flags: libc::c_int| {
+                // SAFETY: the path is a NUL-terminated string.
+                let fd = unsafe {
+                    libc::syscall(libc::SYS_open, c"/proc/self/maps".as_ptr(), flags) as i32
+                };
+                let errno = IoError::last_os_error().raw_os_error();
+                if fd >= 0 {
+                    // SAFETY: fd was just opened here.
+                    unsafe { libc::close(fd) };
+                }
+                (fd, errno)
+            };
+            (
+                open(libc::O_RDONLY | libc::O_LARGEFILE | libc::O_CLOEXEC),
+                open(libc::O_WRONLY),
+            )
+        })
+        .join()
+        .unwrap();
+        assert!(read_only.0 >= 0, "read-only open refused: {read_only:?}");
+        assert_eq!(writable, (-1, Some(libc::EPERM)));
     }
 }
