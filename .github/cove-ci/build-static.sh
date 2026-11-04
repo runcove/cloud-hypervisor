@@ -12,8 +12,12 @@
 #                33 of block's tests open real io_uring rings, which Docker's
 #                default profile refuses, so this phase runs in a container
 #                that allows io_uring, with no network;
-#   test         steps 1-4, then block's clippy and tests and the workspace's
-#                unit tests, in a container that allows io_uring and has
+#   test         steps 1-4, then block's clippy and tests, the workspace's
+#                unit tests, and virtio-devices' `virtio_block_filter` seccomp
+#                tests on x86_64-unknown-linux-musl (the target we ship; the
+#                workspace tests run on the gnu host, where a syscall only
+#                musl's libc makes, such as legacy open or stat, goes unseen),
+#                in a container that allows io_uring and has
 #                /dev/kvm and /dev/net/tun. It builds no release binary.
 #
 # WHAT THE BUILD PHASE DOES, in order, all in /src (the fork's tree, .git included --
@@ -362,6 +366,10 @@ if [ "$BUILD_PHASE" = test ]; then
   cargo test --locked -p block --features "$BLOCK_FEATURES"
   phase "workspace unit tests"
   cargo test --locked --lib --bins --target "$HOST_TARGET" --release --workspace
+  phase "virtio-block seccomp filter tests (x86_64 musl)"
+  # Every test whose name contains virtio_block_filter, so later ones run too.
+  RUST_BACKTRACE=1 cargo test --locked -p virtio-devices --lib --features kvm \
+    --target x86_64-unknown-linux-musl virtio_block_filter
   phase "workspace doc tests"
   cargo test --locked --doc --target "$HOST_TARGET" --release --workspace
   echo "build-static: OK tests of $VERSION in $(( $(date +%s) - T_START ))s"
