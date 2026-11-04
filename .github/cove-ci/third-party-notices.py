@@ -41,6 +41,8 @@ partial file, when:
     C, C++ or assembly source, header, object or library, or a symlink, in
     its package) has no NATIVE_CODE entry for exactly that version from
     crates.io, or a file its entry names is not there;
+  * a C or assembly file of zstd-sys holds a notice BUNDLED_NOTICES does not
+    list;
   * a file BUNDLED_NOTICES names holds no notice, or a mention of one this
     cannot cut out whole as a comment (the notice would go missing);
   * a crate is taken under MPL-2.0 from anywhere but crates.io (MPL-2.0
@@ -355,6 +357,22 @@ def bundled_notices(directory, rels, problems, label, kind):
     return list(seen.items())
 
 
+def unlisted_notice_files(directory, listed, problems, label):
+    """A problem for each C or assembly file under directory/zstd that holds
+    the opening words of a NOTICE_KINDS licence and is not in `listed`, so a
+    new source file with a notice cannot go unreported."""
+    openings = tuple(k[0] for k in NOTICE_KINDS.values())
+    for top, dirs, names in os.walk(os.path.join(directory, "zstd")):
+        for name in sorted(names):
+            path = os.path.join(top, name)
+            rel = os.path.relpath(path, directory)
+            if name.endswith((".c", ".S", ".h")) and rel not in listed and not os.path.islink(path):
+                with open(path, "rb") as f:
+                    text = f.read().decode("utf-8", "replace")
+                if any(o in text for o in openings):
+                    problems.append(f"{label}: {rel} holds a licence notice and BUNDLED_NOTICES does not list it")
+
+
 def may_hold_native_code(directory):
     """Why the crate's package may hold native code -- the first native file
     or symlink found, by name -- or None. A directory that cannot be listed
@@ -604,6 +622,7 @@ def build(about, src, rust_doc, rustc_version, zig_dir, zig_version):
                 problems.append(f"{label}: BUNDLED_NOTICES in third-party-notices.py has no entry for this "
                                 f"version: look at the notices its sources carry, then list them")
             elif carried:
+                unlisted_notice_files(d, {r for _, rels in carried[1] for r in rels}, problems, label)
                 for kind, rels in carried[1]:
                     blocks = bundled_notices(d, rels, problems, label, kind)
                     if blocks:
@@ -687,7 +706,8 @@ def build(about, src, rust_doc, rustc_version, zig_dir, zig_version):
     w(RULE)
     w("")
     w("These crates carry C or assembly that is compiled into the binaries. The")
-    w("licence files below are theirs, verbatim.")
+    w("licence files below are theirs, verbatim, and so are the notices that the")
+    w("source files of that code carry.")
     for key, _, found in native:
         for rel, body, reason in found:
             w("")
