@@ -4555,6 +4555,7 @@ mod tests {
         assert_eq!(base_clear_of_reserved(&regions, 8 * GIB, 8 * GIB), 8 * GIB);
     }
 
+    use std::env;
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::FileExt;
@@ -5360,15 +5361,20 @@ mod tests {
         }
     }
 
-    // A userfaultfd with all of `gm` registered for missing faults, or None
-    // when this host does not let the test create one.
+    // A userfaultfd with all of `gm` registered for missing faults. A host
+    // that does not let the test create one fails the test, unless
+    // CH_TEST_SKIP_UFFD=1 says to skip it (None).
     fn register_uffd(gm: &GuestMemory) -> Option<Uffd> {
         let fd = match uffd::create(userfaultfd::UFFD_FEATURE_MISSING_SHMEM) {
             Ok(fd) => fd,
-            Err(e) => {
-                eprintln!("skipping: cannot create a userfaultfd: {e}");
+            Err(e) if env::var_os("CH_TEST_SKIP_UFFD").is_some_and(|v| v == "1") => {
+                eprintln!("skipping (CH_TEST_SKIP_UFFD=1): cannot create a userfaultfd: {e}");
                 return None;
             }
+            Err(e) => panic!(
+                "cannot create a userfaultfd: {e}; run as root or with \
+                 vm.unprivileged_userfaultfd=1, or set CH_TEST_SKIP_UFFD=1 to skip"
+            ),
         };
         let page = get_page_size();
         let mut ranges = Vec::new();
@@ -5500,7 +5506,14 @@ mod tests {
         let ranges: Box<[UffdRange]> = uffd.ranges().into();
         let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
         let file = snapshot_file(&[(0xa0, page), (0xa1, page), (0xa2, page), (0xa3, page)]);
-        let handler = TestHandler::spawn(uffd, file.reopen().unwrap(), Arc::clone(&served), true);
+        let serve_lock = Arc::new(Mutex::new(()));
+        let handler = TestHandler::spawn_with(
+            uffd,
+            Box::new(FileUffdMemorySource::new(file.reopen().unwrap())),
+            Arc::clone(&served),
+            Arc::clone(&serve_lock),
+            true,
+        );
 
         // Nothing is copied until it is accessed.
         thread::sleep(time::Duration::from_millis(100));
@@ -5509,6 +5522,11 @@ mod tests {
         }
         assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0xa1);
         assert!(gpa_present(&gm, page));
+        // A first access gets a page of the VM's own too.
+        assert!(gpa_exclusive(&gm, page));
+        // The copy wakes the reader before the handler sets the served bit;
+        // the handler holds `serve_lock` until it has, so taking it waits.
+        drop(serve_lock.lock().unwrap());
         assert!(served[0].is_bit_set(1));
         thread::sleep(time::Duration::from_millis(100));
         for gpa in [0, 2 * page, 3 * page] {
@@ -5534,7 +5552,7 @@ mod tests {
             source: file.reopen().unwrap(),
             ranges,
             served: Arc::clone(&served),
-            serve_lock: Arc::new(Mutex::new(())),
+            serve_lock: Arc::clone(&serve_lock),
         };
         let range = MemoryRange {
             gpa: 0,
@@ -5704,6 +5722,45 @@ mod tests {
         discard(&gm, 0, page);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0);
         assert!(!gpa_exclusive(&gm, 0));
+
+        handler.stop();
+    }
+
+    // A first access to a page that is a hole in the snapshot file, or holds
+    // zeroes, gets a zeroed page of the VM's own, not the zero page every
+    // process shares. restore_by_uffd leaves holes unserved for copy-on-access,
+    // as here, so the handler reads them from the file like any other page.
+    #[test]
+    fn copy_on_access_handler_serves_zero_pages_privately() {
+        check_copy_on_access_zero_pages(false);
+    }
+
+    #[test]
+    fn copy_on_access_handler_serves_zero_pages_privately_shared() {
+        check_copy_on_access_zero_pages(true);
+    }
+
+    fn check_copy_on_access_zero_pages(shared: bool) {
+        let page = get_page_size();
+        let gm = test_guest_memory(shared, 4 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        // Data, a hole, zeroes written as data, and a hole up to the end.
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0xd0u8; page as usize]).unwrap();
+        file.seek(SeekFrom::Start(2 * page)).unwrap();
+        file.write_all(&vec![0u8; page as usize]).unwrap();
+        file.set_len(4 * page).unwrap();
+        let handler = TestHandler::spawn(uffd, file, served, true);
+
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xd0);
+        for gpa in [page, 2 * page, 3 * page] {
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), 0);
+            assert!(gpa_present(&gm, gpa));
+            assert!(gpa_exclusive(&gm, gpa), "page at {gpa:#x} is shared");
+        }
 
         handler.stop();
     }
