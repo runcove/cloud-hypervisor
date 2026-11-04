@@ -368,7 +368,7 @@ if [ "$BUILD_PHASE" = test ]; then
   cargo test --locked --lib --bins --target "$HOST_TARGET" --release --workspace
   phase "virtio-block seccomp filter tests (x86_64 musl)"
   # Every test whose name contains virtio_block_filter, so later ones run too.
-  RUST_BACKTRACE=1 cargo zigbuild test --locked -p virtio-devices --lib --features kvm \
+  RUST_BACKTRACE=1 cargo-zigbuild test --locked -p virtio-devices --lib --features kvm \
     --target x86_64-unknown-linux-musl virtio_block_filter
   phase "workspace doc tests"
   cargo test --locked --doc --target "$HOST_TARGET" --release --workspace
