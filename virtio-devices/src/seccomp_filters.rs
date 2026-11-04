@@ -118,6 +118,12 @@ fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_fstat, vec![]),
         (libc::SYS_fsync, vec![]),
         (libc::SYS_ftruncate, vec![]),
+        // The panic hook prints a backtrace when RUST_BACKTRACE is set, which
+        // needs getcwd, readlink and, to read /proc/self/maps, open and stat.
+        // Without them the panic is a SIGSYS. The x86_64 musl libc calls the
+        // legacy open (read-only here, like openat in the common rules), stat
+        // and readlink; the other architectures only have the *at forms.
+        (libc::SYS_getcwd, vec![]),
         (libc::SYS_getrandom, vec![]),
         (libc::SYS_ioctl, create_virtio_block_ioctl_seccomp_rule()),
         (libc::SYS_io_destroy, vec![]),
@@ -126,14 +132,33 @@ fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_io_uring_enter, vec![]),
         (libc::SYS_lseek, vec![]),
         (libc::SYS_newfstatat, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (
+            libc::SYS_open,
+            or![and![
+                Cond::new(
+                    1, // open() flags argument
+                    ArgLen::Dword,
+                    MaskedEq(libc::O_ACCMODE as u64),
+                    libc::O_RDONLY as u64,
+                )
+                .unwrap()
+            ]],
+        ),
         (libc::SYS_pread64, vec![]),
         (libc::SYS_preadv, vec![]),
         (libc::SYS_pwritev, vec![]),
         (libc::SYS_pwritev2, vec![]),
         (libc::SYS_pwrite64, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_readlink, vec![]),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        (libc::SYS_readlinkat, vec![]),
         (libc::SYS_sched_getaffinity, vec![]),
         (libc::SYS_sched_setaffinity, vec![]),
         (libc::SYS_set_robust_list, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_stat, vec![]),
         (libc::SYS_statx, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
     ]
