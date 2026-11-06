@@ -4320,6 +4320,25 @@ fn do_mmap_cow_saved_regions(
         if ret == libc::MAP_FAILED {
             return Err(Error::SnapshotMmap(io::Error::last_os_error()));
         }
+        // Before the THP advice below, so it covers the anonymous ranges too.
+        let report = remap_cow_holes(
+            ret.cast(),
+            length,
+            memory_file,
+            file_offset,
+            reserve_flag,
+            HoleRemapLimits::default(),
+        )?;
+        info!(
+            "Restore (mode=copyonwrite): range at gpa 0x{:x} (size = 0x{:x}): \
+             extents={} holes_remapped={} bytes_remapped={} fallback={}",
+            range.gpa,
+            range.length,
+            report.extents,
+            report.holes,
+            report.bytes,
+            report.fallback.unwrap_or("none"),
+        );
         if thp {
             // SAFETY: ret/length name the private mapping just installed above.
             let adv = unsafe { libc::madvise(ret, length, libc::MADV_HUGEPAGE) };
@@ -4335,6 +4354,153 @@ fn do_mmap_cow_saved_regions(
         })?;
     }
     Ok(())
+}
+
+// Holes in the snapshot file shorter than this stay mapped from the file.
+const COW_HOLE_REMAP_MIN_SIZE: u64 = 2 << 20;
+// Most holes remapped in one saved range: each splits the mapping into up to
+// two more VMAs, so this keeps the count well under vm.max_map_count.
+const COW_HOLE_REMAP_MAX_HOLES: usize = 4096;
+
+#[derive(Clone, Copy, Debug)]
+struct HoleRemapLimits {
+    min_size: u64,
+    max_holes: usize,
+}
+
+impl Default for HoleRemapLimits {
+    fn default() -> Self {
+        HoleRemapLimits {
+            min_size: COW_HOLE_REMAP_MIN_SIZE,
+            max_holes: COW_HOLE_REMAP_MAX_HOLES,
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HoleRemapReport {
+    // Data extents seen in the window.
+    extents: usize,
+    // Holes, and bytes, now mapped anonymous.
+    holes: usize,
+    bytes: u64,
+    // Why some or all holes kept the file mapping, if they did.
+    fallback: Option<&'static str>,
+}
+
+// The page-aligned holes of at least `min_size` bytes in `[start, start +
+// len)` of `file`, as absolute file offsets, along with the number of data
+// extents seen. Anything past EOF is a hole. Errors if SEEK_HOLE is
+// unsupported or the walk fails.
+fn cow_file_holes(
+    file: &File,
+    start: u64,
+    len: u64,
+    page_size: u64,
+    min_size: u64,
+) -> io::Result<(usize, Vec<(u64, u64)>)> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "range overflow"))?;
+    let mut extents = 0;
+    let mut holes = Vec::new();
+    let mut push_hole = |lo: u64, hi: u64| {
+        let lo = lo.next_multiple_of(page_size);
+        let hi = hi - hi % page_size;
+        if hi > lo && hi - lo >= min_size {
+            holes.push((lo, hi - lo));
+        }
+    };
+    let mut cursor = start;
+    while let Some((data_off, data_len)) = next_data_extent(file.as_fd(), cursor, end)? {
+        extents += 1;
+        push_hole(cursor, data_off);
+        cursor = data_off + data_len;
+    }
+    push_hole(cursor, end);
+    Ok((extents, holes))
+}
+
+// Replaces the holes of the private file mapping at `host` (`len` bytes of
+// `file` from `file_offset`, mapped with `map_flags` besides MAP_PRIVATE)
+// with private anonymous memory. Both read as zeroes and keep guest writes
+// private, but a guest touching a hole through the file mapping first
+// faults a zero page into the file's page cache and then copies it, so a
+// mostly-empty guest fills the host page cache with zeroes. Keeps the file
+// mapping whenever SEEK_HOLE is unsupported or the holes are too many. The
+// mapping must be page-aligned and not yet used by anything.
+fn remap_cow_holes(
+    host: *mut u8,
+    len: usize,
+    file: &File,
+    file_offset: u64,
+    map_flags: libc::c_int,
+    limits: HoleRemapLimits,
+) -> Result<HoleRemapReport, Error> {
+    let mut report = HoleRemapReport::default();
+    let page_size = get_page_size();
+    if !file_offset.is_multiple_of(page_size) || !(host as u64).is_multiple_of(page_size) {
+        report.fallback = Some("unaligned");
+        return Ok(report);
+    }
+    let holes = match cow_file_holes(file, file_offset, len as u64, page_size, limits.min_size) {
+        Ok((extents, holes)) => {
+            report.extents = extents;
+            holes
+        }
+        Err(e) => {
+            debug!("Restore (mode=copyonwrite): cannot walk snapshot file holes: {e}");
+            report.fallback = Some("seek_hole_unsupported");
+            return Ok(report);
+        }
+    };
+    if holes.len() > limits.max_holes {
+        report.fallback = Some("too_many_holes");
+        return Ok(report);
+    }
+    for (off, hole_len) in holes {
+        // SAFETY: the hole lies within [file_offset, file_offset + len), so
+        // addr..addr + hole_len lies within the mapping at host, which the
+        // caller owns and nothing uses yet: MAP_FIXED replaces only it.
+        let addr = unsafe { host.add((off - file_offset) as usize) };
+        // SAFETY: as above; an anonymous mapping takes no fd.
+        let ret = unsafe {
+            libc::mmap(
+                addr.cast(),
+                hole_len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | map_flags,
+                -1,
+                0,
+            )
+        };
+        if ret != libc::MAP_FAILED {
+            report.holes += 1;
+            report.bytes += hole_len;
+            continue;
+        }
+        let e = io::Error::last_os_error();
+        // A failed MAP_FIXED may already have unmapped the range: map the
+        // file back over it as it was, so the region stays whole.
+        // SAFETY: same range as above; the fd stays valid for the call.
+        let ret = unsafe {
+            libc::mmap(
+                addr.cast(),
+                hole_len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED | map_flags,
+                file.as_raw_fd(),
+                off as libc::off_t,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            return Err(Error::SnapshotMmap(io::Error::last_os_error()));
+        }
+        warn!("Restore (mode=copyonwrite): remapping a snapshot file hole failed: {e}");
+        report.fallback = Some("mmap_failed");
+        break;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -4951,6 +5117,190 @@ mod tests {
             do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
             assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xcd);
         }
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    // A sparse file of 8 MiB: data [0, 2) MiB, a 3 MiB hole, data [5, 6),
+    // a 1 MiB hole, data [7, 8). Mapped over 10 MiB, [8, 10) lies past EOF.
+    fn sparse_snapshot_file() -> File {
+        use std::os::unix::fs::FileExt;
+
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(8 * MIB).unwrap();
+        for (byte, off, len) in [
+            (0xab, 0, 2 * MIB),
+            (0xcd, 5 * MIB, MIB),
+            (0xef, 7 * MIB, MIB),
+        ] {
+            file.write_all_at(&vec![byte; len as usize], off).unwrap();
+        }
+        file
+    }
+
+    // Whether the VMA holding `gpa` carries `flag` in its smaps VmFlags.
+    fn gpa_has_vm_flag(gm: &GuestMemoryMmap, gpa: u64, flag: &str) -> bool {
+        let host = gm.get_host_address(GuestAddress(gpa)).unwrap() as usize;
+        let smaps = fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut inside = false;
+        for line in smaps.lines() {
+            if let Some((lo, rest)) = line.split_once('-')
+                && let Some(hi) = rest.split_whitespace().next()
+                && let (Ok(lo), Ok(hi)) =
+                    (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+            {
+                inside = (lo..hi).contains(&host);
+            } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+                return flags.split_whitespace().any(|f| f == flag);
+            }
+        }
+        panic!("guest address not found in /proc/self/smaps");
+    }
+
+    #[test]
+    fn cow_restore_maps_file_holes_anonymous() {
+        use std::os::unix::fs::FileExt;
+
+        let file = sparse_snapshot_file();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (10 * MIB) as usize)]).unwrap();
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 10 * MIB,
+        });
+        do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
+
+        // Data reads the file's bytes, holes and past-EOF read zero.
+        for (gpa, byte) in [
+            (0, 0xab),
+            (2 * MIB - 1, 0xab),
+            (2 * MIB, 0),
+            (5 * MIB - 1, 0),
+            (5 * MIB, 0xcd),
+            (6 * MIB, 0),
+            (7 * MIB, 0xef),
+            (8 * MIB - 1, 0xef),
+            (8 * MIB, 0),
+            (10 * MIB - 1, 0),
+        ] {
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), byte);
+        }
+
+        // Holes of 2 MiB or more are anonymous; data and the 1 MiB hole
+        // stay mapped from the file.
+        assert!(gpa_is_file_backed(&gm, 0));
+        assert!(!gpa_is_file_backed(&gm, 2 * MIB));
+        assert!(!gpa_is_file_backed(&gm, 5 * MIB - 1));
+        assert!(gpa_is_file_backed(&gm, 5 * MIB));
+        assert!(gpa_is_file_backed(&gm, 6 * MIB));
+        assert!(gpa_is_file_backed(&gm, 7 * MIB));
+        assert!(!gpa_is_file_backed(&gm, 8 * MIB));
+
+        // The THP advice covers the anonymous ranges as well.
+        if Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+            assert!(gpa_has_vm_flag(&gm, 0, "hg"));
+            assert!(gpa_has_vm_flag(&gm, 2 * MIB, "hg"));
+            assert!(gpa_has_vm_flag(&gm, 8 * MIB, "hg"));
+        }
+
+        // A write into a remapped hole is kept and never reaches the file,
+        // which keeps its hole; a discard reads back zero.
+        gm.write_obj::<u8>(0x5a, GuestAddress(3 * MIB)).unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(3 * MIB)).unwrap(), 0x5a);
+        let mut back = [0xffu8; 1];
+        file.read_exact_at(&mut back, 3 * MIB).unwrap();
+        assert_eq!(back[0], 0);
+        assert_eq!(
+            next_data_extent(file.as_fd(), 2 * MIB, 5 * MIB).unwrap(),
+            None
+        );
+        assert_eq!(file.metadata().unwrap().len(), 8 * MIB);
+        discard(&gm, 3 * MIB, page_size());
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(3 * MIB)).unwrap(), 0);
+    }
+
+    // Guest RAM with `file` mapped privately over it, as the copy-on-write
+    // restore maps it, before any hole is remapped.
+    fn private_file_mapping(file: &File, len: u64) -> GuestMemoryMmap {
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), len as usize)]).unwrap();
+        let host = gm.get_host_address(GuestAddress(0)).unwrap();
+        // SAFETY: host/len name the whole anonymous region just created.
+        let ret = unsafe {
+            libc::mmap(
+                host.cast(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(ret, libc::MAP_FAILED);
+        gm
+    }
+
+    fn remap_holes(gm: &GuestMemoryMmap, file: &File, limits: HoleRemapLimits) -> HoleRemapReport {
+        let host = gm.get_host_address(GuestAddress(0)).unwrap();
+        let len = gm.find_region(GuestAddress(0)).unwrap().len() as usize;
+        remap_cow_holes(host, len, file, 0, libc::MAP_NORESERVE, limits).unwrap()
+    }
+
+    #[test]
+    fn cow_hole_remap_reports_and_honors_limits() {
+        let file = sparse_snapshot_file();
+
+        let gm = private_file_mapping(&file, 10 * MIB);
+        let report = remap_holes(&gm, &file, HoleRemapLimits::default());
+        assert_eq!(
+            report,
+            HoleRemapReport {
+                extents: 3,
+                holes: 2,
+                bytes: 5 * MIB,
+                fallback: None,
+            }
+        );
+
+        // Below the minimum size every hole stays mapped from the file.
+        let gm = private_file_mapping(&file, 8 * MIB);
+        let limits = HoleRemapLimits {
+            min_size: 4 * MIB,
+            ..Default::default()
+        };
+        let report = remap_holes(&gm, &file, limits);
+        assert_eq!((report.extents, report.holes, report.bytes), (3, 0, 0));
+        assert_eq!(report.fallback, None);
+        assert!(gpa_is_file_backed(&gm, 2 * MIB));
+
+        // Over the budget, none is remapped.
+        let gm = private_file_mapping(&file, 10 * MIB);
+        let limits = HoleRemapLimits {
+            max_holes: 1,
+            ..Default::default()
+        };
+        let report = remap_holes(&gm, &file, limits);
+        assert_eq!((report.holes, report.bytes), (0, 0));
+        assert_eq!(report.fallback, Some("too_many_holes"));
+        assert!(gpa_is_file_backed(&gm, 2 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+    }
+
+    #[test]
+    fn cow_hole_remap_keeps_mapping_without_seek_hole() {
+        let file = sparse_snapshot_file();
+        let gm = private_file_mapping(&file, 8 * MIB);
+        // A pipe cannot seek, so its walk fails as on a filesystem without
+        // SEEK_HOLE.
+        let mut fds = [0; 2];
+        // SAFETY: fds has room for the two descriptors pipe writes.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe just returned these descriptors, owned by nothing else.
+        let (pipe_rd, _pipe_wr) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        let report = remap_holes(&gm, &pipe_rd, HoleRemapLimits::default());
+        assert_eq!(report.fallback, Some("seek_hole_unsupported"));
+        assert_eq!((report.holes, report.bytes), (0, 0));
+        assert!(gpa_is_file_backed(&gm, 2 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * MIB)).unwrap(), 0xcd);
     }
 
     #[test]
