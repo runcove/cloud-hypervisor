@@ -1,3 +1,11 @@
+<!-- runcove-fork-note -->
+> **About this fork.** This is runcove's patched build of Cloud Hypervisor, kept
+> on the `cove-patches-*` branches. Most changes belong upstream, at
+> [cloud-hypervisor/cloud-hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor).
+> Changes to our patches are welcome as pull requests here. Anything we take is
+> re-applied on our own forge as our commit, crediting you as the author. We
+> answer pull requests within a day.
+
 - [1. What is Cloud Hypervisor?](#1-what-is-cloud-hypervisor)
   - [Objectives](#objectives)
     - [High Level](#high-level)
