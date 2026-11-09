@@ -404,14 +404,59 @@ pub(crate) trait UffdMemorySource: Send {
 pub(crate) struct FileUffdMemorySource {
     file: File,
     buf: Vec<u8>,
+    /// Holes of `file` as `[start, end)` offsets, sorted and disjoint. A
+    /// page wholly inside one is resolved with zeroes without reading the
+    /// file: a buffered read of a hole would leave a zero page in the host
+    /// page cache for every hole page the guest touches.
+    holes: Box<[(u64, u64)]>,
+    zeroes: Vec<u8>,
 }
 
 impl FileUffdMemorySource {
+    /// A source that reads every page from `file`.
+    #[cfg(test)]
     pub(crate) fn new(file: File) -> Self {
+        Self::with_holes(file, Vec::new())
+    }
+
+    /// As `new`, resolving each page wholly inside `holes` (`[start, end)`
+    /// offsets of `file`, sorted and disjoint) without reading `file`.
+    pub(crate) fn with_holes(file: File, holes: Vec<(u64, u64)>) -> Self {
+        debug_assert!(holes.iter().all(|&(start, end)| start < end));
+        debug_assert!(holes.windows(2).all(|w| w[0].1 <= w[1].0));
         Self {
             file,
             buf: Vec::new(),
+            holes: holes.into(),
+            zeroes: Vec::new(),
         }
+    }
+
+    /// Whether `[pos, pos + len)` lies wholly inside one hole.
+    fn in_hole(&self, pos: u64, len: u64) -> bool {
+        let idx = self.holes.partition_point(|&(_, end)| end <= pos);
+        self.holes
+            .get(idx)
+            .is_some_and(|&(start, end)| start <= pos && pos.saturating_add(len) <= end)
+    }
+}
+
+/// Treat `EEXIST` from resolving the fault at `page_addr` as success: the
+/// page was installed concurrently, so wake any blocked threads.
+fn installed_or_raced(
+    result: Result<(), Error>,
+    uffd_fd: BorrowedFd<'_>,
+    page_addr: u64,
+    len: u64,
+) -> Result<(), Error> {
+    match result {
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+            if let Err(e) = wake(uffd_fd, page_addr, len) {
+                log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
+            }
+            Ok(())
+        }
+        result => result,
     }
 }
 
@@ -426,23 +471,25 @@ impl UffdMemorySource for FileUffdMemorySource {
         let page_addr = range.page_addr(page_idx);
         let file_pos = range.page_source_offset(page_idx);
 
+        if self.in_hole(file_pos, range.page_size) {
+            return match zeropage(uffd_fd, page_addr, range.page_size) {
+                // No zero page for this mapping (hugetlbfs): copy zeroes,
+                // which reads nothing from the file either.
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    copy_zeroes(uffd_fd, range, page_idx, &mut self.zeroes)
+                }
+                result => installed_or_raced(result, uffd_fd, page_addr, range.page_size),
+            };
+        }
+
         if self.buf.len() < page_size {
             self.buf.resize(page_size, 0);
         }
         self.file
             .read_exact_at(&mut self.buf[..page_size], file_pos)?;
 
-        match copy(uffd_fd, page_addr, self.buf.as_ptr(), range.page_size) {
-            Ok(()) => Ok(()),
-            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-                // Installed concurrently. Wake any blocked threads.
-                if let Err(e) = wake(uffd_fd, page_addr, range.page_size) {
-                    log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
-                }
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        let result = copy(uffd_fd, page_addr, self.buf.as_ptr(), range.page_size);
+        installed_or_raced(result, uffd_fd, page_addr, range.page_size)
     }
 
     fn requires_uffd_minor_mode(&self) -> bool {
@@ -584,6 +631,25 @@ pub(crate) fn zeropage(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Er
     }
 }
 
+/// Resolve a missing fault on page `page_idx` of `range` by copying a page
+/// of zeroes from `zeroes`, replaced by `allocate_zero_buffer` with one a
+/// page long when it is shorter. Unlike `zeropage`, this works on every
+/// mapping, hugetlbfs included.
+pub(crate) fn copy_zeroes(
+    fd: BorrowedFd<'_>,
+    range: &UffdRange,
+    page_idx: u64,
+    zeroes: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let page_size = range.page_size as usize;
+    let page_addr = range.page_addr(page_idx);
+    if zeroes.len() < page_size {
+        *zeroes = allocate_zero_buffer(page_size);
+    }
+    let result = copy(fd, page_addr, zeroes.as_ptr(), range.page_size);
+    installed_or_raced(result, fd, page_addr, range.page_size)
+}
+
 /// Mark a missing page so that an access to it fails instead of resolving a
 /// zero page.
 pub(crate) fn poison(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error> {
@@ -645,4 +711,27 @@ pub(crate) fn page_present(addr: u64) -> Result<bool, Error> {
         return Err(Error::last_os_error());
     }
     Ok(vec & 1 != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_hole_needs_the_whole_page_inside_one_hole() {
+        let file = tempfile::tempfile().unwrap();
+        let source =
+            FileUffdMemorySource::with_holes(file, vec![(0x1000, 0x3000), (0x3000, 0x5000)]);
+        assert!(source.in_hole(0x1000, 0x1000));
+        assert!(source.in_hole(0x2000, 0x1000));
+        assert!(source.in_hole(0x4000, 0x1000));
+        // Straddling a hole's start or end, or two holes.
+        assert!(!source.in_hole(0x0800, 0x1000));
+        assert!(!source.in_hole(0x4800, 0x1000));
+        assert!(!source.in_hole(0x2000, 0x2000));
+        // Outside every hole.
+        assert!(!source.in_hole(0, 0x1000));
+        assert!(!source.in_hole(0x5000, 0x1000));
+        assert!(!FileUffdMemorySource::new(tempfile::tempfile().unwrap()).in_hole(0, 0x1000));
+    }
 }
