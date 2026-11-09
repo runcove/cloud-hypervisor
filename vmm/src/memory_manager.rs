@@ -1906,10 +1906,11 @@ impl MemoryManager {
                         "UFFD handler: source error at {:#x}, poisoning unrestored guest memory: {e}",
                         range.page_addr(page_idx)
                     );
-                    exit_evt.write(1).ok();
                     // The restore can no longer complete, with or without a
-                    // background fill.
+                    // background fill. Set the flag before the exit event so
+                    // anyone woken by it already sees the failure.
                     prefault_failed.store(true, Ordering::Release);
+                    exit_evt.write(1).ok();
                     prefault_active = false;
                     source_failed = true;
                     Self::uffd_poison_page(fault_uffd.fd(), range, page_idx)?;
