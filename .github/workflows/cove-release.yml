@@ -8,12 +8,26 @@ name: cove-release
 #
 # A ci-test-* tag runs the same build as a non-release, named by `git describe`,
 # which is how a branch that GitHub does not hold gets a run.
+#
+# GitHub sends no push events at all when one push carries more than three
+# tags, so a tag can arrive without a run. workflow_dispatch, run from a
+# cove-patches-* branch, names such a tag and produces exactly what its push
+# would have: every job checks out, refuses, builds, smokes, attests and
+# publishes the tag and the commit it names, never the branch the run was
+# started from. The build job resolves both once (outputs tag and sha) and
+# the later jobs use those.
 
 on:
   push:
     tags:
       - 'v*-cove.*'
       - 'ci-test-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'An existing v<upstream>-cove.<n> or ci-test-* tag to build as if it had just been pushed'
+        required: true
+        type: string
 
 permissions: {}
 
@@ -28,24 +42,66 @@ jobs:
         shell: bash
     env:
       SRC: ${{ github.workspace }}/src
-      FORK_SHA: ${{ github.sha }}
-      REF: ${{ github.ref_name }}
       RUN_ID: ${{ github.run_id }}
     outputs:
       version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.checkout.outputs.tag }}
+      sha: ${{ steps.checkout.outputs.sha }}
     steps:
       # Plain git and no token: full history and tags, because build.rs runs
       # `git describe` and the release branch is checked below. A test tag is
       # dropped from the clone: annotated, it would be what `git describe` says.
+      # A push builds the pushed ref at GITHUB_SHA; a dispatch builds its input
+      # tag at the commit that tag names. Both go on as TAG and FORK_SHA (and
+      # REF, for BUILDINFO), never GITHUB_REF_NAME or GITHUB_SHA.
       - name: Check out the tagged commit
+        id: checkout
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
+          refuse() { echo "::error::REFUSING: $*"; exit 64; }
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              tag=$GITHUB_REF_NAME
+              ;;
+            workflow_dispatch)
+              case "$GITHUB_REF" in
+                refs/heads/cove-patches-*) ;;
+                *) refuse "run this from a cove-patches-* branch, not $GITHUB_REF" ;;
+              esac
+              tag=$INPUT_TAG
+              ;;
+            *) refuse "unexpected event $GITHUB_EVENT_NAME" ;;
+          esac
+          case "$tag" in
+            *[!A-Za-z0-9._-]*|'') refuse "tag is not a plain name" ;;
+            v*-cove.*|ci-test-*) ;;
+            *) refuse "tag '$tag' is neither v*-cove.* nor ci-test-*" ;;
+          esac
           git init -q "$SRC"
           cd "$SRC" || exit 1
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch -q --tags origin "$GITHUB_SHA" '+refs/heads/cove-patches-*:refs/remotes/origin/cove-patches-*'
-          git checkout -q --detach "$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            sha=$GITHUB_SHA
+            git fetch -q --tags origin "$sha" '+refs/heads/cove-patches-*:refs/remotes/origin/cove-patches-*'
+          else
+            git fetch -q --tags origin '+refs/heads/cove-patches-*:refs/remotes/origin/cove-patches-*'
+            sha=$(git rev-parse -q --verify "refs/tags/$tag^{commit}") || refuse "no tag '$tag' in ${GITHUB_REPOSITORY}"
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || refuse "'$sha' is not a full commit id"
+          git checkout -q --detach "$sha"
           git tag -l 'ci-test-*' | xargs -r git tag -d >/dev/null
           git log -1 --format='checked out %H'
+          {
+            echo "TAG=$tag"
+            echo "FORK_SHA=$sha"
+            echo "REF=$tag"
+          } >> "$GITHUB_ENV"
+          {
+            echo "tag=$tag"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "event $GITHUB_EVENT_NAME: tag $tag at $sha"
           df -h /
 
       # CI never mints a tag; this only reads the one that was pushed. A release
@@ -57,24 +113,24 @@ jobs:
         run: |
           refuse() { echo "::error::REFUSING: $*"; exit 64; }
           described=$(git describe --dirty)
-          case "$GITHUB_REF_NAME" in
+          case "$TAG" in
             ci-test-*)
               version=$described
               is_release=false
               ;;
             *)
-              tag=$GITHUB_REF_NAME
+              tag=$TAG
               .github/cove-ci/version.sh --is-release "$tag" || refuse "tag '$tag' is not a v<upstream>-cove.<n> release tag"
-              [ "$(git rev-parse "refs/tags/$tag^{commit}")" = "$GITHUB_SHA" ] || refuse "tag '$tag' does not name $GITHUB_SHA"
+              [ "$(git rev-parse "refs/tags/$tag^{commit}")" = "$FORK_SHA" ] || refuse "tag '$tag' does not name $FORK_SHA"
               [ "$(git cat-file -t "refs/tags/$tag")" = tag ] || refuse "tag '$tag' is lightweight; build.rs's plain git describe cannot see it"
               others=0
               while IFS= read -r t; do
                 if [ "$t" != "$tag" ] && .github/cove-ci/version.sh --is-release "$t"; then others=$((others + 1)); fi
-              done < <(git tag --points-at "$GITHUB_SHA")
-              [ "$others" -eq 0 ] || refuse "another release tag points at $GITHUB_SHA"
+              done < <(git tag --points-at "$FORK_SHA")
+              [ "$others" -eq 0 ] || refuse "another release tag points at $FORK_SHA"
               branch=cove-patches-${tag%-cove.*}
               git rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null || refuse "no branch $branch"
-              git merge-base --is-ancestor "$GITHUB_SHA" "refs/remotes/origin/$branch" || refuse "$GITHUB_SHA is not on $branch"
+              git merge-base --is-ancestor "$FORK_SHA" "refs/remotes/origin/$branch" || refuse "$FORK_SHA is not on $branch"
               [ "$described" = "$tag" ] || refuse "git describe says '$described', so the binary would not print '$tag'"
               version=$tag
               is_release=true
@@ -84,7 +140,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "VERSION=$version" >> "$GITHUB_ENV"
           echo "IS_RELEASE=$is_release" >> "$GITHUB_ENV"
-          echo "building $version from $GITHUB_SHA, release=$is_release"
+          echo "building $version from $FORK_SHA, release=$is_release"
 
       # The advisory gate and the refusal of a tree carrying .cargo or
       # rust-toolchain are inside this phase, before any of the tree's code runs.
@@ -144,7 +200,7 @@ jobs:
   # aarch64 is built and attested, not booted (no KVM on hosted arm runners); development use only
   # It also packs this build's checkpoint (step 6) and records its sha256 before
   # waking the previous release's (step 5): the release publishes only that file.
-  # Its attestation proves a release-tag run of this workflow in this repo produced the file and its smoke passed: not that its contents are benign, nor which tag it belongs to.
+  # Its attestation proves a release run of this workflow in this repo (a tag push, or a dispatch naming the tag) produced the file and its smoke passed: not that its contents are benign, nor which tag it belongs to.
   # A regression check, not a gate against a hostile tree: the smoke runs from the
   # tree under test, so its token reads this public repo and nothing more.
   smoke:
@@ -166,13 +222,17 @@ jobs:
       BUSYBOX_SHA256: 6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348
     steps:
       - name: Check out the tagged commit
+        env:
+          FORK_SHA: ${{ needs.build.outputs.sha }}
         run: |
           set -euo pipefail
+          [[ "$FORK_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::the build job gave no commit id"; exit 1; }
           git init -q src
           cd src
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch -q --depth 1 origin "$GITHUB_SHA"
+          git fetch -q --depth 1 origin "$FORK_SHA"
           git checkout -q --detach FETCH_HEAD
+          [ "$(git rev-parse HEAD)" = "$FORK_SHA" ] || { echo "::error::fetched $(git rev-parse HEAD), not $FORK_SHA"; exit 1; }
           git log -1 --format='checked out %H'
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
@@ -322,14 +382,14 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  # The one job holding a write token, and only for a release tag; a ci-test-*
-  # tag never gets here. It runs nothing from the tree and prints nothing from
+  # The one job holding a write token, and only for a release tag, pushed or
+  # named by a dispatch; a ci-test-* tag never gets here. It runs nothing from the tree and prints nothing from
   # the artifact. The attestation comes first, so a Release never exists without one.
   # It also publishes the smoke's checkpoint, attested, for the next release's step 5.
   release:
     name: attest and publish
     needs: [build, list, smoke]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v'))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -343,9 +403,16 @@ jobs:
       - name: Check the tag is the version that was built
         env:
           VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_REF_NAME" != "$VERSION" ]; then
+          case "$GITHUB_EVENT_NAME" in
+            push) asked=$GITHUB_REF_NAME ;;
+            workflow_dispatch) asked=$INPUT_TAG ;;
+            *) echo "::error::unexpected event"; exit 1 ;;
+          esac
+          if [ -z "$TAG" ] || [ "$TAG" != "$asked" ] || [ "$TAG" != "$VERSION" ]; then
             echo "::error::the tag is not the version the build job decided on"
             exit 1
           fi
@@ -412,9 +479,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+          gh release create "$TAG" --verify-tag --title "$TAG" \
             --notes "Both binaries and the smoke checkpoint carry a build provenance attestation: gh attestation verify FILE --repo $GH_REPO" \
             SHA256SUMS cloud-hypervisor-static-x86_64 cloud-hypervisor-static-aarch64 BUILDINFO THIRD-PARTY-NOTICES.txt \
             ../smoke/ch-smoke-checkpoint.tar.gz ../smoke/ch-smoke-checkpoint.tar.gz.sha256
