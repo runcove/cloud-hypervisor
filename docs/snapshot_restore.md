@@ -185,8 +185,19 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   global or per-zone, with `hotplug_method=acpi`), plugged virtio-mem memory
   (see below), KSM (`mergeable=on`), `--pvmemcontrol`, device passthrough
   (`--device`/`--user-device`/`--vdpa`), and snapshot ranges that are not
-  page-aligned single-region extents. Each region's `reserve` policy and the
-  THP policy are re-applied to the mapped region.
+  page-aligned single-region extents or that overlap each other (only a
+  malformed snapshot has them). Each region's `reserve` policy and the THP
+  policy are re-applied to the mapped region.
+- Holes in the snapshot memory file are remapped as private anonymous memory,
+  so a guest touching memory the snapshot never used does not fill the host
+  page cache with zeroes. Only holes of at least 64 KiB (after page-aligning
+  them inward) are remapped, at most 8192 per restore: the holes of all saved
+  ranges compete, and the largest win. Smaller holes and those over the
+  budget stay mapped from the file, as does a whole range when the
+  filesystem cannot report holes (`SEEK_HOLE`). If remapping a hole fails
+  (for example at `vm.max_map_count`), it and every hole not yet remapped
+  stay mapped from the file and the restore continues. The restore logs a
+  summary of the holes found, remapped and skipped.
 - virtio-mem hotplug (`hotplug_method=virtio-mem`, global or per-zone) is
   supported while nothing is plugged: `hotplugged_size` unset or 0 in the
   global config and in every zone. A non-zero `hotplugged_size` falls back to
