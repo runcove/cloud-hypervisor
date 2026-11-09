@@ -723,7 +723,8 @@ pub struct Vmm {
     check_migration_evt: EventFd,
 }
 
-/// Informational text of the migration refusal after a failed on-demand restore.
+/// The message of the Conflict vm.send-migration returns once an on-demand
+/// memory restore has failed.
 pub(crate) const MIGRATION_RESTORE_FAILED_MSG: &str =
     "An on-demand memory restore failed: guest memory is incomplete";
 
