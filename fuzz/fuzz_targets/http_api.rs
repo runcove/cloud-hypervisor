@@ -219,6 +219,8 @@ impl RequestHandler for StubApiRequestHandler {
             state: VmState::Running,
             memory_actual_size: 0,
             device_tree: None,
+            restoring: false,
+            restore_failed: false,
         })
     }
 

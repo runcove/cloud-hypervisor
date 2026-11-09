@@ -670,6 +670,14 @@ components:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/DeviceNode"
+        restoring:
+          type: boolean
+          default: false
+          description: An on-demand memory restore is still filling guest memory
+        restore_failed:
+          type: boolean
+          default: false
+          description: An on-demand memory restore failed and guest memory is incomplete
       description: Virtual Machine information
 
     DeviceNode:
