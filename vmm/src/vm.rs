@@ -3851,7 +3851,8 @@ impl GuestDebuggable for Vm {
 mod tests {
     use super::*;
 
-    // This text is a contract cove matches on; do not reword it.
+    // vm.snapshot returns this text (409) once an on-demand restore has
+    // failed: pinned so that rewording it is a deliberate API change.
     #[test]
     fn test_vm_restore_failed_text() {
         assert_eq!(
