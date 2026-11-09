@@ -54,6 +54,26 @@ pub fn next_data_extent(
     Ok(Some((data_off, hole_off - data_off)))
 }
 
+/// The holes of `file` in `[0, end)`, as `[start, end)` offsets, sorted and
+/// disjoint. Only offsets inside the file count: a read past EOF fails
+/// rather than reading zeroes, so the space past it is not a hole. Errors if
+/// the filesystem does not support `SEEK_HOLE`.
+pub fn file_holes(file: &File, end: u64) -> io::Result<Vec<(u64, u64)>> {
+    let end = end.min(file.metadata()?.len());
+    let mut holes = Vec::new();
+    let mut cursor = 0;
+    while let Some((data_off, data_len)) = next_data_extent(file.as_fd(), cursor, end)? {
+        if data_off > cursor {
+            holes.push((cursor, data_off));
+        }
+        cursor = data_off + data_len;
+    }
+    if end > cursor {
+        holes.push((cursor, end));
+    }
+    Ok(holes)
+}
+
 /// Copy `[src_offset, src_offset+len)` of `src` to `dst` at `dst_offset`,
 /// writing only the populated extents so `dst` keeps its holes. `dst` must
 /// already be sized (e.g. via `set_len`). Returns `Ok(true)` if the region
