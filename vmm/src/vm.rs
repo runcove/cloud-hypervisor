@@ -3441,6 +3441,16 @@ impl GuestDebuggable for Vm {
 mod tests {
     use super::*;
 
+    // vm.snapshot returns this text (409) once an on-demand restore has
+    // failed: pinned so that rewording it is a deliberate API change.
+    #[test]
+    fn test_vm_restore_failed_text() {
+        assert_eq!(
+            Error::VmRestoreFailed.to_string(),
+            "VM on-demand memory restore failed: guest memory is incomplete"
+        );
+    }
+
     fn test_vm_state_transitions(state: VmState) {
         match state {
             VmState::Created => {
