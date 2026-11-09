@@ -1204,10 +1204,13 @@ impl MemoryManager {
         file_path: PathBuf,
         saved_regions: &MemoryRangeTable,
     ) -> Result<(), Error> {
-        // Overlapping saved ranges land here too. The copy writes only each
-        // range's data, in table order: where ranges overlap, a later
-        // range's data replaces an earlier one's, and a later range's hole
-        // leaves the earlier range's data in place.
+        // Overlapping saved ranges land here too. The copy goes in table
+        // order, so where ranges overlap a later range's data replaces an
+        // earlier one's. Where SEEK_DATA works on the snapshot file, the
+        // copy writes only each range's data, and a later range's hole
+        // leaves the earlier range's data in place; where it does not, each
+        // range is copied whole, and a later range's hole overwrites the
+        // earlier range's data with zeroes.
         if !is_restore_cow_compatible(guest_memory, saved_regions) {
             info!("Restore (mode=copyonwrite): guest RAM unsuitable, falling back to copy");
             return Self::copy_saved_regions(guest_memory, file_path, saved_regions);
@@ -4633,9 +4636,14 @@ impl HoleChooser {
         Some(CowHole { range, off, len })
     }
 
-    // Drops every hole kept from `range`.
-    fn forget_range(&mut self, range: usize) {
-        self.heap.retain(|Reverse((_, Reverse(r), _))| *r != range);
+    // Offers every hole `other` kept; calls `on_dropped` with each hole
+    // dropped over the cap, from either chooser.
+    fn merge(&mut self, other: HoleChooser, mut on_dropped: impl FnMut(CowHole)) {
+        for Reverse((len, Reverse(range), Reverse(off))) in other.heap {
+            if let Some(dropped) = self.offer(CowHole { range, off, len }) {
+                on_dropped(dropped);
+            }
+        }
     }
 
     // The holes chosen, by range then offset.
@@ -4647,6 +4655,43 @@ impl HoleChooser {
             .collect();
         chosen.sort_unstable_by_key(|h| (h.range, h.off));
         chosen
+    }
+}
+
+// Offers `chooser` the holes of mapping `range` that `walk` passes to its
+// callback, counting them in `reports`. They compete among themselves while
+// the walk runs, and with the holes of other ranges only once it has
+// succeeded, so a failed walk leaves `chooser` as it was; the range then
+// keeps its whole file mapping.
+fn offer_range_holes(
+    chooser: &mut HoleChooser,
+    reports: &mut [HoleRemapReport],
+    range: usize,
+    limits: HoleRemapLimits,
+    walk: impl FnOnce(&mut dyn FnMut(u64, u64)) -> io::Result<usize>,
+) {
+    let mut walked = HoleChooser::new(limits.max_holes);
+    let report = &mut reports[range];
+    let walk = walk(&mut |off, len| {
+        report.found += 1;
+        if len < limits.min_size {
+            report.skipped_small += 1;
+        } else if walked.offer(CowHole { range, off, len }).is_some() {
+            report.skipped_cap += 1;
+        }
+    });
+    match walk {
+        Ok(extents) => {
+            reports[range].extents = extents;
+            chooser.merge(walked, |dropped| reports[dropped.range].skipped_cap += 1);
+        }
+        Err(e) => {
+            debug!("Restore (mode=copyonwrite): cannot walk snapshot file holes: {e}");
+            reports[range] = HoleRemapReport {
+                fallback: Some("seek_hole_unsupported"),
+                ..Default::default()
+            };
+        }
     }
 }
 
@@ -4704,27 +4749,9 @@ fn remap_cow_holes(
             reports[range].fallback = Some("unaligned");
             continue;
         }
-        let walk = cow_file_holes(file, m.file_offset, m.len as u64, page_size, |off, len| {
-            reports[range].found += 1;
-            if len < limits.min_size {
-                reports[range].skipped_small += 1;
-            } else if let Some(dropped) = chooser.offer(CowHole { range, off, len }) {
-                reports[dropped.range].skipped_cap += 1;
-            }
+        offer_range_holes(&mut chooser, &mut reports, range, limits, |on_hole| {
+            cow_file_holes(file, m.file_offset, m.len as u64, page_size, on_hole)
         });
-        match walk {
-            Ok(extents) => reports[range].extents = extents,
-            Err(e) => {
-                // The whole range keeps its file mapping. Holes of other
-                // ranges its holes pushed over the cap stay counted there.
-                debug!("Restore (mode=copyonwrite): cannot walk snapshot file holes: {e}");
-                chooser.forget_range(range);
-                reports[range] = HoleRemapReport {
-                    fallback: Some("seek_hole_unsupported"),
-                    ..Default::default()
-                };
-            }
-        }
     }
 
     let mut failed = false;
@@ -5967,6 +5994,80 @@ mod tests {
 
         assert_eq!(choose(&holes, 0), (Vec::new(), holes.to_vec()));
         assert_eq!(choose(&[], 4), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn cow_hole_chooser_drops_the_holes_of_a_failed_walk() {
+        let kib = 1 << 10;
+        let limits = HoleRemapLimits {
+            min_size: 64 * kib,
+            max_holes: 3,
+        };
+        let mut chooser = HoleChooser::new(limits.max_holes);
+        let mut reports: Vec<_> = (0..3).map(|_| HoleRemapReport::default()).collect();
+        let walk = |holes: Vec<CowHole>, result: io::Result<usize>| {
+            move |on_hole: &mut dyn FnMut(u64, u64)| {
+                for h in holes {
+                    on_hole(h.off, h.len);
+                }
+                result
+            }
+        };
+
+        let kept = vec![hole(0, 0, 64 * kib), hole(0, MIB, 128 * kib)];
+        offer_range_holes(
+            &mut chooser,
+            &mut reports,
+            0,
+            limits,
+            walk(kept.clone(), Ok(2)),
+        );
+
+        // Range 1's walk fails after finding holes larger than all those
+        // kept, enough to push them over the cap: none of its holes is
+        // chosen, and none of range 0's is dropped for them.
+        let failed = (0..4).map(|i| hole(1, (2 + i) * MIB, 512 * kib)).collect();
+        let err = io::Error::other("walk failed");
+        offer_range_holes(
+            &mut chooser,
+            &mut reports,
+            1,
+            limits,
+            walk(failed, Err(err)),
+        );
+
+        // Range 2's walk succeeds: its holes compete with those kept.
+        let big = hole(2, 8 * MIB, MIB);
+        let small = hole(2, 10 * MIB, 64 * kib);
+        offer_range_holes(
+            &mut chooser,
+            &mut reports,
+            2,
+            limits,
+            walk(vec![big, small], Ok(1)),
+        );
+
+        assert_eq!(chooser.into_chosen(), vec![kept[0], kept[1], big]);
+        assert_eq!(
+            reports,
+            vec![
+                HoleRemapReport {
+                    extents: 2,
+                    found: 2,
+                    ..Default::default()
+                },
+                HoleRemapReport {
+                    fallback: Some("seek_hole_unsupported"),
+                    ..Default::default()
+                },
+                HoleRemapReport {
+                    extents: 1,
+                    found: 2,
+                    skipped_cap: 1,
+                    ..Default::default()
+                },
+            ]
+        );
     }
 
     #[test]
