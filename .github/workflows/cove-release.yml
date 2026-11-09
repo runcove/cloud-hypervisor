@@ -10,12 +10,24 @@ name: cove-release
 # which is how a branch that GitHub does not hold gets a run.
 #
 # GitHub sends no push events at all when one push carries more than three
-# tags, so a tag can arrive without a run. workflow_dispatch, run from a
-# cove-patches-* branch, names such a tag and produces exactly what its push
-# would have: every job checks out, refuses, builds, smokes, attests and
-# publishes the tag and the commit it names, never the branch the run was
-# started from. The build job resolves both once (outputs tag and sha) and
-# the later jobs use those.
+# tags, so a tag can arrive without a run. workflow_dispatch names such a tag
+# and produces exactly what its push would have: every job checks out,
+# refuses, builds, smokes, attests and publishes the tag and the commit it
+# names, never the branch the run was started from. The build job resolves
+# both once (outputs tag and sha) and the later jobs use those. A release tag
+# v<upstream>-cove.<n> is dispatched from its own branch,
+# cove-patches-v<upstream>; a ci-test-* tag from any cove-patches-* branch.
+# The release job checks the tag still names the built commit just before it
+# attests.
+#
+# A dispatched release's attestations carry the branch as their source ref and
+# its head as their source digest, so `gh attestation verify --source-ref
+# refs/tags/<tag>` does not match them; --repo and --signer-workflow without a
+# ref do. BUILDINFO's fork sha is the commit that was built.
+#
+# Dispatch missed release tags in ascending order, each only once the one
+# before it is published: the smoke wakes the checkpoint of the newest lower
+# release that has a GitHub Release.
 
 on:
   push:
@@ -30,6 +42,12 @@ on:
         type: string
 
 permissions: {}
+
+# One run per tag at a time, pushed or dispatched; a second waits rather than
+# cancelling the first. inputs.tag here is only a group name, never a script.
+concurrency:
+  group: cove-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -65,10 +83,6 @@ jobs:
               tag=$GITHUB_REF_NAME
               ;;
             workflow_dispatch)
-              case "$GITHUB_REF" in
-                refs/heads/cove-patches-*) ;;
-                *) refuse "run this from a cove-patches-* branch, not $GITHUB_REF" ;;
-              esac
               tag=$INPUT_TAG
               ;;
             *) refuse "unexpected event $GITHUB_EVENT_NAME" ;;
@@ -78,6 +92,18 @@ jobs:
             v*-cove.*|ci-test-*) ;;
             *) refuse "tag '$tag' is neither v*-cove.* nor ci-test-*" ;;
           esac
+          # A dispatched release tag runs from its own branch's workflow; a
+          # test tag from any patch branch's.
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            case "$tag" in
+              v*) want_ref="refs/heads/cove-patches-${tag%-cove.*}"
+                  [ "$GITHUB_REF" = "$want_ref" ] || refuse "dispatch $tag from $want_ref, not $GITHUB_REF" ;;
+              *) case "$GITHUB_REF" in
+                   refs/heads/cove-patches-*) ;;
+                   *) refuse "dispatch $tag from a cove-patches-* branch, not $GITHUB_REF" ;;
+                 esac ;;
+            esac
+          fi
           git init -q "$SRC"
           cd "$SRC" || exit 1
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
@@ -466,6 +492,26 @@ jobs:
           got=$(sha256sum < ch-smoke-checkpoint.tar.gz); got=${got%% *}
           [[ "$PACKED_SHA256" =~ ^[0-9a-f]{64}$ ]] && [ "$got" = "$PACKED_SHA256" ] \
             || { echo "::error::the checkpoint is not the one the smoke packed before step 5"; exit 1; }
+
+      # Immediately before the attestation: the tag, read fresh from GitHub,
+      # must still name the commit that was built. Attestations are minted
+      # nowhere else in this workflow.
+      - name: Check the tag still names the built commit
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          FORK_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$FORK_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::the build job gave no commit id"; exit 1; }
+          case "$TAG" in *[!A-Za-z0-9._-]*|'') echo "::error::the build job gave no plain tag name"; exit 1 ;; esac
+          # Only the tag and its commit: no tree, nothing from it runs.
+          git init -q "$RUNNER_TEMP/tagcheck"
+          cd "$RUNNER_TEMP/tagcheck"
+          git fetch -q --no-tags --depth 1 --filter=tree:0 "https://github.com/${GITHUB_REPOSITORY}.git" "+refs/tags/$TAG:refs/tags/$TAG"
+          [ "$(git cat-file -t "refs/tags/$TAG")" = tag ] || { echo "::error::tag $TAG is no longer an annotated tag"; exit 1; }
+          now=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}")
+          [ "$now" = "$FORK_SHA" ] || { echo "::error::tag $TAG now names $now, but $FORK_SHA was built"; exit 1; }
+          echo "tag $TAG still names $FORK_SHA"
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
