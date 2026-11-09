@@ -6969,6 +6969,50 @@ mod tests {
         vec.iter().filter(|&&v| v & 1 != 0).count()
     }
 
+    // The /proc/self/pagemap entry of the page at `addr`: bit 63 present,
+    // bit 56 mapped exclusively, bits 0-54 the PFN (zero unless the caller
+    // has CAP_SYS_ADMIN).
+    fn pagemap_entry(addr: u64) -> u64 {
+        use std::os::unix::fs::FileExt;
+
+        let pagemap = File::open("/proc/self/pagemap").unwrap();
+        let mut entry = [0u8; 8];
+        pagemap
+            .read_exact_at(&mut entry, addr / get_page_size() * 8)
+            .unwrap();
+        u64::from_ne_bytes(entry)
+    }
+
+    const PAGEMAP_PRESENT: u64 = 1 << 63;
+    const PAGEMAP_EXCLUSIVE: u64 = 1 << 56;
+    const PAGEMAP_PFN: u64 = (1 << 55) - 1;
+
+    // The pagemap entry of a private anonymous page that was only read, so
+    // that the kernel mapped the zero page there.
+    fn zero_page_pagemap_entry() -> u64 {
+        use std::ptr;
+
+        let page = get_page_size() as usize;
+        // SAFETY: a fresh private anonymous mapping; unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                page,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        // SAFETY: `addr` maps one readable page.
+        assert_eq!(unsafe { ptr::read_volatile(addr.cast::<u8>()) }, 0);
+        let entry = pagemap_entry(addr as u64);
+        // SAFETY: unmaps the mapping made above.
+        unsafe { libc::munmap(addr, page) };
+        entry
+    }
+
     #[test]
     fn uffd_handler_resolves_file_holes_without_reading_them() {
         check_uffd_handler_file_holes(false);
@@ -7021,6 +7065,26 @@ mod tests {
         // A hole page reads zero, and is present and served.
         assert_eq!(gm.read_obj::<u64>(GuestAddress(3 * page)).unwrap(), 0);
         assert!(gpa_present(&gm, 3 * page));
+        assert_eq!(gm.read_obj::<u64>(GuestAddress(4 * page)).unwrap(), 0);
+        // Each hole page read is a page of its own, not the zero page every
+        // process shares: mapped exclusively, which the zero page never is,
+        // and, where the PFNs are visible, at its own PFN.
+        let zero_page = zero_page_pagemap_entry();
+        assert_ne!(zero_page & PAGEMAP_PRESENT, 0);
+        assert_eq!(zero_page & PAGEMAP_EXCLUSIVE, 0);
+        let hole_pages = [3, 4].map(|idx| {
+            let entry =
+                pagemap_entry(gm.get_host_address(GuestAddress(idx * page)).unwrap() as u64);
+            assert_ne!(entry & PAGEMAP_PRESENT, 0, "hole page {idx} not present");
+            assert_ne!(entry & PAGEMAP_EXCLUSIVE, 0, "hole page {idx} shared");
+            entry & PAGEMAP_PFN
+        });
+        if zero_page & PAGEMAP_PFN != 0 {
+            assert!(!hole_pages.contains(&(zero_page & PAGEMAP_PFN)));
+            assert_ne!(hole_pages[0], hole_pages[1]);
+        } else {
+            eprintln!("note: PFNs hidden from this user, checked the exclusive bit only");
+        }
         // A data page reads the file.
         assert_eq!(gm.read_obj::<u8>(GuestAddress(15 * page)).unwrap(), 0xaf);
         // A write to a hole page keeps the guest's data, and leaves its
@@ -7034,7 +7098,7 @@ mod tests {
         release(&gm, 5 * page, page);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * page + 7)).unwrap(), 0);
         handler.stop();
-        for idx in [3, 5, 6, 15] {
+        for idx in [3, 4, 5, 6, 15] {
             assert!(served[0].is_bit_set(idx), "page {idx} not served");
         }
 
@@ -7282,7 +7346,9 @@ mod tests {
     // A first access to a page that is a hole in the snapshot file, or holds
     // zeroes, gets a zeroed page of the VM's own, not the zero page every
     // process shares. restore_by_uffd leaves holes unserved for copy-on-access,
-    // as here, so the handler reads them from the file like any other page.
+    // as here, so the source resolves a hole page with a copied page of zeroes
+    // without reading the file, and reads zeroes written as data from the file
+    // like any other page.
     #[test]
     fn copy_on_access_handler_serves_zero_pages_privately() {
         check_copy_on_access_zero_pages(false);

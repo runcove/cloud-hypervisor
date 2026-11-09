@@ -441,25 +441,6 @@ impl FileUffdMemorySource {
     }
 }
 
-/// Treat `EEXIST` from resolving the fault at `page_addr` as success: the
-/// page was installed concurrently, so wake any blocked threads.
-fn installed_or_raced(
-    result: Result<(), Error>,
-    uffd_fd: BorrowedFd<'_>,
-    page_addr: u64,
-    len: u64,
-) -> Result<(), Error> {
-    match result {
-        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-            if let Err(e) = wake(uffd_fd, page_addr, len) {
-                log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
-            }
-            Ok(())
-        }
-        result => result,
-    }
-}
-
 impl UffdMemorySource for FileUffdMemorySource {
     fn resolve(
         &mut self,
@@ -472,14 +453,9 @@ impl UffdMemorySource for FileUffdMemorySource {
         let file_pos = range.page_source_offset(page_idx);
 
         if self.in_hole(file_pos, range.page_size) {
-            return match zeropage(uffd_fd, page_addr, range.page_size) {
-                // No zero page for this mapping (hugetlbfs): copy zeroes,
-                // which reads nothing from the file either.
-                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                    copy_zeroes(uffd_fd, range, page_idx, &mut self.zeroes)
-                }
-                result => installed_or_raced(result, uffd_fd, page_addr, range.page_size),
-            };
+            // A copied page of zeroes, private to this VM like every page it
+            // touches, rather than the zero page every process shares.
+            return copy_zeroes(uffd_fd, range, page_idx, &mut self.zeroes);
         }
 
         if self.buf.len() < page_size {
@@ -488,8 +464,17 @@ impl UffdMemorySource for FileUffdMemorySource {
         self.file
             .read_exact_at(&mut self.buf[..page_size], file_pos)?;
 
-        let result = copy(uffd_fd, page_addr, self.buf.as_ptr(), range.page_size);
-        installed_or_raced(result, uffd_fd, page_addr, range.page_size)
+        match copy(uffd_fd, page_addr, self.buf.as_ptr(), range.page_size) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                // Installed concurrently. Wake any blocked threads.
+                if let Err(e) = wake(uffd_fd, page_addr, range.page_size) {
+                    log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn requires_uffd_minor_mode(&self) -> bool {
@@ -646,8 +631,17 @@ pub(crate) fn copy_zeroes(
     if zeroes.len() < page_size {
         *zeroes = allocate_zero_buffer(page_size);
     }
-    let result = copy(fd, page_addr, zeroes.as_ptr(), range.page_size);
-    installed_or_raced(result, fd, page_addr, range.page_size)
+    match copy(fd, page_addr, zeroes.as_ptr(), range.page_size) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+            // Installed concurrently. Wake any blocked threads.
+            if let Err(e) = wake(fd, page_addr, range.page_size) {
+                log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Mark a missing page so that an access to it fails instead of resolving a
