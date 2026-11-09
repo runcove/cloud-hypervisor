@@ -60,7 +60,9 @@ use crate::coredump::{
 };
 use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
-use crate::sparse::{copy_region, copy_region_dense, next_data_extent, write_region_sparse};
+use crate::sparse::{
+    copy_region, copy_region_dense, file_holes, next_data_extent, write_region_sparse,
+};
 use crate::uffd::{
     self, FileUffdMemorySource, SocketUffdMemorySource, Uffd, UffdMemorySource, UffdRange,
 };
@@ -1266,8 +1268,28 @@ impl MemoryManager {
         let mut file_offset: u64 = 0;
 
         let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
-        let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(
+        // A fault on a hole of the snapshot file is resolved with zeroes
+        // rather than by reading the hole, which would cache a zero page in
+        // the host page cache for each hole page the guest touches. Without
+        // SEEK_HOLE support every page is read, as before.
+        let saved_len: u64 = saved_regions.ranges().iter().map(|r| r.length).sum();
+        let holes = match file_holes(&snapshot_file, saved_len) {
+            Ok(holes) => {
+                info!(
+                    "UFFD restore: snapshot file holes={} bytes={} resolved without reading the file",
+                    holes.len(),
+                    holes.iter().map(|(start, end)| end - start).sum::<u64>()
+                );
+                holes
+            }
+            Err(e) => {
+                info!("UFFD restore: snapshot file holes unknown, every fault reads the file: {e}");
+                Vec::new()
+            }
+        };
+        let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::with_holes(
             snapshot_file.try_clone().map_err(Error::SnapshotOpen)?,
+            holes,
         ));
 
         let Some(uffd) = self.prepare_uffd(
@@ -6546,6 +6568,190 @@ mod tests {
     #[test]
     fn copy_on_access_handler_copies_only_accessed_pages_shared() {
         check_copy_on_access_handler(true);
+    }
+
+    #[test]
+    fn file_holes_lists_the_holes_inside_the_file() {
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        // Past EOF is not a hole: a read there fails.
+        assert_eq!(
+            file_holes(&file, 10 * MIB).unwrap(),
+            [(2 * MIB, 5 * MIB), (6 * MIB, 7 * MIB)]
+        );
+        assert_eq!(file_holes(&file, 3 * MIB).unwrap(), [(2 * MIB, 3 * MIB)]);
+        assert_eq!(file_holes(&file, 2 * MIB).unwrap(), []);
+    }
+
+    // How many of the pages of `[off, off + len)` of `file` are in the
+    // host page cache.
+    fn cached_file_pages(file: &File, off: u64, len: u64) -> usize {
+        use std::ptr;
+
+        let page = page_size();
+        // SAFETY: maps `len` bytes of `file` read-only; unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                off as libc::off_t,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        let mut vec = vec![0u8; len.div_ceil(page) as usize];
+        // SAFETY: `vec` holds one byte per page of the mapping.
+        let ret = unsafe { libc::mincore(addr, len as usize, vec.as_mut_ptr()) };
+        assert_eq!(ret, 0);
+        // SAFETY: unmaps the mapping made above.
+        unsafe { libc::munmap(addr, len as usize) };
+        vec.iter().filter(|&&v| v & 1 != 0).count()
+    }
+
+    // The /proc/self/pagemap entry of the page at `addr`: bit 63 present,
+    // bit 56 mapped exclusively, bits 0-54 the PFN (zero unless the caller
+    // has CAP_SYS_ADMIN).
+    fn pagemap_entry(addr: u64) -> u64 {
+        use std::os::unix::fs::FileExt;
+
+        let pagemap = File::open("/proc/self/pagemap").unwrap();
+        let mut entry = [0u8; 8];
+        pagemap
+            .read_exact_at(&mut entry, addr / page_size() * 8)
+            .unwrap();
+        u64::from_ne_bytes(entry)
+    }
+
+    const PAGEMAP_PRESENT: u64 = 1 << 63;
+    const PAGEMAP_EXCLUSIVE: u64 = 1 << 56;
+    const PAGEMAP_PFN: u64 = (1 << 55) - 1;
+
+    // The pagemap entry of a private anonymous page that was only read, so
+    // that the kernel mapped the zero page there.
+    fn zero_page_pagemap_entry() -> u64 {
+        use std::ptr;
+
+        let page = page_size() as usize;
+        // SAFETY: a fresh private anonymous mapping; unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                page,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        // SAFETY: `addr` maps one readable page.
+        assert_eq!(unsafe { ptr::read_volatile(addr.cast::<u8>()) }, 0);
+        let entry = pagemap_entry(addr as u64);
+        // SAFETY: unmaps the mapping made above.
+        unsafe { libc::munmap(addr, page) };
+        entry
+    }
+
+    #[test]
+    fn uffd_handler_resolves_file_holes_without_reading_them() {
+        check_uffd_handler_file_holes(false);
+    }
+
+    #[test]
+    fn uffd_handler_resolves_file_holes_without_reading_them_shared() {
+        check_uffd_handler_file_holes(true);
+    }
+
+    fn check_uffd_handler_file_holes(shared: bool) {
+        use std::os::unix::fs::FileExt;
+
+        let page = page_size();
+        // 16 pages: data in page 0 and in page 15, a hole in between.
+        let len = 16 * page;
+        let gm = test_guest_memory(shared, len);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let ranges: Box<[UffdRange]> = uffd.ranges().into();
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(len).unwrap();
+        file.write_all_at(&vec![0xa0; page as usize], 0).unwrap();
+        file.write_all_at(&vec![0xaf; page as usize], 15 * page)
+            .unwrap();
+        file.sync_all().unwrap();
+        let holes = match file_holes(&file, len) {
+            Ok(holes) if holes == [(page, 15 * page)] => holes,
+            other => {
+                eprintln!("skipping: SEEK_HOLE reports {other:x?}, not the hole written");
+                return;
+            }
+        };
+        // SAFETY: drops the clean pages of `file` from the page cache.
+        let ret = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(ret, 0);
+        let handler = TestHandler::spawn_with(
+            uffd,
+            Box::new(FileUffdMemorySource::with_holes(
+                file.try_clone().unwrap(),
+                holes,
+            )),
+            Arc::clone(&served),
+            Arc::new(Mutex::new(())),
+            true,
+        );
+
+        // A hole page reads zero, and is present and served.
+        assert_eq!(gm.read_obj::<u64>(GuestAddress(3 * page)).unwrap(), 0);
+        assert!(gpa_present(&gm, 3 * page));
+        assert_eq!(gm.read_obj::<u64>(GuestAddress(4 * page)).unwrap(), 0);
+        // Each hole page read is a page of its own, not the zero page every
+        // process shares: mapped exclusively, which the zero page never is,
+        // and, where the PFNs are visible, at its own PFN.
+        let zero_page = zero_page_pagemap_entry();
+        assert_ne!(zero_page & PAGEMAP_PRESENT, 0);
+        assert_eq!(zero_page & PAGEMAP_EXCLUSIVE, 0);
+        let hole_pages = [3, 4].map(|idx| {
+            let entry =
+                pagemap_entry(gm.get_host_address(GuestAddress(idx * page)).unwrap() as u64);
+            assert_ne!(entry & PAGEMAP_PRESENT, 0, "hole page {idx} not present");
+            assert_ne!(entry & PAGEMAP_EXCLUSIVE, 0, "hole page {idx} shared");
+            entry & PAGEMAP_PFN
+        });
+        if zero_page & PAGEMAP_PFN != 0 {
+            assert!(!hole_pages.contains(&(zero_page & PAGEMAP_PFN)));
+            assert_ne!(hole_pages[0], hole_pages[1]);
+        } else {
+            eprintln!("note: PFNs hidden from this user, checked the exclusive bit only");
+        }
+        // A data page reads the file.
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(15 * page)).unwrap(), 0xaf);
+        // A write to a hole page keeps the guest's data, and leaves its
+        // neighbours zero.
+        gm.write_obj::<u8>(0x5a, GuestAddress(5 * page + 7))
+            .unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * page + 7)).unwrap(), 0x5a);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * page)).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(6 * page)).unwrap(), 0);
+        // A hole page discarded after a write comes back as zeroes.
+        release(&gm, 5 * page, page);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * page + 7)).unwrap(), 0);
+        handler.stop();
+        for idx in [3, 4, 5, 6, 15] {
+            assert!(served[0].is_bit_set(idx), "page {idx} not served");
+        }
+
+        // None of it went through the file's page cache. Reading the hole
+        // through the file does cache it on this filesystem (unlike tmpfs,
+        // which maps the zero page), or there is nothing to tell apart.
+        assert_eq!(cached_file_pages(&file, page, 14 * page), 0);
+        file.read_exact_at(&mut [0u8; 1], 10 * page).unwrap();
+        if cached_file_pages(&file, page, 14 * page) == 0 {
+            eprintln!("note: reading a hole caches nothing here, so the page cache check is moot");
+        }
     }
 
     fn check_copy_on_access_handler(shared: bool) {
