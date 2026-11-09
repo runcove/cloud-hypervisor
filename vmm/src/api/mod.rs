@@ -220,6 +220,12 @@ pub struct VmInfoResponse {
     pub state: VmState,
     pub memory_actual_size: u64,
     pub device_tree: Option<DeviceTree>,
+    /// An on-demand memory restore is still filling guest RAM.
+    #[serde(default)]
+    pub restoring: bool,
+    /// An on-demand memory restore failed: guest RAM is incomplete for good.
+    #[serde(default)]
+    pub restore_failed: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]

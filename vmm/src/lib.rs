@@ -2623,7 +2623,15 @@ impl RequestHandler for Vmm {
     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
-                if vm.restoring() {
+                // A failed fill keeps refusing, with its own error: pages
+                // never faulted in exist only in the restore source, so a
+                // snapshot would be missing them. Unlike a running fill it
+                // never clears, so a caller must not retry.
+                let (restoring, restore_failed) = vm.restore_status();
+                if restore_failed {
+                    return Err(VmError::VmRestoreFailed);
+                }
+                if restoring {
                     return Err(VmError::VmRestoring);
                 }
                 // Drain console_info so that FDs are not reused
@@ -2853,13 +2861,18 @@ impl RequestHandler for Vmm {
 
         let base_memory_actual_size =
             vm_config.memory.total_size() - vm_config.memory.hotplugged_size();
-        let (memory_actual_size, device_tree) = match &self.vm {
-            VmOwnership::Owned(vm) => (
-                base_memory_actual_size.saturating_sub(vm.balloon_size())
-                    + vm.virtio_mem_plugged_size(),
-                Some(vm.device_tree().lock().unwrap().clone()),
-            ),
-            VmOwnership::None => (base_memory_actual_size, None),
+        let (memory_actual_size, device_tree, restoring, restore_failed) = match &self.vm {
+            VmOwnership::Owned(vm) => {
+                let (restoring, restore_failed) = vm.restore_status();
+                (
+                    base_memory_actual_size.saturating_sub(vm.balloon_size())
+                        + vm.virtio_mem_plugged_size(),
+                    Some(vm.device_tree().lock().unwrap().clone()),
+                    restoring,
+                    restore_failed,
+                )
+            }
+            VmOwnership::None => (base_memory_actual_size, None, false, false),
             VmOwnership::Migration { .. } => unreachable!("migration path is handled above"),
         };
 
@@ -2868,6 +2881,8 @@ impl RequestHandler for Vmm {
             state,
             memory_actual_size,
             device_tree,
+            restoring,
+            restore_failed,
         })
     }
 
@@ -3417,7 +3432,16 @@ impl RequestHandler for Vmm {
     ) -> result::Result<(), MigratableError> {
         match self.vm {
             VmOwnership::Owned(ref vm) => {
-                if vm.restoring() {
+                // A failed fill keeps refusing, with its own message: the
+                // destination would get incomplete guest memory. Unlike a
+                // running fill it never clears, so a caller must not retry.
+                let (restoring, restore_failed) = vm.restore_status();
+                if restore_failed {
+                    return Err(MigratableError::Conflict(anyhow!(
+                        "An on-demand memory restore failed: guest memory is incomplete"
+                    )));
+                }
+                if restoring {
                     return Err(MigratableError::Conflict(anyhow!(
                         "An on-demand memory restore is still in progress"
                     )));
@@ -3761,6 +3785,38 @@ mod tests {
             vmm.vm_create(config),
             Err(VmError::VmAlreadyCreated)
         ));
+    }
+
+    #[test]
+    fn test_vm_info_response_restore_status_serde() {
+        let info = VmInfoResponse {
+            config: create_dummy_vm_config(),
+            state: VmState::Created,
+            memory_actual_size: 0,
+            device_tree: None,
+            restoring: false,
+            restore_failed: true,
+        };
+        let info = serde_json::to_value(&info).unwrap();
+        assert_eq!(info["restoring"], serde_json::Value::Bool(false));
+        assert_eq!(info["restore_failed"], serde_json::Value::Bool(true));
+
+        // A vm.info from a VMM without the fields still parses, as neither.
+        let mut info = info;
+        let fields = info.as_object_mut().unwrap();
+        fields.remove("restoring");
+        fields.remove("restore_failed");
+        let info: VmInfoResponse = serde_json::from_value(info).unwrap();
+        assert!(!info.restoring);
+        assert!(!info.restore_failed);
+
+        let info = VmInfoResponse {
+            restoring: true,
+            ..info
+        };
+        let info = serde_json::to_value(&info).unwrap();
+        assert_eq!(info["restoring"], serde_json::Value::Bool(true));
+        assert_eq!(info["restore_failed"], serde_json::Value::Bool(false));
     }
 
     #[test]

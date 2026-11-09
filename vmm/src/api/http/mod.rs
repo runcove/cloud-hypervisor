@@ -117,6 +117,7 @@ fn api_error_status_code(error: &ApiError) -> StatusCode {
         Some(
             VmError::VmMigrating
             | VmError::VmRestoring
+            | VmError::VmRestoreFailed
             | VmError::DeviceManager(DeviceManagerError::IdentifierNotUnique(_)),
         ) => StatusCode::Conflict,
         Some(VmError::ConfigValidation(e)) => match e {
@@ -618,6 +619,10 @@ mod tests {
         );
         assert_eq!(
             api_error_status_code(&ApiError::VmSnapshot(VmError::VmRestoring)),
+            StatusCode::Conflict
+        );
+        assert_eq!(
+            api_error_status_code(&ApiError::VmSnapshot(VmError::VmRestoreFailed)),
             StatusCode::Conflict
         );
         assert_eq!(
