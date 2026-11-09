@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::cmp::Reverse;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
@@ -4343,8 +4344,27 @@ fn do_mmap_cow_saved_regions(
     saved_regions: &MemoryRangeTable,
     thp: bool,
 ) -> Result<(), Error> {
+    do_mmap_cow_saved_regions_with(
+        guest_memory,
+        memory_file,
+        saved_regions,
+        thp,
+        HoleRemapLimits::default(),
+    )
+    .map(|_| ())
+}
+
+// As `do_mmap_cow_saved_regions`, with the hole remap limits given. Returns
+// the hole remap report of each saved range.
+fn do_mmap_cow_saved_regions_with(
+    guest_memory: &GuestMemoryMmap,
+    memory_file: &File,
+    saved_regions: &MemoryRangeTable,
+    thp: bool,
+    limits: HoleRemapLimits,
+) -> Result<Vec<HoleRemapReport>, Error> {
     let mut file_offset: u64 = 0;
-    let mut summary = HoleRemapReport::default();
+    let mut mappings = Vec::with_capacity(saved_regions.ranges().len());
     for range in saved_regions.ranges() {
         // Zones map with their own reserve setting, so take MAP_NORESERVE
         // from the region actually backing this range rather than from the
@@ -4375,28 +4395,36 @@ fn do_mmap_cow_saved_regions(
         if ret == libc::MAP_FAILED {
             return Err(Error::SnapshotMmap(io::Error::last_os_error()));
         }
-        // Before the THP advice below, so it covers the anonymous ranges too.
-        // The hole budget is the restore's: ranges share it in order.
-        let limits = HoleRemapLimits {
-            max_holes: COW_HOLE_REMAP_MAX_HOLES.saturating_sub(summary.holes),
-            ..Default::default()
-        };
-        let report = remap_cow_holes(
-            ret.cast(),
-            length,
-            memory_file,
+        mappings.push(CowMapping {
+            host: ret.cast(),
+            len: length,
             file_offset,
-            reserve_flag,
-            limits,
-        )?;
+            map_flags: reserve_flag,
+        });
+        file_offset = file_offset.checked_add(range.length).ok_or_else(|| {
+            Error::SnapshotMmap(io::Error::other("snapshot range file offset overflow"))
+        })?;
+    }
+
+    // Before the THP advice below, so it covers the anonymous ranges too.
+    // The holes of every range compete for one budget.
+    let reports = remap_cow_holes(&mappings, memory_file, limits, |addr, len, flags| {
+        // SAFETY: remap_cow_holes passes ranges inside the mappings just
+        // installed above, which nothing uses yet.
+        unsafe { map_anon_fixed(addr, len, flags) }
+    })?;
+
+    let mut summary = HoleRemapReport::default();
+    for ((range, mapping), report) in saved_regions.ranges().iter().zip(&mappings).zip(&reports) {
         debug!(
             "Restore (mode=copyonwrite): range at gpa 0x{:x} (size = 0x{:x}): {}",
             range.gpa, range.length, report,
         );
-        summary.add(&report);
+        summary.add(report);
         if thp {
-            // SAFETY: ret/length name the private mapping just installed above.
-            let adv = unsafe { libc::madvise(ret, length, libc::MADV_HUGEPAGE) };
+            // SAFETY: host/len name the private mapping installed above.
+            let adv =
+                unsafe { libc::madvise(mapping.host.cast(), mapping.len, libc::MADV_HUGEPAGE) };
             if adv != 0 {
                 warn!(
                     "Restore (mode=copyonwrite): MADV_HUGEPAGE failed: {}",
@@ -4404,16 +4432,13 @@ fn do_mmap_cow_saved_regions(
                 );
             }
         }
-        file_offset = file_offset.checked_add(range.length).ok_or_else(|| {
-            Error::SnapshotMmap(io::Error::other("snapshot range file offset overflow"))
-        })?;
     }
     info!(
         "Restore (mode=copyonwrite): snapshot file holes: ranges={} {}",
         saved_regions.ranges().len(),
         summary,
     );
-    Ok(())
+    Ok(reports)
 }
 
 // Holes in the snapshot file shorter than this stay mapped from the file.
@@ -4423,12 +4448,14 @@ fn do_mmap_cow_saved_regions(
 // under 2 MiB cannot hold a transparent huge page, but neither could that
 // part of the file mapping, whose private copies are never collapsed.
 const COW_HOLE_REMAP_MIN_SIZE: u64 = 64 << 10;
-// Most holes remapped in one restore, across all its saved ranges; when there
-// are more, the largest win. Each remapped hole splits the file mapping into
-// up to two more VMAs, so the restore adds at most 2 * 8192 plus one per
-// range, about a quarter of the default vm.max_map_count (65530), leaving
-// the rest to the VMM's own mappings. A golden image's memory file has a few
-// thousand data extents, so about as many holes, which this covers twice over.
+// Most holes remapped in one restore: the holes of all its saved ranges
+// compete, and when there are more the largest win. Each saved range's file
+// mapping can split the guest region around it into two more VMAs, and each
+// remapped hole splits the file mapping around it into two more, so the
+// restore adds at most 2 * 8192 + 2 * ranges VMAs: about a quarter of the
+// default vm.max_map_count (65530), leaving the rest to the VMM's own
+// mappings. A golden image's memory file has a few thousand data extents, so
+// about as many holes, which this covers twice over.
 const COW_HOLE_REMAP_MAX_HOLES: usize = 8192;
 const _: () = assert!(2 * COW_HOLE_REMAP_MAX_HOLES < 65530 / 3);
 
@@ -4447,16 +4474,47 @@ impl Default for HoleRemapLimits {
     }
 }
 
+// One saved range's private file mapping: `len` bytes at `host` of the
+// snapshot file from `file_offset`, mapped with `map_flags` besides
+// MAP_PRIVATE.
+#[derive(Clone, Copy, Debug)]
+struct CowMapping {
+    host: *mut u8,
+    len: usize,
+    file_offset: u64,
+    map_flags: libc::c_int,
+}
+
+// A hole of the snapshot file in the mapping `range`, at absolute file
+// offset `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CowHole {
+    range: usize,
+    off: u64,
+    len: u64,
+}
+
+// What becomes of a hole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoleChoice {
+    Remap,
+    TooSmall,
+    OverCap,
+}
+
+// Every hole found is either remapped or counted under one of the skips:
+// found == holes + skipped_small + skipped_cap + skipped_failed.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct HoleRemapReport {
     // Data extents seen in the window.
     extents: usize,
     // Page-aligned holes found, whatever their size.
     found: usize,
-    // Holes kept mapped from the file as shorter than the minimum size, and
-    // as over the hole budget.
+    // Holes kept mapped from the file as shorter than the minimum size, as
+    // over the hole budget, and as not tried or failed after an mmap failed.
     skipped_small: usize,
     skipped_cap: usize,
+    skipped_failed: usize,
     // Holes, and bytes, now mapped anonymous.
     holes: usize,
     bytes: u64,
@@ -4471,6 +4529,7 @@ impl HoleRemapReport {
         self.found += other.found;
         self.skipped_small += other.skipped_small;
         self.skipped_cap += other.skipped_cap;
+        self.skipped_failed += other.skipped_failed;
         self.holes += other.holes;
         self.bytes += other.bytes;
         self.fallback = self.fallback.or(other.fallback);
@@ -4482,13 +4541,14 @@ impl fmt::Display for HoleRemapReport {
         write!(
             f,
             "extents={} holes_found={} holes_remapped={} bytes_remapped={} \
-             skipped_small={} skipped_cap={} fallback={}",
+             skipped_small={} skipped_cap={} skipped_failed={} fallback={}",
             self.extents,
             self.found,
             self.holes,
             self.bytes,
             self.skipped_small,
             self.skipped_cap,
+            self.skipped_failed,
             self.fallback.unwrap_or("none"),
         )
     }
@@ -4526,109 +4586,147 @@ fn cow_file_holes(
     Ok((extents, holes))
 }
 
-// The `(offset, len)` holes to remap out of `holes`: those of at least
-// `limits.min_size` bytes and, when more than `limits.max_holes` of them
-// remain, the largest (the earlier of equal ones), returned in file order.
-// Also returns how many were left out as too small and as over the cap.
-fn select_cow_holes(
-    holes: Vec<(u64, u64)>,
-    limits: HoleRemapLimits,
-) -> (Vec<(u64, u64)>, usize, usize) {
-    let found = holes.len();
-    let mut picked: Vec<_> = holes
-        .into_iter()
-        .filter(|&(_, len)| len >= limits.min_size)
+// What becomes of each of `holes`: those shorter than `limits.min_size` are
+// too small, and when more than `limits.max_holes` remain, only the largest
+// are remapped, the earlier (by range, then offset) of equal ones.
+fn select_cow_holes(holes: &[CowHole], limits: HoleRemapLimits) -> Vec<HoleChoice> {
+    let mut choices: Vec<_> = holes
+        .iter()
+        .map(|h| {
+            if h.len >= limits.min_size {
+                HoleChoice::Remap
+            } else {
+                HoleChoice::TooSmall
+            }
+        })
         .collect();
-    let skipped_small = found - picked.len();
-    let skipped_cap = picked.len().saturating_sub(limits.max_holes);
-    if skipped_cap > 0 {
-        picked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        picked.truncate(limits.max_holes);
-        picked.sort_unstable_by_key(|&(off, _)| off);
+    let mut big: Vec<usize> = (0..holes.len())
+        .filter(|&i| choices[i] == HoleChoice::Remap)
+        .collect();
+    if big.len() > limits.max_holes {
+        big.sort_by_key(|&i| (Reverse(holes[i].len), holes[i].range, holes[i].off));
+        for &i in &big[limits.max_holes..] {
+            choices[i] = HoleChoice::OverCap;
+        }
     }
-    (picked, skipped_small, skipped_cap)
+    choices
 }
 
-// Replaces the holes of the private file mapping at `host` (`len` bytes of
-// `file` from `file_offset`, mapped with `map_flags` besides MAP_PRIVATE)
-// with private anonymous memory. Both read as zeroes and keep guest writes
-// private, but a guest touching a hole through the file mapping first
-// faults a zero page into the file's page cache and then copies it, so a
-// mostly-empty guest fills the host page cache with zeroes. Keeps the file
-// mapping when SEEK_HOLE is unsupported, and for the holes `limits` leaves
-// out. The mapping must be page-aligned and not yet used by anything.
-fn remap_cow_holes(
-    host: *mut u8,
-    len: usize,
-    file: &File,
-    file_offset: u64,
-    map_flags: libc::c_int,
-    limits: HoleRemapLimits,
-) -> Result<HoleRemapReport, Error> {
-    let mut report = HoleRemapReport::default();
-    let page_size = get_page_size();
-    if !file_offset.is_multiple_of(page_size) || !(host as u64).is_multiple_of(page_size) {
-        report.fallback = Some("unaligned");
-        return Ok(report);
-    }
-    let holes = match cow_file_holes(file, file_offset, len as u64, page_size) {
-        Ok((extents, holes)) => {
-            report.extents = extents;
-            report.found = holes.len();
-            holes
-        }
-        Err(e) => {
-            debug!("Restore (mode=copyonwrite): cannot walk snapshot file holes: {e}");
-            report.fallback = Some("seek_hole_unsupported");
-            return Ok(report);
-        }
+// Maps `len` bytes at `addr` private anonymous, with `map_flags` besides.
+//
+// # Safety
+//
+// `addr..addr + len` must lie in a mapping the caller owns and nothing uses:
+// MAP_FIXED replaces whatever is there.
+unsafe fn map_anon_fixed(addr: *mut u8, len: usize, map_flags: libc::c_int) -> io::Result<()> {
+    // SAFETY: the caller vouches for the range; an anonymous mapping takes
+    // no fd.
+    let ret = unsafe {
+        libc::mmap(
+            addr.cast(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | map_flags,
+            -1,
+            0,
+        )
     };
-    let (holes, skipped_small, skipped_cap) = select_cow_holes(holes, limits);
-    report.skipped_small = skipped_small;
-    report.skipped_cap = skipped_cap;
-    for (off, hole_len) in holes {
-        // SAFETY: the hole lies within [file_offset, file_offset + len), so
-        // addr..addr + hole_len lies within the mapping at host, which the
-        // caller owns and nothing uses yet: MAP_FIXED replaces only it.
-        let addr = unsafe { host.add((off - file_offset) as usize) };
-        // SAFETY: as above; an anonymous mapping takes no fd.
-        let ret = unsafe {
-            libc::mmap(
-                addr.cast(),
-                hole_len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | map_flags,
-                -1,
-                0,
-            )
-        };
-        if ret != libc::MAP_FAILED {
-            report.holes += 1;
-            report.bytes += hole_len;
+    if ret == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+// Replaces the holes of the private file mappings of `file` in `mappings`
+// with private anonymous memory, through `map_anon` (`map_anon_fixed` but in
+// tests). Both read as zeroes and keep guest writes private, but a guest
+// touching a hole through the file mapping first faults a zero page into the
+// file's page cache and then copies it, so a mostly-empty guest fills the
+// host page cache with zeroes. The holes of all mappings compete for
+// `limits`. Keeps a mapping whole when SEEK_HOLE is unsupported, and keeps
+// the holes `limits` leaves out mapped from the file, as well as every hole
+// left once one remap has failed. The mappings must be page-aligned and not
+// yet used by anything. Returns the report of each mapping.
+fn remap_cow_holes(
+    mappings: &[CowMapping],
+    file: &File,
+    limits: HoleRemapLimits,
+    mut map_anon: impl FnMut(*mut u8, usize, libc::c_int) -> io::Result<()>,
+) -> Result<Vec<HoleRemapReport>, Error> {
+    let page_size = get_page_size();
+    let mut reports: Vec<HoleRemapReport> = mappings
+        .iter()
+        .map(|_| HoleRemapReport::default())
+        .collect();
+    let mut holes = Vec::new();
+    for (range, (m, report)) in mappings.iter().zip(reports.iter_mut()).enumerate() {
+        if !m.file_offset.is_multiple_of(page_size) || !(m.host as u64).is_multiple_of(page_size) {
+            report.fallback = Some("unaligned");
             continue;
         }
-        let e = io::Error::last_os_error();
-        // A failed MAP_FIXED may already have unmapped the range: map the
-        // file back over it as it was, so the region stays whole.
-        // SAFETY: same range as above; the fd stays valid for the call.
-        let ret = unsafe {
-            libc::mmap(
-                addr.cast(),
-                hole_len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_FIXED | map_flags,
-                file.as_raw_fd(),
-                off as libc::off_t,
-            )
-        };
-        if ret == libc::MAP_FAILED {
-            return Err(Error::SnapshotMmap(io::Error::last_os_error()));
+        match cow_file_holes(file, m.file_offset, m.len as u64, page_size) {
+            Ok((extents, found)) => {
+                report.extents = extents;
+                report.found = found.len();
+                holes.extend(
+                    found
+                        .into_iter()
+                        .map(|(off, len)| CowHole { range, off, len }),
+                );
+            }
+            Err(e) => {
+                debug!("Restore (mode=copyonwrite): cannot walk snapshot file holes: {e}");
+                report.fallback = Some("seek_hole_unsupported");
+            }
         }
-        warn!("Restore (mode=copyonwrite): remapping a snapshot file hole failed: {e}");
-        report.fallback = Some("mmap_failed");
-        break;
     }
-    Ok(report)
+
+    let choices = select_cow_holes(&holes, limits);
+    let mut failed = false;
+    for (hole, choice) in holes.iter().zip(choices) {
+        let report = &mut reports[hole.range];
+        match choice {
+            HoleChoice::TooSmall => report.skipped_small += 1,
+            HoleChoice::OverCap => report.skipped_cap += 1,
+            HoleChoice::Remap if failed => {
+                report.skipped_failed += 1;
+                report.fallback.get_or_insert("mmap_failed");
+            }
+            HoleChoice::Remap => {
+                let m = &mappings[hole.range];
+                // SAFETY: the hole lies within [file_offset, file_offset +
+                // len) of its mapping, so addr..addr + hole.len lies within
+                // the mapping at m.host.
+                let addr = unsafe { m.host.add((hole.off - m.file_offset) as usize) };
+                let Err(e) = map_anon(addr, hole.len as usize, m.map_flags) else {
+                    report.holes += 1;
+                    report.bytes += hole.len;
+                    continue;
+                };
+                // A failed MAP_FIXED may already have unmapped the range: map
+                // the file back over it as it was, so the region stays whole.
+                // SAFETY: same range as above; the fd stays valid for the call.
+                let ret = unsafe {
+                    libc::mmap(
+                        addr.cast(),
+                        hole.len as usize,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_FIXED | m.map_flags,
+                        file.as_raw_fd(),
+                        hole.off as libc::off_t,
+                    )
+                };
+                if ret == libc::MAP_FAILED {
+                    return Err(Error::SnapshotMmap(io::Error::last_os_error()));
+                }
+                warn!("Restore (mode=copyonwrite): remapping a snapshot file hole failed: {e}");
+                report.skipped_failed += 1;
+                report.fallback = Some("mmap_failed");
+                failed = true;
+            }
+        }
+    }
+    Ok(reports)
 }
 
 #[cfg(test)]
@@ -5367,10 +5465,67 @@ mod tests {
         gm
     }
 
+    fn whole_mapping(gm: &GuestMemoryMmap) -> CowMapping {
+        CowMapping {
+            host: gm.get_host_address(GuestAddress(0)).unwrap(),
+            len: gm.find_region(GuestAddress(0)).unwrap().len() as usize,
+            file_offset: 0,
+            map_flags: libc::MAP_NORESERVE,
+        }
+    }
+
     fn remap_holes(gm: &GuestMemoryMmap, file: &File, limits: HoleRemapLimits) -> HoleRemapReport {
-        let host = gm.get_host_address(GuestAddress(0)).unwrap();
-        let len = gm.find_region(GuestAddress(0)).unwrap().len() as usize;
-        remap_cow_holes(host, len, file, 0, libc::MAP_NORESERVE, limits).unwrap()
+        let mut reports =
+            remap_cow_holes(&[whole_mapping(gm)], file, limits, |addr, len, flags| {
+                // SAFETY: the range lies in gm's mapping, which the test owns.
+                unsafe { map_anon_fixed(addr, len, flags) }
+            })
+            .unwrap();
+        assert_eq!(reports.len(), 1);
+        reports.pop().unwrap()
+    }
+
+    // Every hole found is remapped or counted as skipped for one reason.
+    fn assert_holes_add_up(report: &HoleRemapReport) {
+        assert_eq!(
+            report.found,
+            report.holes + report.skipped_small + report.skipped_cap + report.skipped_failed,
+            "{report}"
+        );
+    }
+
+    // A file of `len` bytes of data with `holes` punched out. None unless
+    // SEEK_HOLE reports exactly those holes, as on a filesystem that tracks
+    // holes at a coarser grain (ZFS) it does not.
+    fn file_with_holes(len: u64, holes: &[(u64, u64)]) -> Option<File> {
+        use std::os::unix::fs::FileExt;
+
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(&vec![0x77u8; len as usize], 0).unwrap();
+        for &(off, hole_len) in holes {
+            // SAFETY: a plain syscall on an fd the test owns.
+            let ret = unsafe {
+                libc::fallocate(
+                    file.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    off as libc::off_t,
+                    hole_len as libc::off_t,
+                )
+            };
+            if ret != 0 {
+                eprintln!(
+                    "skipped: cannot punch holes: {}",
+                    io::Error::last_os_error()
+                );
+                return None;
+            }
+        }
+        let (_, seen) = cow_file_holes(&file, 0, len, page_size()).ok()?;
+        if seen != holes {
+            eprintln!("skipped: SEEK_HOLE reports {seen:x?}, not the holes punched {holes:x?}");
+            return None;
+        }
+        Some(file)
     }
 
     #[test]
@@ -5386,6 +5541,7 @@ mod tests {
                 found: 3,
                 skipped_small: 0,
                 skipped_cap: 0,
+                skipped_failed: 0,
                 holes: 3,
                 bytes: 6 * MIB,
                 fallback: None,
@@ -5405,6 +5561,7 @@ mod tests {
         );
         assert_eq!((report.holes, report.bytes), (0, 0));
         assert_eq!(report.fallback, None);
+        assert_holes_add_up(&report);
         assert!(gpa_is_file_backed(&gm, 2 * MIB));
 
         // Over the budget, the largest holes are remapped and the rest stay
@@ -5418,13 +5575,14 @@ mod tests {
         assert_eq!((report.found, report.skipped_cap), (3, 1));
         assert_eq!((report.holes, report.bytes), (2, 5 * MIB));
         assert_eq!(report.fallback, None);
+        assert_holes_add_up(&report);
         assert!(!gpa_is_file_backed(&gm, 2 * MIB));
         assert!(gpa_is_file_backed(&gm, 6 * MIB));
         assert!(!gpa_is_file_backed(&gm, 8 * MIB));
         assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(6 * MIB)).unwrap(), 0);
 
-        // With no budget left, every hole stays mapped from the file.
+        // With no budget, every hole stays mapped from the file.
         let gm = private_file_mapping(&file, 10 * MIB);
         let limits = HoleRemapLimits {
             max_holes: 0,
@@ -5432,112 +5590,225 @@ mod tests {
         };
         let report = remap_holes(&gm, &file, limits);
         assert_eq!((report.skipped_cap, report.holes), (3, 0));
+        assert_holes_add_up(&report);
         assert!(gpa_is_file_backed(&gm, 2 * MIB));
     }
 
     #[test]
-    fn cow_hole_remap_covers_small_holes() {
-        use std::os::unix::fs::FileExt;
+    fn cow_hole_remap_counts_holes_left_after_a_failure() {
+        let file = sparse_snapshot_file();
+        let gm = private_file_mapping(&file, 10 * MIB);
+        // The second remap fails, without touching the mapping.
+        let mut calls = 0;
+        let mut reports = remap_cow_holes(
+            &[whole_mapping(&gm)],
+            &file,
+            HoleRemapLimits::default(),
+            |addr, len, flags| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(io::Error::other("injected"));
+                }
+                // SAFETY: the range lies in gm's mapping, which the test owns.
+                unsafe { map_anon_fixed(addr, len, flags) }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        let report = reports.pop().unwrap();
+        assert_eq!(
+            report,
+            HoleRemapReport {
+                extents: 3,
+                found: 3,
+                skipped_small: 0,
+                skipped_cap: 0,
+                skipped_failed: 2,
+                holes: 1,
+                bytes: 3 * MIB,
+                fallback: Some("mmap_failed"),
+            }
+        );
+        assert_holes_add_up(&report);
+        // The hole that failed is mapped from the file again, and still
+        // reads zero; the one never tried is untouched.
+        assert!(!gpa_is_file_backed(&gm, 2 * MIB));
+        assert!(gpa_is_file_backed(&gm, 6 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(6 * MIB)).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(7 * MIB)).unwrap(), 0xef);
+        assert!(gpa_is_file_backed(&gm, 8 * MIB));
+    }
 
+    #[test]
+    fn cow_hole_remap_covers_small_holes() {
         let page = page_size();
         let kib = 1 << 10;
-        // Data pages separated, in turn, by a one-page hole and a 64 KiB
-        // one: only the 64 KiB holes are remapped.
-        let file = tempfile::tempfile().unwrap();
+        if page >= 64 * kib {
+            eprintln!("skipped: a one-page hole is not small with {page}-byte pages");
+            return;
+        }
+        // One-page and 64 KiB holes in turn, each after a data page, in a
+        // file that ends in data: only the 64 KiB holes are remapped.
         let mut off = 0;
         let mut small = Vec::new();
         let mut big = Vec::new();
         for i in 0..8 {
-            file.write_all_at(&vec![0x77u8; page as usize], off)
-                .unwrap();
             off += page;
             if i % 2 == 0 {
-                small.push(off);
+                small.push((off, page));
                 off += page;
             } else {
-                big.push(off);
+                big.push((off, 64 * kib));
                 off += 64 * kib;
             }
         }
-        file.write_all_at(&vec![0x77u8; page as usize], off)
-            .unwrap();
         off += page;
+        let mut holes: Vec<_> = small.iter().chain(&big).copied().collect();
+        holes.sort_unstable();
+        let Some(file) = file_with_holes(off, &holes) else {
+            return;
+        };
+        // Mapped past EOF, which adds one more hole.
         let len = off.next_multiple_of(2 * MIB);
 
         let gm = private_file_mapping(&file, len);
         let report = remap_holes(&gm, &file, HoleRemapLimits::default());
-        // With 64 KiB pages a one-page hole is big enough: check the rest.
-        if page < 64 * kib {
-            assert_eq!(report.extents, 9);
-            assert_eq!(report.skipped_small, 4);
-            assert_eq!(report.holes, 4 + 1);
-            assert_eq!(report.bytes, 4 * 64 * kib + (len - off));
-            for &gpa in &small {
-                assert!(gpa_is_file_backed(&gm, gpa));
-            }
-            for &gpa in &big {
-                assert!(!gpa_is_file_backed(&gm, gpa));
-                assert!(!gpa_is_file_backed(&gm, gpa + 64 * kib - 1));
-                assert!(gpa_is_file_backed(&gm, gpa + 64 * kib));
-                assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), 0);
-            }
-        }
+        assert_eq!(report.extents, 9);
+        assert_eq!(report.found, 9);
+        assert_eq!(report.skipped_small, 4);
+        assert_eq!(report.holes, 5);
+        assert_eq!(report.bytes, 4 * 64 * kib + (len - off));
         assert_eq!(report.fallback, None);
+        assert_holes_add_up(&report);
+        for &(gpa, _) in &small {
+            assert!(gpa_is_file_backed(&gm, gpa));
+        }
+        for &(gpa, _) in &big {
+            assert!(!gpa_is_file_backed(&gm, gpa));
+            assert!(!gpa_is_file_backed(&gm, gpa + 64 * kib - 1));
+            assert!(gpa_is_file_backed(&gm, gpa + 64 * kib));
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), 0);
+        }
         assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x77);
     }
 
     #[test]
-    fn cow_hole_selection_honors_min_size_and_prefers_largest() {
+    fn cow_hole_remap_prefers_largest_across_ranges() {
         let kib = 1 << 10;
-        let holes = vec![
-            (0, 4 * kib),
-            (100 * kib, 64 * kib),
-            (300 * kib, 60 * kib),
-            (400 * kib, 128 * kib),
-            (600 * kib, 64 * kib),
-            (800 * kib, 2 * MIB),
+        // Range 0 ([0, 2) MiB) has four 64 KiB holes, range 1 ([2, 4) MiB)
+        // one of 1 MiB. With a budget of four, the 1 MiB hole and the first
+        // three 64 KiB ones are remapped, though range 0 comes first.
+        let small = [128 * kib, 384 * kib, 640 * kib, 896 * kib];
+        let mut holes: Vec<_> = small.iter().map(|&off| (off, 64 * kib)).collect();
+        holes.push((2 * MIB + 512 * kib, MIB));
+        let Some(file) = file_with_holes(4 * MIB, &holes) else {
+            return;
+        };
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (4 * MIB) as usize)]).unwrap();
+        let mut table = MemoryRangeTable::default();
+        for gpa in [0, 2 * MIB] {
+            table.push(MemoryRange {
+                gpa,
+                length: 2 * MIB,
+            });
+        }
+        let limits = HoleRemapLimits {
+            max_holes: 4,
+            ..Default::default()
+        };
+        let reports = do_mmap_cow_saved_regions_with(&gm, &file, &table, false, limits).unwrap();
+        assert_eq!(
+            reports,
+            vec![
+                HoleRemapReport {
+                    extents: 5,
+                    found: 4,
+                    skipped_cap: 1,
+                    holes: 3,
+                    bytes: 3 * 64 * kib,
+                    ..Default::default()
+                },
+                HoleRemapReport {
+                    extents: 2,
+                    found: 1,
+                    holes: 1,
+                    bytes: MIB,
+                    ..Default::default()
+                },
+            ]
+        );
+        for report in &reports {
+            assert_holes_add_up(report);
+        }
+        for &gpa in &small[..3] {
+            assert!(!gpa_is_file_backed(&gm, gpa));
+        }
+        assert!(gpa_is_file_backed(&gm, small[3]));
+        assert!(!gpa_is_file_backed(&gm, 2 * MIB + 512 * kib));
+        assert!(gpa_is_file_backed(&gm, 3 * MIB + 512 * kib));
+        for (gpa, byte) in [
+            (0, 0x77),
+            (small[0], 0),
+            (small[3], 0),
+            (2 * MIB + 512 * kib, 0),
+            (4 * MIB - 1, 0x77),
+        ] {
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), byte);
+        }
+    }
+
+    fn hole(range: usize, off: u64, len: u64) -> CowHole {
+        CowHole { range, off, len }
+    }
+
+    #[test]
+    fn cow_hole_selection_honors_min_size_and_prefers_largest() {
+        use HoleChoice::{OverCap, Remap, TooSmall};
+
+        let kib = 1 << 10;
+        let holes = [
+            hole(0, 0, 4 * kib),
+            hole(0, 100 * kib, 64 * kib),
+            hole(0, 300 * kib, 60 * kib),
+            hole(0, 400 * kib, 128 * kib),
+            hole(0, 600 * kib, 64 * kib),
+            hole(0, 800 * kib, 2 * MIB),
+            hole(1, 0, 64 * kib),
+            hole(1, 100 * kib, 4 * MIB),
         ];
         let limits = HoleRemapLimits::default();
 
-        // Within the cap: every hole of 64 KiB or more, in file order.
-        let (picked, small, cap) = select_cow_holes(holes.clone(), limits);
+        // Within the cap: every hole of 64 KiB or more.
         assert_eq!(
-            picked,
-            vec![
-                (100 * kib, 64 * kib),
-                (400 * kib, 128 * kib),
-                (600 * kib, 64 * kib),
-                (800 * kib, 2 * MIB),
-            ]
+            select_cow_holes(&holes, limits),
+            [TooSmall, Remap, TooSmall, Remap, Remap, Remap, Remap, Remap]
         );
-        assert_eq!((small, cap), (2, 0));
 
-        // Over the cap: the largest, the earlier of equal sizes, still in
-        // file order.
+        // Over the cap: the largest across ranges, the earlier (by range,
+        // then offset) of equal sizes.
         let limits = HoleRemapLimits {
-            max_holes: 3,
+            max_holes: 4,
             ..limits
         };
-        let (picked, small, cap) = select_cow_holes(holes.clone(), limits);
         assert_eq!(
-            picked,
-            vec![
-                (100 * kib, 64 * kib),
-                (400 * kib, 128 * kib),
-                (800 * kib, 2 * MIB),
+            select_cow_holes(&holes, limits),
+            [
+                TooSmall, Remap, TooSmall, Remap, OverCap, Remap, OverCap, Remap
             ]
         );
-        assert_eq!((small, cap), (2, 1));
 
         let limits = HoleRemapLimits {
             max_holes: 0,
             ..limits
         };
-        let (picked, small, cap) = select_cow_holes(holes, limits);
-        assert!(picked.is_empty());
-        assert_eq!((small, cap), (2, 4));
+        assert_eq!(
+            select_cow_holes(&holes, limits),
+            [
+                TooSmall, OverCap, TooSmall, OverCap, OverCap, OverCap, OverCap, OverCap
+            ]
+        );
 
-        assert_eq!(select_cow_holes(Vec::new(), limits), (Vec::new(), 0, 0));
+        assert!(select_cow_holes(&[], limits).is_empty());
     }
 
     #[test]
@@ -5546,11 +5817,10 @@ mod tests {
         // extents with a 64 KiB to 1 MiB hole after each, is covered whole.
         let kib = 1 << 10;
         let holes: Vec<_> = (0..3554u64)
-            .map(|i| (i * 2 * MIB, (64 + (i % 16) * 64) * kib))
+            .map(|i| hole(0, i * 2 * MIB, (64 + (i % 16) * 64) * kib))
             .collect();
-        let (picked, small, cap) = select_cow_holes(holes.clone(), HoleRemapLimits::default());
-        assert_eq!(picked, holes);
-        assert_eq!((small, cap), (0, 0));
+        let choices = select_cow_holes(&holes, HoleRemapLimits::default());
+        assert!(choices.iter().all(|&c| c == HoleChoice::Remap));
     }
 
     #[test]
@@ -5560,19 +5830,19 @@ mod tests {
             extents: 2,
             found: 3,
             skipped_small: 1,
-            skipped_cap: 0,
             holes: 2,
             bytes: MIB,
-            fallback: None,
+            ..Default::default()
         });
         total.add(&HoleRemapReport {
             extents: 1,
-            found: 2,
-            skipped_small: 0,
+            found: 4,
             skipped_cap: 1,
+            skipped_failed: 2,
             holes: 1,
             bytes: 2 * MIB,
             fallback: Some("mmap_failed"),
+            ..Default::default()
         });
         total.add(&HoleRemapReport {
             fallback: Some("unaligned"),
@@ -5582,18 +5852,20 @@ mod tests {
             total,
             HoleRemapReport {
                 extents: 3,
-                found: 5,
+                found: 7,
                 skipped_small: 1,
                 skipped_cap: 1,
+                skipped_failed: 2,
                 holes: 3,
                 bytes: 3 * MIB,
                 fallback: Some("mmap_failed"),
             }
         );
+        assert_holes_add_up(&total);
         assert_eq!(
             total.to_string(),
-            "extents=3 holes_found=5 holes_remapped=3 bytes_remapped=3145728 \
-             skipped_small=1 skipped_cap=1 fallback=mmap_failed"
+            "extents=3 holes_found=7 holes_remapped=3 bytes_remapped=3145728 \
+             skipped_small=1 skipped_cap=1 skipped_failed=2 fallback=mmap_failed"
         );
     }
 
