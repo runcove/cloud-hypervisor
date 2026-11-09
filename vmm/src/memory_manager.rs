@@ -16,7 +16,7 @@ use std::ops::{BitAnd, Not, Sub};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, ffi, panic, process, result, thread, time};
@@ -75,6 +75,10 @@ struct UffdHandler {
     handle: thread::JoinHandle<()>,
     fault_socket_fd: Option<OwnedFd>,
     uffd_registry: Arc<UffdRegistry>,
+    /// Set once the restore can no longer complete: the background fill was
+    /// abandoned after an error, the source failed, or the handler died.
+    /// Demand faults may still be served after an abandoned fill.
+    prefault_failed: Arc<AtomicBool>,
     copy_on_access: Option<CopyOnAccessPages>,
 }
 
@@ -184,6 +188,22 @@ impl PostcopyHandler for UffdRegistry {
     fn postcopy_done_event(&self) -> &EventFd {
         &self.done
     }
+}
+
+/// Whether an on-demand restore is still filling guest RAM, and whether its
+/// fill failed, as `(restoring, restore_failed)`. A copy-on-access restore
+/// never fills, so it is neither; a failed fill is no longer filling.
+fn restore_status(
+    copy_on_access: bool,
+    uffd_registry: &UffdRegistry,
+    prefault_failed: &AtomicBool,
+) -> (bool, bool) {
+    if copy_on_access {
+        return (false, false);
+    }
+    let failed = prefault_failed.load(Ordering::Acquire);
+    let complete = uffd_registry.is_done();
+    (!complete && !failed, failed)
 }
 
 /// How a UFFD handler serves guest memory.
@@ -1663,6 +1683,10 @@ impl MemoryManager {
             ranges,
         });
         let thread_uffd_registry = Arc::clone(&uffd_registry);
+        let prefault_failed = Arc::new(AtomicBool::new(false));
+        let thread_prefault_failed = Arc::clone(&prefault_failed);
+        let panic_uffd_registry = Arc::clone(&uffd_registry);
+        let panic_prefault_failed = Arc::clone(&prefault_failed);
         let handle = thread::Builder::new()
             .name("uffd-handler".to_string())
             .spawn(move || {
@@ -1675,6 +1699,7 @@ impl MemoryManager {
                         served_bitmap,
                         &serve_lock,
                         &ready_tx,
+                        &thread_prefault_failed,
                         background_fetch_pages,
                         private_zeroes,
                     );
@@ -1686,6 +1711,10 @@ impl MemoryManager {
 
                     if let Err(e) = &result {
                         error!("UFFD handler exited with error: {e}");
+                        // A dead handler fills nothing more.
+                        if !thread_uffd_registry.is_done() {
+                            thread_prefault_failed.store(true, Ordering::Release);
+                        }
                         thread_exit_evt.write(1).ok();
                     }
 
@@ -1693,6 +1722,10 @@ impl MemoryManager {
                 }))
                 .map_err(|_| {
                     error!("uffd-handler thread panicked");
+                    // A dead handler fills nothing more.
+                    if !panic_uffd_registry.is_done() {
+                        panic_prefault_failed.store(true, Ordering::Release);
+                    }
                     panic_exit_evt.write(1).ok();
                 })
                 .ok();
@@ -1715,6 +1748,7 @@ impl MemoryManager {
             handle,
             fault_socket_fd,
             uffd_registry,
+            prefault_failed,
             copy_on_access,
         });
 
@@ -1764,13 +1798,38 @@ impl MemoryManager {
         Some(Arc::clone(&uffd_handler.uffd_registry))
     }
 
-    /// True while an on-demand (UFFD) restore is still faulting in guest RAM.
-    /// A copy-on-access restore never completes and is not counted: its
+    /// True while an on-demand (UFFD) restore has not filled guest RAM and
+    /// its handler still serves faults, failed fill or not, so backends added
+    /// now need the registry. A copy-on-access restore is not counted: its
     /// snapshot writer saves the pages not faulted in from the restore source.
+    /// vm.info reports [`Self::restore_status`] instead, which turns
+    /// `restoring` false once the fill fails.
     pub fn restoring(&self) -> bool {
         self.uffd_handler
             .as_ref()
             .is_some_and(|h| h.copy_on_access.is_none() && !h.uffd_registry.is_done())
+    }
+
+    /// `(restoring, restore_failed)` of an on-demand (UFFD) restore, read once.
+    ///
+    /// `restoring` is true while the restore is still faulting in guest RAM.
+    /// A copy-on-access restore never completes and is neither: its snapshot
+    /// writer saves the pages not faulted in from the restore source.
+    /// `restore_failed` is true once the restore can no longer complete: its
+    /// background fill was abandoned after an error, its source failed, or its
+    /// handler exited with an error. Guest RAM is incomplete for good, pages
+    /// not yet faulted in exist only in the restore source, and a failed
+    /// restore is never `restoring`. Callers must use this one result rather
+    /// than reading the two states separately, or a fill that fails in
+    /// between reads as neither.
+    pub fn restore_status(&self) -> (bool, bool) {
+        self.uffd_handler.as_ref().map_or((false, false), |h| {
+            restore_status(
+                h.copy_on_access.is_some(),
+                &h.uffd_registry,
+                &h.prefault_failed,
+            )
+        })
     }
 
     /// True when guest RAM was restored copy-on-access: part of it may still
@@ -1824,6 +1883,7 @@ impl MemoryManager {
         served_bitmap: Arc<[AtomicBitmap]>,
         serve_lock: &Mutex<()>,
         ready_tx: &SyncSender<()>,
+        prefault_failed: &AtomicBool,
         background_fetch_pages: bool,
         private_zeroes: bool,
     ) -> Result<(), io::Error> {
@@ -2123,6 +2183,9 @@ impl MemoryManager {
                         range.page_addr(page_idx)
                     );
                     exit_evt.write(1).ok();
+                    // The restore can no longer complete, with or without a
+                    // background fill.
+                    prefault_failed.store(true, Ordering::Release);
                     prefault_active = false;
                     source_failed = true;
                     Self::uffd_poison_page(fault_uffd.fd(), range, page_idx)?;
@@ -2192,6 +2255,7 @@ impl MemoryManager {
                 Err(e) => {
                     // Give up prefaulting but continue serving demand faults.
                     warn!("UFFD prefault: abandoning background prefault after error: {e}");
+                    prefault_failed.store(true, Ordering::Release);
                     prefault_active = false;
                 }
             }
@@ -6475,7 +6539,9 @@ mod tests {
         // SEEK_HOLE.
         let mut fds = [0; 2];
         // SAFETY: fds has room for the two descriptors pipe writes.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: `fds` has room for the two descriptors pipe() writes.
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(ret, 0);
         // SAFETY: pipe just returned these descriptors, owned by nothing else.
         let (pipe_rd, _pipe_wr) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
         let report = remap_holes(&gm, &pipe_rd, HoleRemapLimits::default());
@@ -6732,6 +6798,7 @@ mod tests {
         stop: EventFd,
         _exit: EventFd,
         registry: Arc<UffdRegistry>,
+        prefault_failed: Arc<AtomicBool>,
         handle: thread::JoinHandle<Result<(), io::Error>>,
     }
 
@@ -6758,6 +6825,26 @@ mod tests {
             serve_lock: Arc<Mutex<()>>,
             private_zeroes: bool,
         ) -> Self {
+            Self::spawn_inner(uffd, source, served, serve_lock, false, private_zeroes)
+        }
+
+        // An on-demand handler that also fills guest RAM in the background.
+        fn spawn_fill(
+            uffd: Uffd,
+            source: Box<dyn UffdMemorySource>,
+            served: Arc<[AtomicBitmap]>,
+        ) -> Self {
+            Self::spawn_inner(uffd, source, served, Arc::new(Mutex::new(())), true, false)
+        }
+
+        fn spawn_inner(
+            uffd: Uffd,
+            source: Box<dyn UffdMemorySource>,
+            served: Arc<[AtomicBitmap]>,
+            serve_lock: Arc<Mutex<()>>,
+            background_fetch_pages: bool,
+            private_zeroes: bool,
+        ) -> Self {
             let stop = EventFd::new(libc::EFD_NONBLOCK).unwrap();
             let exit = EventFd::new(libc::EFD_NONBLOCK).unwrap();
             let registry = Arc::new(UffdRegistry {
@@ -6766,9 +6853,11 @@ mod tests {
                 added_uffd_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
                 done: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
             });
+            let prefault_failed = Arc::new(AtomicBool::new(false));
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let (thread_stop, thread_exit) = (stop.try_clone().unwrap(), exit.try_clone().unwrap());
             let thread_registry = Arc::clone(&registry);
+            let thread_failed = Arc::clone(&prefault_failed);
             let handle = thread::spawn(move || {
                 MemoryManager::uffd_handler_loop(
                     &thread_registry,
@@ -6778,7 +6867,8 @@ mod tests {
                     served,
                     &serve_lock,
                     &ready_tx,
-                    false,
+                    &thread_failed,
+                    background_fetch_pages,
                     private_zeroes,
                 )
             });
@@ -6787,13 +6877,20 @@ mod tests {
                 stop,
                 _exit: exit,
                 registry,
+                prefault_failed,
                 handle,
             }
+        }
+
+        // `(restoring, restore_failed)` as vm.info reports them.
+        fn status(&self, copy_on_access: bool) -> (bool, bool) {
+            restore_status(copy_on_access, &self.registry, &self.prefault_failed)
         }
 
         fn stop(self) {
             assert!(!self.handle.is_finished(), "handler exited on its own");
             assert!(!self.registry.is_done());
+            assert!(!self.prefault_failed.load(Ordering::Acquire));
             self.stop.write(1).unwrap();
             self.handle.join().unwrap().unwrap();
         }
@@ -7076,6 +7173,166 @@ mod tests {
             assert!(gpa_exclusive(&gm, gpa), "page at {gpa:#x} is shared");
         }
 
+        handler.stop();
+    }
+    // A source whose every read fails, as a vanished snapshot file would.
+    struct FailingSource;
+
+    impl UffdMemorySource for FailingSource {
+        fn resolve(&mut self, _: BorrowedFd<'_>, _: &UffdRange, _: u64) -> Result<(), io::Error> {
+            Err(io::Error::other("source gone"))
+        }
+
+        fn requires_uffd_minor_mode(&self) -> bool {
+            false
+        }
+    }
+
+    fn wait_for(cond: impl Fn() -> bool) {
+        let deadline = time::Instant::now() + time::Duration::from_secs(10);
+        while !cond() {
+            assert!(time::Instant::now() < deadline, "condition never met");
+            thread::sleep(time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn restore_status_after_fill_completes() {
+        let page = get_page_size();
+        let gm = test_guest_memory(false, 2 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        let file = snapshot_file(&[(0xd0, page), (0xd1, page)]);
+        let handler = TestHandler::spawn_fill(
+            uffd,
+            Box::new(FileUffdMemorySource::new(file.reopen().unwrap())),
+            served,
+        );
+
+        wait_for(|| handler.registry.is_done());
+        assert_eq!(handler.status(false), (false, false));
+        handler.handle.join().unwrap().unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0xd1);
+    }
+
+    #[test]
+    fn restore_status_while_fill_runs() {
+        let page = get_page_size();
+        let gm = test_guest_memory(false, 2 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        let file = snapshot_file(&[(0xe0, page), (0xe1, page)]);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let handler = TestHandler::spawn_fill(
+            uffd,
+            Box::new(GatedSource {
+                inner: FileUffdMemorySource::new(file.reopen().unwrap()),
+                entered: entered_tx,
+                go: go_rx,
+            }),
+            served,
+        );
+
+        // The fill is held on its first page.
+        entered_rx.recv().unwrap();
+        assert_eq!(handler.status(false), (true, false));
+        go_tx.send(()).unwrap();
+        entered_rx.recv().unwrap();
+        assert_eq!(handler.status(false), (true, false));
+        go_tx.send(()).unwrap();
+
+        handler.handle.join().unwrap().unwrap();
+        let (registry, failed) = (&handler.registry, &handler.prefault_failed);
+        assert_eq!(restore_status(false, registry, failed), (false, false));
+    }
+
+    #[test]
+    fn restore_status_after_fill_fails() {
+        let page = get_page_size();
+        let gm = test_guest_memory(false, 2 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        let handler = TestHandler::spawn_fill(uffd, Box::new(FailingSource), served);
+
+        wait_for(|| handler.prefault_failed.load(Ordering::Acquire));
+        assert_eq!(handler.status(false), (false, true));
+        // The handler goes on serving demand faults after abandoning the fill.
+        assert!(!handler.handle.is_finished());
+        assert!(!handler.registry.is_done());
+        handler.stop.write(1).unwrap();
+        handler.handle.join().unwrap().unwrap();
+        let (registry, failed) = (&handler.registry, &handler.prefault_failed);
+        assert_eq!(restore_status(false, registry, failed), (false, true));
+    }
+
+    #[test]
+    fn restore_status_after_demand_fault_fails() {
+        let page = get_page_size();
+        let gm = test_guest_memory(false, 2 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        // No background fill: only a guest fault reaches the failing source.
+        let handler = TestHandler::spawn_with(
+            uffd,
+            Box::new(FailingSource),
+            served,
+            Arc::new(Mutex::new(())),
+            false,
+        );
+        assert_eq!(handler.status(false), (true, false));
+
+        // Fault the page in the kernel rather than with a load: the page is
+        // poisoned on failure, so a load would deliver SIGBUS to the test
+        // process while a write(2) from it just returns EFAULT.
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe() writes.
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(ret, 0);
+        let addr = gm.get_host_address(GuestAddress(0)).unwrap();
+        // SAFETY: `addr` is a mapped guest page; a failed read of it is the point.
+        let ret = unsafe { libc::write(fds[1], addr as *const libc::c_void, 1) };
+        assert_eq!(ret, -1, "write from a poisoned page must fail");
+        // SAFETY: both descriptors were opened above and are closed once.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        wait_for(|| handler.prefault_failed.load(Ordering::Acquire));
+        assert_eq!(handler.status(false), (false, true));
+        assert!(!handler.registry.is_done());
+        handler.stop.write(1).unwrap();
+        handler.handle.join().unwrap().ok();
+    }
+
+    #[test]
+    fn restore_status_copy_on_access_is_not_restoring() {
+        let page = get_page_size();
+        let gm = test_guest_memory(false, 2 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        let file = snapshot_file(&[(0xf0, page), (0xf1, page)]);
+        let handler = TestHandler::spawn(uffd, file.reopen().unwrap(), served, true);
+
+        assert_eq!(handler.status(true), (false, false));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xf0);
+        assert_eq!(handler.status(true), (false, false));
+        // Even a failed copy-on-access handler reports neither.
+        assert_eq!(
+            restore_status(true, &handler.registry, &AtomicBool::new(true)),
+            (false, false)
+        );
         handler.stop();
     }
 }
