@@ -4255,8 +4255,11 @@ impl Migratable for MemoryManager {
 
 // Reports whether every saved range is page-aligned and lies wholly inside a
 // single plain private-anonymous guest region — the MAP_FIXED overlay
-// preconditions. File-backed regions are rejected: their stale mapping
-// metadata would misdirect a later snapshot or fd consumer.
+// preconditions — and no two overlap. File-backed regions are rejected:
+// their stale mapping metadata would misdirect a later snapshot or fd
+// consumer. Overlapping ranges, which only a malformed snapshot has, are
+// rejected because every range is mapped before any hole is remapped, so
+// one range's hole would replace another's data with zeroes.
 fn is_restore_cow_compatible(
     guest_memory: &GuestMemoryMmap,
     saved_regions: &MemoryRangeTable,
@@ -4287,7 +4290,19 @@ fn is_restore_cow_compatible(
         };
         file_offset = next;
     }
-    true
+    !saved_ranges_overlap_each_other(saved_regions)
+}
+
+// Whether two saved ranges share a guest address. Empty ranges share none.
+fn saved_ranges_overlap_each_other(saved_regions: &MemoryRangeTable) -> bool {
+    let mut spans: Vec<(u64, u64)> = saved_regions
+        .ranges()
+        .iter()
+        .filter(|r| r.length > 0)
+        .map(|r| (r.gpa, r.gpa.saturating_add(r.length)))
+        .collect();
+    spans.sort_unstable();
+    spans.windows(2).any(|w| w[1].0 < w[0].1)
 }
 
 // Whether any saved range lies in a zone's virtio-mem region. A requested
@@ -5292,6 +5307,37 @@ mod tests {
     }
 
     #[test]
+    fn cow_restore_rejects_overlapping_ranges() {
+        let page = page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (4 * page) as usize)]).unwrap();
+        let table = |ranges: &[(u64, u64)]| {
+            let mut table = MemoryRangeTable::default();
+            for &(gpa, length) in ranges {
+                table.push(MemoryRange { gpa, length });
+            }
+            table
+        };
+
+        // Adjacent ranges, in either order, and an empty one are fine.
+        for ok in [
+            table(&[(0, page), (page, 3 * page)]),
+            table(&[(2 * page, 2 * page), (0, 2 * page)]),
+            table(&[(0, 2 * page), (page, 0), (2 * page, page)]),
+        ] {
+            assert!(is_restore_cow_compatible(&gm, &ok));
+        }
+        // Ranges sharing even one page are not, whatever their order.
+        for overlapping in [
+            table(&[(0, 2 * page), (page, 2 * page)]),
+            table(&[(2 * page, 2 * page), (0, 3 * page)]),
+            table(&[(0, 4 * page), (page, page)]),
+            table(&[(page, page), (3 * page, page), (page, page)]),
+        ] {
+            assert!(!is_restore_cow_compatible(&gm, &overlapping));
+        }
+    }
+
+    #[test]
     fn cow_restore_rejects_file_backed_region() {
         let page = page_size();
         let backing = tempfile::tempfile().unwrap();
@@ -5349,7 +5395,8 @@ mod tests {
 
     // A sparse file of 8 MiB: data [0, 2) MiB, a 3 MiB hole, data [5, 6),
     // a 1 MiB hole, data [7, 8). Mapped over 10 MiB, [8, 10) lies past EOF.
-    fn sparse_snapshot_file() -> File {
+    // None unless SEEK_HOLE reports exactly those holes.
+    fn sparse_snapshot_file() -> Option<File> {
         use std::os::unix::fs::FileExt;
 
         let file = tempfile::tempfile().unwrap();
@@ -5361,7 +5408,13 @@ mod tests {
         ] {
             file.write_all_at(&vec![byte; len as usize], off).unwrap();
         }
-        file
+        let holes = [(2 * MIB, 3 * MIB), (6 * MIB, MIB)];
+        let (_, seen) = cow_file_holes(&file, 0, 8 * MIB, page_size()).ok()?;
+        if seen != holes {
+            eprintln!("skipped: SEEK_HOLE reports {seen:x?}, not the holes written {holes:x?}");
+            return None;
+        }
+        Some(file)
     }
 
     // Whether the VMA holding `gpa` carries `flag` in its smaps VmFlags.
@@ -5387,7 +5440,9 @@ mod tests {
     fn cow_restore_maps_file_holes_anonymous() {
         use std::os::unix::fs::FileExt;
 
-        let file = sparse_snapshot_file();
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (10 * MIB) as usize)]).unwrap();
         let mut table = MemoryRangeTable::default();
         table.push(MemoryRange {
@@ -5530,7 +5585,9 @@ mod tests {
 
     #[test]
     fn cow_hole_remap_reports_and_honors_limits() {
-        let file = sparse_snapshot_file();
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
 
         let gm = private_file_mapping(&file, 10 * MIB);
         let report = remap_holes(&gm, &file, HoleRemapLimits::default());
@@ -5596,7 +5653,9 @@ mod tests {
 
     #[test]
     fn cow_hole_remap_counts_holes_left_after_a_failure() {
-        let file = sparse_snapshot_file();
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
         let gm = private_file_mapping(&file, 10 * MIB);
         // The second remap fails, without touching the mapping.
         let mut calls = 0;
@@ -5637,6 +5696,83 @@ mod tests {
         assert_eq!(gm.read_obj::<u8>(GuestAddress(6 * MIB)).unwrap(), 0);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(7 * MIB)).unwrap(), 0xef);
         assert!(gpa_is_file_backed(&gm, 8 * MIB));
+    }
+
+    #[test]
+    fn cow_hole_remap_failure_skips_the_holes_of_later_ranges() {
+        let kib = 1 << 10;
+        // Range 0 ([0, 2) MiB) and range 1 ([2, 4) MiB) have two holes each;
+        // the second remap, range 0's last, fails, so range 1's are skipped.
+        let holes = [
+            (256 * kib, 64 * kib),
+            (MIB, 128 * kib),
+            (2 * MIB + 256 * kib, 64 * kib),
+            (3 * MIB, 256 * kib),
+        ];
+        let Some(file) = file_with_holes(4 * MIB, &holes) else {
+            return;
+        };
+        let gm = private_file_mapping(&file, 4 * MIB);
+        let whole = whole_mapping(&gm);
+        let mappings = [
+            CowMapping {
+                len: (2 * MIB) as usize,
+                ..whole
+            },
+            CowMapping {
+                // SAFETY: 2 MiB lies inside gm's 4 MiB mapping.
+                host: unsafe { whole.host.add((2 * MIB) as usize) },
+                len: (2 * MIB) as usize,
+                file_offset: 2 * MIB,
+                ..whole
+            },
+        ];
+        let mut calls = 0;
+        let reports = remap_cow_holes(
+            &mappings,
+            &file,
+            HoleRemapLimits::default(),
+            |addr, len, flags| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(io::Error::other("injected"));
+                }
+                // SAFETY: the range lies in gm's mapping, which the test owns.
+                unsafe { map_anon_fixed(addr, len, flags) }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            reports,
+            vec![
+                HoleRemapReport {
+                    extents: 3,
+                    found: 2,
+                    skipped_failed: 1,
+                    holes: 1,
+                    bytes: 64 * kib,
+                    fallback: Some("mmap_failed"),
+                    ..Default::default()
+                },
+                HoleRemapReport {
+                    extents: 3,
+                    found: 2,
+                    skipped_failed: 2,
+                    fallback: Some("mmap_failed"),
+                    ..Default::default()
+                },
+            ]
+        );
+        for report in &reports {
+            assert_holes_add_up(report);
+        }
+        assert!(!gpa_is_file_backed(&gm, 256 * kib));
+        for &(gpa, _) in &holes[1..] {
+            assert!(gpa_is_file_backed(&gm, gpa));
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), 0);
+        }
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(2 * MIB)).unwrap(), 0x77);
     }
 
     #[test]
@@ -5871,7 +6007,9 @@ mod tests {
 
     #[test]
     fn cow_hole_remap_keeps_mapping_without_seek_hole() {
-        let file = sparse_snapshot_file();
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
         let gm = private_file_mapping(&file, 8 * MIB);
         // A pipe cannot seek, so its walk fails as on a filesystem without
         // SEEK_HOLE.
