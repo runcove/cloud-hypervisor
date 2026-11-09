@@ -723,6 +723,10 @@ pub struct Vmm {
     check_migration_evt: EventFd,
 }
 
+/// Informational text of the migration refusal after a failed on-demand restore.
+pub(crate) const MIGRATION_RESTORE_FAILED_MSG: &str =
+    "An on-demand memory restore failed: guest memory is incomplete";
+
 /// Time before aborting on the page fault connection.
 const FAULT_CONNECTION_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -3438,7 +3442,7 @@ impl RequestHandler for Vmm {
                 let (restoring, restore_failed) = vm.restore_status();
                 if restore_failed {
                     return Err(MigratableError::Conflict(anyhow!(
-                        "An on-demand memory restore failed: guest memory is incomplete"
+                        "{MIGRATION_RESTORE_FAILED_MSG}"
                     )));
                 }
                 if restoring {
@@ -3665,6 +3669,14 @@ mod tests {
         CpusConfig, DeviceConfig, HotplugMethod, MemoryConfig, MemoryZoneConfig, PayloadConfig,
         PciDeviceCommonConfig, PlatformConfig, RngConfig, SerialConfig,
     };
+
+    #[test]
+    fn test_migration_restore_failed_text() {
+        assert_eq!(
+            MIGRATION_RESTORE_FAILED_MSG,
+            "An on-demand memory restore failed: guest memory is incomplete"
+        );
+    }
 
     fn create_dummy_vmm() -> Vmm {
         Vmm::new(

@@ -3851,6 +3851,15 @@ impl GuestDebuggable for Vm {
 mod tests {
     use super::*;
 
+    // This text is a contract cove matches on; do not reword it.
+    #[test]
+    fn test_vm_restore_failed_text() {
+        assert_eq!(
+            Error::VmRestoreFailed.to_string(),
+            "VM on-demand memory restore failed: guest memory is incomplete"
+        );
+    }
+
     fn test_vm_state_transitions(state: VmState) {
         match state {
             VmState::Created => {
