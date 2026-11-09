@@ -199,6 +199,9 @@ pub enum Error {
     #[error("VM on-demand memory restore is still in progress")]
     VmRestoring,
 
+    #[error("VM on-demand memory restore failed: guest memory is incomplete")]
+    VmRestoreFailed,
+
     #[error("Cannot clone EventFd")]
     EventFdClone(#[source] io::Error),
 
@@ -3239,8 +3242,10 @@ impl Vm {
         self.memory_manager.lock().unwrap().guest_memory()
     }
 
-    pub fn restoring(&self) -> bool {
-        self.memory_manager.lock().unwrap().restoring()
+    /// `(restoring, restore_failed)`, read under one lock and one load of
+    /// each flag: see [`MemoryManager::restore_status`].
+    pub fn restore_status(&self) -> (bool, bool) {
+        self.memory_manager.lock().unwrap().restore_status()
     }
 
     pub fn copy_on_access(&self) -> bool {
@@ -3836,6 +3841,15 @@ impl GuestDebuggable for Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // This text is a contract cove matches on; do not reword it.
+    #[test]
+    fn test_vm_restore_failed_text() {
+        assert_eq!(
+            Error::VmRestoreFailed.to_string(),
+            "VM on-demand memory restore failed: guest memory is incomplete"
+        );
+    }
 
     fn test_vm_state_transitions(state: VmState) {
         match state {
