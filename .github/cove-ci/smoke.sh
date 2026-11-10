@@ -36,9 +36,24 @@
 #      heartbeat must reach two beats past the number it was saved at, with no
 #      reboot and 2 disk queues. That proves this binary still restores what
 #      the last release saved. With no previous.tar.gz the step says SKIPPED
-#      and why, and proves nothing: there was no earlier checkpoint to wake;(15)
+#      and why, and proves nothing: there was no earlier checkpoint to wake.
+#      It also says SKIPPED, exit 0, when the wake fails because Cloud
+#      Hypervisor refused the checkpoint for CPUID: its log says "Error
+#      checking cpu feature compatibility" / "Detected incompatible CPUID
+#      entry", because the host that saved it had CPU features this one lacks
+#      (a hosted runner's CPU model cannot be chosen, and CH v54 has no
+#      portable CPU profile). That skip names the missing flags (from the
+#      checkpoint's HOST_CPU_FLAGS against this host's /proc/cpuinfo) or,
+#      for a checkpoint without HOST_CPU_FLAGS, CH's CPUID lines, prints a
+#      ::warning:: line, and says it is not a pass: it proves nothing about
+#      waking that checkpoint. The forge's ch-smoke, which saves and wakes on
+#      one host, is the cross-version gate that cannot skip this way. Any
+#      other failure of the wake fails the step;                           (15)
 #   6. PACK, run right after step 2, before anything is woken: the step 2
-#      checkpoint (snapshot + the disk as it was at that moment + CHECKPOINT) becomes OUT/ch-smoke-checkpoint.tar.gz and
+#      checkpoint (snapshot + the disk as it was at that moment + CHECKPOINT
+#      + HOST_CPU_FLAGS, this host's /proc/cpuinfo flags line, so the next
+#      release can say what a CPUID refusal lacked) becomes
+#      OUT/ch-smoke-checkpoint.tar.gz and
 #      OUT/ch-smoke-checkpoint.tar.gz.sha256, which the release publishes for
 #      the next release's step 5. This script never publishes anything.    (16)
 #
@@ -66,9 +81,12 @@
 #                         Hypervisor's _disable_io_uring=on puts the disk on
 #                         another backend, so step 1's ring check must fail.
 #
-# Exit: 0 every step passed (step 5 may say SKIPPED); 10-16 the step above
-#       failed, naming what it saw; 93 could not run safely (an argument or
-#       input missing or malformed, no usable KVM device, a work or out
+# Exit: 0 every step passed, or step 5 said SKIPPED (no previous checkpoint,
+#       or CH refused it for CPUID: this runner's CPU lacks features the
+#       saving host had; the output says which, and that it is not a pass);
+#       10-16 the step above failed, naming what it saw (15: any wake
+#       failure other than that CPUID refusal); 93 could not run safely (an
+#       argument or input missing or malformed, no usable KVM device, a work or out
 #       directory that is not empty, a previous checkpoint that is not what
 #       step 6 writes, a tool missing).
 set -euo pipefail
@@ -77,14 +95,63 @@ export LC_ALL=C
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOL="$HERE/smoke_tool.py"
 STEP=preflight
+# Set by step 5 to the unpacked checkpoint it wakes; while set, a step 5
+# failure is first checked for Cloud Hypervisor's CPUID refusal.
+WAKE_CKPT=""
+# Where this host's CPU flags are read; only the tests change it.
+CPUINFO=/proc/cpuinfo
+# What Cloud Hypervisor logs when a snapshot's CPUID is not a subset of this
+# host's (vmm/src/lib.rs's context, arch/src/x86_64/mod.rs's error! per entry).
+CPUID_REFUSAL_RE='Error checking cpu feature compatibility|Detected incompatible CPUID entry'
 
 cannot() { echo "ch-smoke: CANNOT RUN -- $* (exit 93)" >&2; exit 93; }
+say() { echo "ch-smoke: $*"; }
+
+# cpu_flags FILE: the words of FILE's first `flags :` line (a /proc/cpuinfo, or
+# a checkpoint's HOST_CPU_FLAGS), one per line, sorted. Only [a-z0-9_] words:
+# HOST_CPU_FLAGS comes from a published release.
+cpu_flags() {
+  { sed -n '/^flags[[:space:]]*:/{s/^[^:]*://;p;q;}' "$1" 2>/dev/null \
+      | tr -s '[:blank:]' '\n' | grep -E '^[a-z0-9_]{1,64}$' | LC_ALL=C sort -u; } || true
+}
+
+# cpuid_refused WORKDIR CHECKPOINTDIR: true when the wake's VMM (d) logged
+# Cloud Hypervisor's CPUID refusal. Prints what this host lacks: the flags in
+# CHECKPOINTDIR/HOST_CPU_FLAGS missing from this host's, or, when there is no
+# such file or no flag differs (CPUID holds more than /proc/cpuinfo names),
+# CH's own CPUID lines, printable characters only, on one line.
+cpuid_refused() {
+  local work=$1 ckpt=$2 lines missing=""
+  lines=$(cat "$work/d.chlog" "$work/d.out" 2>/dev/null | tr -d '\r' | grep -a -E "$CPUID_REFUSAL_RE" || true)
+  [ -n "$lines" ] || return 1
+  if [ -f "$ckpt/HOST_CPU_FLAGS" ] && [ ! -L "$ckpt/HOST_CPU_FLAGS" ]; then
+    missing=$(comm -23 <(cpu_flags "$ckpt/HOST_CPU_FLAGS") <(cpu_flags "$CPUINFO") | tr '\n' ' ')
+    missing=${missing% }
+  fi
+  if [ -n "$missing" ]; then
+    echo "$missing (in the checkpoint's HOST_CPU_FLAGS, not in this host's)"
+  else
+    lines=$({ grep -a -o 'Detected incompatible CPUID entry.*' <<<"$lines" || echo "$lines"; } \
+      | head -n 16 | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-3000)
+    echo "${lines% }"
+  fi
+}
+
 fail() {
-  local code=$1; shift
+  local code=$1 missing; shift
+  if [ "$code" = 15 ] && [ -n "$WAKE_CKPT" ] && missing=$(cpuid_refused "$WORK" "$WAKE_CKPT"); then
+    say "step 5 (previous release's checkpoint) SKIPPED -- this runner's CPU lacks features the checkpoint was saved with: $missing; this is not a pass"
+    say "step 5: the wake of ${PREV_VERSION:-the previous release}'s checkpoint ended with: $*"
+    echo "::warning title=ch-smoke step 5 skipped::this runner's CPU lacks features ${PREV_VERSION:-the previous release}'s checkpoint was saved with; step 5 is not a pass"
+    say "DONE version=${VERSION:-} previous=${PREV_VERSION:-none} mode=${MODE:-} step5=skipped-cpuid (not PASSED)"
+    exit 0
+  fi
   echo "ch-smoke: FAILED at step $STEP -- $* (exit $code)" >&2
   exit "$code"
 }
-say() { echo "ch-smoke: $*"; }
+
+# Sourced (the tests): the helpers above only.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 IN="" WORK="" OUT="" MODE=all
 while [ $# -gt 0 ]; do
@@ -110,7 +177,7 @@ SETTLE=${SMOKE_SETTLE:-3};                  num SMOKE_SETTLE "$SETTLE"
 KVM=${SMOKE_KVM_DEVICE:-/dev/kvm}
 DISK_OPTS=${SMOKE_DISK_OPTS:-}
 
-for t in python3 sha256sum cp grep sed tail awk; do
+for t in python3 sha256sum cp grep sed tail awk comm sort tr; do
   command -v "$t" >/dev/null 2>&1 || cannot "no $t on PATH"
 done
 [ -f "$TOOL" ] || cannot "no smoke_tool.py beside this script"
@@ -341,8 +408,11 @@ passed 2 "snapshot and restore" "saved at heartbeat $HB_SAVED, restored to $(hb_
 
 # --- 6. pack this build's checkpoint, before step 5 wakes anything -------------
 STEP="6 (pack)"
+# Where it was made: a later wake refused for CPUID can then name what it lacks.
+grep -m1 '^flags' "$CPUINFO" > "$WORK/HOST_CPU_FLAGS" || fail 16 "no flags line in $CPUINFO"
 python3 "$TOOL" pack "$OUT" --snapshot "$WORK/snap1" --disk "$WORK/snap1-disk.raw" --version "$VERSION" \
   --hb "$HB_SAVED" --kernel-sha256 "$KSHA" --initramfs-sha256 "$ISHA" \
+  --host-cpu-flags "$WORK/HOST_CPU_FLAGS" \
   || fail 16 "the checkpoint could not be packed"
 passed 6 pack "$(cut -d' ' -f1 "$OUT/ch-smoke-checkpoint.tar.gz.sha256")"
 
@@ -408,11 +478,14 @@ elif [ -f "$PREVIOUS" ]; then
   PREV_VERSION=$(python3 "$TOOL" info "$P/CHECKPOINT" version) || cannot "the previous checkpoint has no version"
   PREV_HB=$(python3 "$TOOL" info "$P/CHECKPOINT" hb) || cannot "the previous checkpoint has no heartbeat"
   [ "$PREV_VERSION" != "$VERSION" ] || cannot "the previous checkpoint is this build's own ($VERSION)"
+  # From here a failure is first checked for CH's CPUID refusal (fail above).
+  WAKE_CKPT=$P
   restore d "$P/snapshot" "$P/disk.raw" 15
   wait_hb d "$((PREV_HB + 1))" 15 "waking $PREV_VERSION's checkpoint"
   queues_ok d 15 "waking $PREV_VERSION's checkpoint"
   not_rebooted d 15 "waking $PREV_VERSION's checkpoint"
   stop d
+  WAKE_CKPT=""
   passed 5 "previous release's checkpoint" "$PREV_VERSION's, saved at heartbeat $PREV_HB, woke at $(hb_of d)"
 else
   say "step 5 previous release's checkpoint: SKIPPED (no $PREVIOUS: no earlier release published a checkpoint to wake)"
