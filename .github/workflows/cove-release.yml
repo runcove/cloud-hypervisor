@@ -394,11 +394,22 @@ jobs:
           [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "the pack wrote no single sha256 line"; exit 1; }
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
 
+      # A wake Cloud Hypervisor refused for CPUID (the runner that saved the
+      # checkpoint had CPU features this one lacks) ends step 5 SKIPPED, exit 0,
+      # not passed: smoke.sh's own ::warning:: is inert under stop-commands, so
+      # this step raises a fixed one once commands run again. The forge's
+      # ch-smoke, which saves and wakes on one host, remains the gate.
       - name: Wake the previous release's checkpoint (steps 0 and 5)
         run: |
           set -euo pipefail
-          echo "::stop-commands::$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-          bash src/.github/cove-ci/smoke.sh --wake-only --in "$RUNNER_TEMP/smoke/in" --work "$RUNNER_TEMP/smoke/work"
+          tok=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "::stop-commands::$tok"
+          bash src/.github/cove-ci/smoke.sh --wake-only --in "$RUNNER_TEMP/smoke/in" --work "$RUNNER_TEMP/smoke/work" \
+            | tee "$RUNNER_TEMP/smoke/wake.log"
+          echo "::$tok::"
+          if grep -q "^ch-smoke: step 5 (previous release's checkpoint) SKIPPED -- this runner's CPU lacks features" "$RUNNER_TEMP/smoke/wake.log"; then
+            echo "::warning title=step 5 skipped, not passed::this runner's CPU lacks features the previous release's checkpoint was saved with, so it was not woken here; see the step log for the missing flags"
+          fi
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
