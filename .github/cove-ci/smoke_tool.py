@@ -29,10 +29,11 @@ Subcommands:
       shape this expects (one disk, a serial and a console section).
 
   pack OUTDIR --snapshot DIR --disk FILE --version V --hb N
-              --kernel-sha256 X --initramfs-sha256 Y
+              --kernel-sha256 X --initramfs-sha256 Y [--host-cpu-flags FILE]
       Writes OUTDIR/ch-smoke-checkpoint.tar.gz (checkpoint/CHECKPOINT,
-      checkpoint/disk.raw, checkpoint/snapshot/*) and
-      OUTDIR/ch-smoke-checkpoint.tar.gz.sha256 (one sha256sum line).
+      checkpoint/disk.raw, checkpoint/snapshot/*, and with --host-cpu-flags
+      checkpoint/HOST_CPU_FLAGS: the saving host's /proc/cpuinfo flags line)
+      and OUTDIR/ch-smoke-checkpoint.tar.gz.sha256 (one sha256sum line).
 
   unpack TARBALL DEST
       Extracts a checkpoint written by pack into DEST/checkpoint. The tarball
@@ -68,7 +69,7 @@ VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9._-]+)?$")
 # A checkpoint is guest RAM (256 MiB) plus a 64 MiB disk and a few small files;
 # 4 GiB leaves room for a bigger guest and stops a runaway one.
 SIZE_CAP = 4 << 30
-# pack writes 5 members plus the snapshot's files, a handful.
+# pack writes 5 or 6 members plus the snapshot's files, a handful.
 MEMBER_CAP = 64
 
 # The guest's /init. busybox sh, no network, no modules (the kernel has none).
@@ -322,6 +323,8 @@ def cmd_pack(a):
                 _add(tar, "checkpoint/CHECKPOINT",
                      data=checkpoint_text(a.version, a.hb, a.kernel_sha256, a.initramfs_sha256).encode())
                 _add(tar, "checkpoint/disk.raw", path=a.disk)
+                if a.host_cpu_flags:
+                    _add(tar, "checkpoint/HOST_CPU_FLAGS", path=a.host_cpu_flags)
                 _add(tar, "checkpoint/snapshot")
                 for n in names:
                     _add(tar, f"checkpoint/snapshot/{n}", path=os.path.join(a.snapshot, n))
@@ -421,6 +424,7 @@ def main(argv=None):
     s.add_argument("outdir")
     for k in ("--snapshot", "--disk", "--version", "--hb", "--kernel-sha256", "--initramfs-sha256"):
         s.add_argument(k, required=True)
+    s.add_argument("--host-cpu-flags")
     s = sub.add_parser("unpack")
     s.add_argument("tarball")
     s.add_argument("dest")
