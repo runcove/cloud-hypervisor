@@ -44,11 +44,15 @@
 #      (a hosted runner's CPU model cannot be chosen, and CH v54 has no
 #      portable CPU profile). That skip names the missing flags (from the
 #      checkpoint's HOST_CPU_FLAGS against this host's /proc/cpuinfo) or,
-#      for a checkpoint without HOST_CPU_FLAGS, CH's CPUID lines, prints a
-#      ::warning:: line, and says it is not a pass: it proves nothing about
-#      waking that checkpoint. The forge's ch-smoke, which saves and wakes on
-#      one host, is the cross-version gate that cannot skip this way. Any
-#      other failure of the wake fails the step;                           (15)
+#      for a checkpoint without HOST_CPU_FLAGS (an older release's), CH's
+#      CPUID lines; it prints a ::warning:: line and the same tail of the
+#      VMM logs a failure prints, and says it is not a pass: it proves
+#      nothing about waking that checkpoint. When the checkpoint does carry
+#      HOST_CPU_FLAGS and none of its flags is missing from this host's, the
+#      refusal is no runner difference but a change in what CH reports, and
+#      the step FAILS. The forge's ch-smoke, which saves and wakes on one
+#      host, is the cross-version gate that cannot skip this way. Any other
+#      failure of the wake fails the step;                                 (15)
 #   6. PACK, run right after step 2, before anything is woken: the step 2
 #      checkpoint (snapshot + the disk as it was at that moment + CHECKPOINT
 #      + HOST_CPU_FLAGS, this host's /proc/cpuinfo flags line, so the next
@@ -85,10 +89,11 @@
 #       or CH refused it for CPUID: this runner's CPU lacks features the
 #       saving host had; the output says which, and that it is not a pass);
 #       10-16 the step above failed, naming what it saw (15: any wake
-#       failure other than that CPUID refusal); 93 could not run safely (an
-#       argument or input missing or malformed, no usable KVM device, a work or out
-#       directory that is not empty, a previous checkpoint that is not what
-#       step 6 writes, a tool missing).
+#       failure other than that CPUID refusal, and a CPUID refusal when the
+#       checkpoint's HOST_CPU_FLAGS shows this host lacks no flag); 93 could
+#       not run safely (an argument or input missing or malformed, no usable
+#       KVM device, a work or out directory that is not empty, a previous
+#       checkpoint that is not what step 6 writes, a tool missing).
 set -euo pipefail
 export LC_ALL=C
 
@@ -115,36 +120,65 @@ cpu_flags() {
       | tr -s '[:blank:]' '\n' | grep -E '^[a-z0-9_]{1,64}$' | LC_ALL=C sort -u; } || true
 }
 
-# cpuid_refused WORKDIR CHECKPOINTDIR: true when the wake's VMM (d) logged
-# Cloud Hypervisor's CPUID refusal. Prints what this host lacks: the flags in
-# CHECKPOINTDIR/HOST_CPU_FLAGS missing from this host's, or, when there is no
-# such file or no flag differs (CPUID holds more than /proc/cpuinfo names),
-# CH's own CPUID lines, printable characters only, on one line.
+# log_tails WORKDIR: the last lines of each VMM's and guest's log in WORKDIR,
+# on stderr. What a failure prints on the way out, and a CPUID skip as well.
+log_tails() {
+  local f
+  for f in "$1"/*.console "$1"/*.serial "$1"/*.chlog "$1"/*.out; do
+    [ -f "$f" ] || continue
+    echo "--- last lines of ${f##*/} ---" >&2
+    tail -n 15 "$f" >&2 || true
+  done
+}
+
+# cpuid_refused WORKDIR CHECKPOINTDIR: did the wake's VMM (d) log Cloud
+# Hypervisor's CPUID refusal, and does this host explain it? Prints what this
+# host lacks: the flags in CHECKPOINTDIR/HOST_CPU_FLAGS missing from this
+# host's, or CH's own CPUID lines (printable characters only, on one line)
+# when no flag differs or there is nothing to compare. Returns
+#   0  a refusal this host explains (flags missing), or one it cannot be
+#      checked against (no HOST_CPU_FLAGS, or none in it): the step is skipped;
+#   1  not a CPUID refusal;
+#   2  a refusal although HOST_CPU_FLAGS names no flag this host lacks: the
+#      same CPU features, so a real change in what CH reports; the step fails.
 cpuid_refused() {
-  local work=$1 ckpt=$2 lines missing=""
+  local work=$1 ckpt=$2 lines saved="" missing="" known=no
   lines=$(cat "$work/d.chlog" "$work/d.out" 2>/dev/null | tr -d '\r' | grep -a -E "$CPUID_REFUSAL_RE" || true)
   [ -n "$lines" ] || return 1
   if [ -f "$ckpt/HOST_CPU_FLAGS" ] && [ ! -L "$ckpt/HOST_CPU_FLAGS" ]; then
-    missing=$(comm -23 <(cpu_flags "$ckpt/HOST_CPU_FLAGS") <(cpu_flags "$CPUINFO") | tr '\n' ' ')
-    missing=${missing% }
+    saved=$(cpu_flags "$ckpt/HOST_CPU_FLAGS")
+    if [ -n "$saved" ]; then
+      known=yes
+      missing=$(comm -23 <(printf '%s\n' "$saved") <(cpu_flags "$CPUINFO") | tr '\n' ' ')
+      missing=${missing% }
+    fi
   fi
   if [ -n "$missing" ]; then
     echo "$missing (in the checkpoint's HOST_CPU_FLAGS, not in this host's)"
-  else
-    lines=$({ grep -a -o 'Detected incompatible CPUID entry.*' <<<"$lines" || echo "$lines"; } \
-      | head -n 16 | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-3000)
-    echo "${lines% }"
+    return 0
   fi
+  lines=$({ grep -a -o 'Detected incompatible CPUID entry.*' <<<"$lines" || echo "$lines"; } \
+    | head -n 16 | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-3000)
+  echo "${lines% }"
+  [ "$known" = yes ] || return 0
+  return 2
 }
 
 fail() {
-  local code=$1 missing; shift
-  if [ "$code" = 15 ] && [ -n "$WAKE_CKPT" ] && missing=$(cpuid_refused "$WORK" "$WAKE_CKPT"); then
-    say "step 5 (previous release's checkpoint) SKIPPED -- this runner's CPU lacks features the checkpoint was saved with: $missing; this is not a pass"
-    say "step 5: the wake of ${PREV_VERSION:-the previous release}'s checkpoint ended with: $*"
-    echo "::warning title=ch-smoke step 5 skipped::this runner's CPU lacks features ${PREV_VERSION:-the previous release}'s checkpoint was saved with; step 5 is not a pass"
-    say "DONE version=${VERSION:-} previous=${PREV_VERSION:-none} mode=${MODE:-} step5=skipped-cpuid (not PASSED)"
-    exit 0
+  local code=$1 why rc=0; shift
+  if [ "$code" = 15 ] && [ -n "$WAKE_CKPT" ]; then
+    why=$(cpuid_refused "$WORK" "$WAKE_CKPT") || rc=$?
+    if [ "$rc" = 0 ]; then
+      say "step 5 (previous release's checkpoint) SKIPPED -- this runner's CPU lacks features the checkpoint was saved with: $why; this is not a pass"
+      say "step 5: the wake of ${PREV_VERSION:-the previous release}'s checkpoint ended with: $*"
+      log_tails "$WORK"
+      echo "::warning title=ch-smoke step 5 skipped::this runner's CPU lacks features ${PREV_VERSION:-the previous release}'s checkpoint was saved with; step 5 is not a pass"
+      say "DONE version=${VERSION:-} previous=${PREV_VERSION:-none} mode=${MODE:-} step5=skipped-cpuid (not PASSED)"
+      exit 0
+    fi
+    if [ "$rc" = 2 ]; then
+      echo "ch-smoke: step 5: Cloud Hypervisor refused the checkpoint for CPUID, yet this host lacks none of the CPU flags in its HOST_CPU_FLAGS: that is a change in what Cloud Hypervisor reports, not a runner difference: $why" >&2
+    fi
   fi
   echo "ch-smoke: FAILED at step $STEP -- $* (exit $code)" >&2
   exit "$code"
@@ -221,14 +255,7 @@ cleanup() {
     kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
-  if [ "$rc" -ne 0 ] && [ -d "$WORK" ]; then
-    local f
-    for f in "$WORK"/*.console "$WORK"/*.serial "$WORK"/*.chlog "$WORK"/*.out; do
-      [ -f "$f" ] || continue
-      echo "--- last lines of ${f##*/} ---" >&2
-      tail -n 15 "$f" >&2 || true
-    done
-  fi
+  if [ "$rc" -ne 0 ] && [ -d "$WORK" ]; then log_tails "$WORK"; fi
   rm -rf -- "$WORK"
   exit "$rc"
 }
