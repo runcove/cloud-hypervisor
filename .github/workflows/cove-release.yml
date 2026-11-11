@@ -226,7 +226,10 @@ jobs:
   # aarch64 is built and attested, not booted (no KVM on hosted arm runners); development use only
   # It also packs this build's checkpoint (step 6) and records its sha256 before
   # waking the previous release's (step 5): the release publishes only that file.
-  # Its attestation proves a release run of this workflow in this repo (a tag push, or a dispatch naming the tag) produced the file and its smoke passed: not that its contents are benign, nor which tag it belongs to.
+  # Its attestation proves a release run of this workflow in this repo (a tag push, or a dispatch naming the tag) produced the file, and that
+  # run's smoke job ended without a failure: steps 0-4 and the pack passed, and step 5 passed or was SKIPPED (no previous checkpoint, or a
+  # CPUID refusal the runner's CPU explains), which proves nothing about waking the previous release's checkpoint. It does not prove
+  # that the file's contents are benign, nor which tag it belongs to.
   # A regression check, not a gate against a hostile tree: the smoke runs from the
   # tree under test, so its token reads this public repo and nothing more.
   smoke:
@@ -397,8 +400,10 @@ jobs:
       # A wake Cloud Hypervisor refused for CPUID (the runner that saved the
       # checkpoint had CPU features this one lacks) ends step 5 SKIPPED, exit 0,
       # not passed: smoke.sh's own ::warning:: is inert under stop-commands, so
-      # this step raises a fixed one once commands run again. The forge's
-      # ch-smoke, which saves and wakes on one host, remains the gate.
+      # this step raises a fixed one once commands run again. A refusal with no
+      # flag lacking (the checkpoint's HOST_CPU_FLAGS all in this runner's)
+      # fails the step instead. The forge's ch-smoke, which saves and wakes on
+      # one host, remains the gate.
       - name: Wake the previous release's checkpoint (steps 0 and 5)
         run: |
           set -euo pipefail
