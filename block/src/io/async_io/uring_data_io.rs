@@ -486,10 +486,11 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStringExt;
+    use std::process::{Command, Stdio};
     use std::sync::Mutex;
     use std::thread::{self, sleep};
     use std::time::Duration;
-    use std::{io, ptr};
+    use std::{env, io, ptr};
 
     use io_uring::{opcode, squeue, types};
     use vmm_sys_util::tempdir::TempDir;
@@ -535,13 +536,17 @@ mod tests {
         max
     }
 
-    // Counts the io_uring workers the kernel has started for thread `tid`.
-    fn worker_count(tid: libc::pid_t) -> usize {
-        let name = format!("iou-wrk-{tid}");
+    // Counts every io_uring worker in this process. The kernel names a worker
+    // `iou-wrk-<pid>` after its owner's pid in the initial PID namespace, so
+    // inside a PID namespace (a container) the suffix matches no tid this
+    // process can see: the count cannot tell whose workers they are. It is
+    // only meaningful in a process where one measurement alone starts
+    // workers, which is what `peak_workers_in_child` runs it in.
+    fn worker_count() -> usize {
         fs::read_dir("/proc/self/task")
             .unwrap()
             .filter_map(|task| fs::read_to_string(task.ok()?.path().join("comm")).ok())
-            .filter(|comm| comm.trim_end() == name)
+            .filter(|comm| comm.starts_with("iou-wrk-"))
             .count()
     }
 
@@ -565,8 +570,6 @@ mod tests {
             scope
                 .spawn(|| {
                     let mut data_io = data_io;
-                    // SAFETY: gettid has no preconditions.
-                    let tid = unsafe { libc::gettid() };
                     for user_data in 0..u64::from(count) {
                         let entry = entry().flags(squeue::Flags::ASYNC).user_data(user_data);
                         data_io.submit_kernel_entry(user_data, &entry).unwrap();
@@ -574,7 +577,7 @@ mod tests {
 
                     let mut peak = 0;
                     for _ in 0..25 {
-                        peak = peak.max(worker_count(tid));
+                        peak = peak.max(worker_count());
                         if peak >= count as usize {
                             break;
                         }
@@ -656,19 +659,88 @@ mod tests {
         )
     }
 
+    // The measurement `measure_peak_workers` makes when this is set, as
+    // `<opens|tees> <count> [<bounded>:<unbounded>]`.
+    const MEASUREMENT_ENV: &str = "BLOCK_TEST_IOWQ_MEASUREMENT";
+    const PEAK_PREFIX: &str = "IOWQ_PEAK=";
+
+    // Runs one measurement of `peak_workers_on_blocked_opens` ("opens") or
+    // `peak_workers_on_blocked_tees` ("tees") in a new process of this test
+    // executable, where no other test starts io_uring workers, and returns
+    // its peak.
+    fn peak_workers_in_child(kind: &str, limits: Option<IoWorkerLimits>, count: u32) -> usize {
+        let measurement = match limits {
+            Some(l) => format!("{kind} {count} {}:{}", l.bounded, l.unbounded),
+            None => format!("{kind} {count}"),
+        };
+        // The test's name as libtest knows it: its path without the crate.
+        let helper = format!(
+            "{}::measure_peak_workers",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = Command::new(env::current_exe().unwrap())
+            .args(["--exact", &helper, "--ignored", "--nocapture"])
+            .arg("--test-threads=1")
+            .env(MEASUREMENT_ENV, &measurement)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "measuring {measurement} failed ({}):\n{stdout}\n{stderr}",
+            output.status
+        );
+        // libtest may print the test's name on the same line, before it.
+        stdout
+            .lines()
+            .find_map(|line| line.split_once(PEAK_PREFIX))
+            .unwrap_or_else(|| {
+                panic!("measuring {measurement} printed no peak:\n{stdout}\n{stderr}")
+            })
+            .1
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    // Not a test of its own: the measurement `peak_workers_in_child` runs in
+    // a child process. Without MEASUREMENT_ENV it does nothing.
+    #[test]
+    #[ignore = "a measurement run by the worker cap tests in a process of its own"]
+    fn measure_peak_workers() {
+        let Ok(measurement) = env::var(MEASUREMENT_ENV) else {
+            return;
+        };
+        let fields: Vec<&str> = measurement.split_whitespace().collect();
+        let (kind, count, limits) = match fields[..] {
+            [kind, count] => (kind, count, None),
+            [kind, count, limits] => (kind, count, Some(limits.parse().unwrap())),
+            _ => panic!("not a measurement: {measurement}"),
+        };
+        let count = count.parse().unwrap();
+        let peak = match kind {
+            "opens" => peak_workers_on_blocked_opens(limits, count),
+            "tees" => peak_workers_on_blocked_tees(limits, count),
+            _ => panic!("not a measurement: {measurement}"),
+        };
+        println!("{PEAK_PREFIX}{peak}");
+    }
+
     #[test]
     fn uring_caps_bounded_workers() {
         let limits = IoWorkerLimits {
             bounded: 2,
             unbounded: 64,
         };
-        let peak = peak_workers_on_blocked_opens(Some(limits), 32);
+        let peak = peak_workers_in_child("opens", Some(limits), 32);
         assert!(peak > 0, "the test started no worker");
         assert!(peak <= 2, "{peak} bounded workers under a cap of 2");
 
         // Without the cap the same requests start more workers than that, so
         // the check above can see a missing cap.
-        assert!(peak_workers_on_blocked_opens(None, 32) > 2);
+        assert!(peak_workers_in_child("opens", None, 32) > 2);
     }
 
     #[test]
@@ -677,11 +749,11 @@ mod tests {
             bounded: 64,
             unbounded: 2,
         };
-        let peak = peak_workers_on_blocked_tees(Some(limits), 32);
+        let peak = peak_workers_in_child("tees", Some(limits), 32);
         assert!(peak > 0, "the test started no worker");
         assert!(peak <= 2, "{peak} unbounded workers under a cap of 2");
 
-        assert!(peak_workers_on_blocked_tees(None, 32) > 2);
+        assert!(peak_workers_in_child("tees", None, 32) > 2);
     }
 
     #[test]
