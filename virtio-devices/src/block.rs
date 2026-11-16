@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 use std::{io, mem, result, thread};
 
 use anyhow::anyhow;
-use block::async_io::{AsyncIo, AsyncIoCompletion, OFFLOAD_DEPTH, OffloadedOp};
+use block::async_io::{
+    AsyncIo, AsyncIoCompletion, IoWorkerLimits, OFFLOAD_DEPTH, OffloadedOp, apply_io_worker_limits,
+};
 use block::disk_file::AsyncFullDiskFile;
 use block::error::BlockError;
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
@@ -1648,6 +1650,9 @@ pub struct Block {
     exit_evt: EventFd,
     serial: Box<[u8]>,
     queue_affinity: BTreeMap<u16, Box<[usize]>>,
+    // Configured cap on each queue's io_uring workers; `None` applies the
+    // default on a best-effort basis.
+    iouring_max_workers: Option<IoWorkerLimits>,
     lock_granularity_choice: LockGranularityChoice,
     device_status: Arc<AtomicU8>,
     active_request_count: Arc<AtomicUsize>,
@@ -1686,6 +1691,7 @@ impl Block {
         sparse: bool,
         lock_granularity: LockGranularityChoice,
         guest_block_size: Option<u32>,
+        iouring_max_workers: Option<IoWorkerLimits>,
     ) -> io::Result<Self> {
         let (disk_nsectors, avail_features, acked_features, config, paused) =
             if let Some(state) = state {
@@ -1815,6 +1821,7 @@ impl Block {
             exit_evt,
             serial,
             queue_affinity,
+            iouring_max_workers,
             lock_granularity_choice: lock_granularity,
             device_status: Arc::new(AtomicU8::new(0)),
             active_request_count: Arc::new(AtomicUsize::new(0)),
@@ -2078,6 +2085,7 @@ impl VirtioDevice for Block {
             .into_iter()
             .map(|(_, queue_evt)| queue_evt)
             .collect();
+        let mut warned_uncapped = false;
 
         // `queue_idx` is the virtqueue number the driver configured. It differs from
         // the position in `queues`, which only holds the enabled queues.
@@ -2094,6 +2102,27 @@ impl VirtioDevice for Block {
                         error!("failed to create new AsyncIo: {e}");
                         ActivateError::BadActivate
                     })?;
+            // Before the queue thread submits anything: the kernel applies
+            // the limits when a thread first submits to the ring.
+            match apply_io_worker_limits(disk_image.as_mut(), self.iouring_max_workers) {
+                Ok(None) => {}
+                Ok(Some(e)) => {
+                    if !warned_uncapped {
+                        warn!(
+                            "{}: io_uring workers run uncapped, the default limits were refused: {e}",
+                            self.id
+                        );
+                        warned_uncapped = true;
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "{}: failed to apply iouring_max_workers {:?}: {e}",
+                        self.id, self.iouring_max_workers
+                    );
+                    return Err(ActivateError::BadActivate);
+                }
+            }
             // Worker threads the backend spawns for this queue get the same
             // seccomp filter as the queue thread.
             let seccomp_filter = get_seccomp_filter(&self.seccomp_action, Thread::VirtioBlock)
@@ -2365,6 +2394,7 @@ mod tests {
             BTreeMap::new(),
             true,
             LockGranularityChoice::default(),
+            None,
             None,
         )
         .unwrap()

@@ -133,6 +133,20 @@ With buffered I/O the host page cache absorbs any alignment difference. Under
 `direct=on`, overrides below the backing block size are rejected for writable
 disks and for read-only raw and fixed VHD disks.
 
+The `iouring_max_workers=<bounded>:<unbounded>` parameter of `--disk` caps the
+io_uring kernel worker threads (`iou-wrk`) each queue of the disk may start:
+`bounded` for I/O on regular files and block devices, `unbounded` for anything
+else. The bounded limit is never set above the queue's ring size. A request
+that would need a worker beyond the cap waits for one to be free. Each limit
+must be between 1 and 2147483647, and the parameter is not supported with
+`vhost_user=on`. When set, the cap is kept in the VM configuration (so it shows
+in `vm.info` and survives snapshot and restore), and the disk fails to activate
+if the kernel refuses it (`IORING_REGISTER_IOWQ_MAX_WORKERS` needs Linux 5.15,
+and older kernels with per-NUMA-node io-wq pools apply it per node). When
+unset, a cap of `16:4` is applied if the kernel accepts it; if not, a warning
+is logged and the queues run with the kernel's own limits. Backends without an
+io_uring ring start no such workers.
+
 Raw and fixed VHD data requests under `direct=on` must have offsets and total
 lengths aligned to the backing file's direct I/O requirement. Unaligned requests
 return a virtio-block I/O error, including reads from read-only disks. Unaligned
