@@ -2328,6 +2328,9 @@ mod tests {
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             None
         }
+        fn set_io_worker_limits(&mut self, _: IoWorkerLimits) -> IoResult<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -2572,6 +2575,9 @@ mod tests {
         }
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             self.completions.lock().unwrap().pop_front()
+        }
+        fn set_io_worker_limits(&mut self, _: IoWorkerLimits) -> IoResult<()> {
+            Ok(())
         }
     }
 

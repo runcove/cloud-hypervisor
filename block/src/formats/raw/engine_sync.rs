@@ -11,6 +11,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::async_io::{
     AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, CompletionCommon,
+    IoWorkerLimits,
 };
 use crate::sparse::{punch_hole, write_zeroes, write_zeroes_unmap};
 use crate::{AlignedFile, is_block_device};
@@ -78,6 +79,11 @@ impl AsyncIo for RawSync {
                 .complete(AsyncIoCompletion::new(user_data, result, None));
         }
 
+        Ok(())
+    }
+
+    fn set_io_worker_limits(&mut self, _limits: IoWorkerLimits) -> io::Result<()> {
+        // No io_uring ring: the kernel starts no io_uring workers here.
         Ok(())
     }
 

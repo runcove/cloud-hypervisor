@@ -12,6 +12,7 @@ use vmm_sys_util::eventfd::EventFd;
 use super::dynamic::Vhdx;
 use crate::async_io::{
     AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, CompletionCommon,
+    IoWorkerLimits,
 };
 
 pub(super) struct VhdxSync {
@@ -86,6 +87,11 @@ impl AsyncIo for VhdxSync {
             self.completions
                 .complete(AsyncIoCompletion::new(user_data, 0, None));
         }
+        Ok(())
+    }
+
+    fn set_io_worker_limits(&mut self, _limits: IoWorkerLimits) -> io::Result<()> {
+        // No io_uring ring: the kernel starts no io_uring workers here.
         Ok(())
     }
 

@@ -256,14 +256,19 @@ pub trait AsyncIo: Send {
     /// submitted. Backends without worker threads drop it.
     fn set_worker_thread_init(&mut self, _init: WorkerThreadInit) {}
 
-    /// Caps the io_uring worker threads the kernel may start for this
-    /// backend's ring. Must be called before any request is submitted, from
-    /// any thread: the kernel applies the limits to each thread when it first
-    /// submits to the ring. Backends without an io_uring ring start no such
-    /// workers and return `Ok`.
-    fn set_io_worker_limits(&mut self, _limits: IoWorkerLimits) -> io::Result<()> {
-        Ok(())
-    }
+    /// Caps the io_uring worker threads the kernel may start for the thread
+    /// that drives this backend's ring. Must be called before any request is
+    /// submitted.
+    ///
+    /// The kernel keeps io_uring workers per thread, not per ring, and takes
+    /// the limits stored on a ring only when a thread first uses io_uring.
+    /// The cap therefore holds only for a thread that drives this one ring
+    /// and has not used io_uring before; see `UringDataIo::set_max_workers`.
+    ///
+    /// Every backend implements this, so that a wrapper cannot silently drop
+    /// the call: a wrapper passes it to the backend it wraps, and a backend
+    /// without an io_uring ring, which starts no such workers, returns `Ok`.
+    fn set_io_worker_limits(&mut self, limits: IoWorkerLimits) -> io::Result<()>;
 
     /// Returns the next owned completion, if one is available.
     ///
