@@ -89,14 +89,24 @@ impl UringDataIo {
         })
     }
 
-    /// Caps the io_uring worker threads the kernel may start for this ring
-    /// (`IORING_REGISTER_IOWQ_MAX_WORKERS`).
+    /// Caps the io_uring worker threads the kernel may start for the thread
+    /// that drives this ring (`IORING_REGISTER_IOWQ_MAX_WORKERS`).
     ///
-    /// The kernel stores the limits on the ring and applies them to each
-    /// thread when it first submits to the ring, so this must be called
-    /// before the thread that drives the ring submits anything. The bounded
-    /// limit is never set above the ring's size: a ring never has more
-    /// requests in flight than it has entries.
+    /// The kernel keeps io_uring workers per thread, not per ring: a thread
+    /// has one worker pool, shared by every ring it submits to. The limits
+    /// are stored on the ring, and the kernel applies them to a thread's pool
+    /// when that thread first uses io_uring, if it does so on this ring. It
+    /// does not apply them to a thread that used another ring first, and
+    /// called from a thread that has already used io_uring, this also caps
+    /// that thread's own pool.
+    ///
+    /// So the cap holds as configured only for a thread that has not used
+    /// io_uring before this ring and drives no other ring. That is true today
+    /// because each virtio-block queue gets a new thread that drives just its
+    /// own ring. This must be called before that thread submits anything.
+    ///
+    /// The bounded limit is never set above the ring's size: a ring never has
+    /// more requests in flight than it has entries.
     pub fn set_max_workers(&self, limits: IoWorkerLimits) -> io::Result<()> {
         // A zero leaves that limit unchanged in the kernel: refuse it rather
         // than silently run uncapped.
