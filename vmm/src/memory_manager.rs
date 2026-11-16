@@ -61,8 +61,7 @@ use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
 use crate::pagemap::PageMap;
 use crate::sparse::{
-    clone_file_range, copy_region, copy_region_dense, file_holes, next_data_extent,
-    write_region_sparse,
+    clone_file_range, copy_region, copy_region_dense, next_data_extent, write_region_sparse,
 };
 use crate::uffd::{
     self, FileUffdMemorySource, SocketUffdMemorySource, Uffd, UffdHole, UffdMemorySource, UffdRange,
@@ -1420,26 +1419,14 @@ impl MemoryManager {
         let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
         // A fault on a hole of the snapshot file is resolved with zeroes
         // rather than by reading the hole, which would cache a zero page in
-        // the host page cache for each hole page the guest touches. Without
-        // SEEK_HOLE support every page is read, as before.
-        let saved_len: u64 = saved_regions.ranges().iter().map(|r| r.length).sum();
-        let holes = match file_holes(&snapshot_file, saved_len) {
-            Ok(holes) => {
-                info!(
-                    "UFFD restore: snapshot file holes={} bytes={} resolved without reading the file",
-                    holes.len(),
-                    holes.iter().map(|(start, end)| end - start).sum::<u64>()
-                );
-                holes
-            }
-            Err(e) => {
-                info!("UFFD restore: snapshot file holes unknown, every fault reads the file: {e}");
-                Vec::new()
-            }
-        };
-        let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::with_holes(
+        // the host page cache for each hole page the guest touches. With
+        // `copy_on_access`, the source looks each hole up when a page is
+        // faulted, and nothing scans the file. Otherwise the holes are found
+        // below and marked served, so a fault on one is resolved as for a
+        // discarded page and never reaches the source. Without SEEK_HOLE
+        // support every page is read.
+        let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(
             snapshot_file.try_clone().map_err(Error::SnapshotOpen)?,
-            holes,
         ));
 
         let Some(uffd) = self.prepare_uffd(
@@ -6928,20 +6915,6 @@ mod tests {
         check_copy_on_access_handler(true);
     }
 
-    #[test]
-    fn file_holes_lists_the_holes_inside_the_file() {
-        let Some(file) = sparse_snapshot_file() else {
-            return;
-        };
-        // Past EOF is not a hole: a read there fails.
-        assert_eq!(
-            file_holes(&file, 10 * MIB).unwrap(),
-            [(2 * MIB, 5 * MIB), (6 * MIB, 7 * MIB)]
-        );
-        assert_eq!(file_holes(&file, 3 * MIB).unwrap(), [(2 * MIB, 3 * MIB)]);
-        assert_eq!(file_holes(&file, 2 * MIB).unwrap(), []);
-    }
-
     // How many of the pages of `[off, off + len)` of `file` are in the
     // host page cache.
     fn cached_file_pages(file: &File, off: u64, len: u64) -> usize {
@@ -7041,22 +7014,19 @@ mod tests {
         file.write_all_at(&vec![0xaf; page as usize], 15 * page)
             .unwrap();
         file.sync_all().unwrap();
-        let holes = match file_holes(&file, len) {
-            Ok(holes) if holes == [(page, 15 * page)] => holes,
+        match next_data_extent(file.as_fd(), page, len) {
+            Ok(Some((off, _))) if off == 15 * page => {}
             other => {
-                eprintln!("skipping: SEEK_HOLE reports {other:x?}, not the hole written");
+                eprintln!("skipping: SEEK_DATA reports {other:x?}, not the hole written");
                 return;
             }
-        };
+        }
         // SAFETY: drops the clean pages of `file` from the page cache.
         let ret = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         assert_eq!(ret, 0);
         let handler = TestHandler::spawn_with(
             uffd,
-            Box::new(FileUffdMemorySource::with_holes(
-                file.try_clone().unwrap(),
-                holes,
-            )),
+            Box::new(FileUffdMemorySource::new(file.try_clone().unwrap())),
             Arc::clone(&served),
             Arc::new(Mutex::new(())),
             true,
