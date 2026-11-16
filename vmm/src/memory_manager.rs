@@ -1274,6 +1274,10 @@ impl MemoryManager {
         let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(
             snapshot_file.try_clone().map_err(Error::SnapshotOpen)?,
         ));
+        info!(
+            "UFFD restore: snapshot file holes are looked up per fault and resolved \
+             without reading the file; counts are logged when the source is dropped"
+        );
 
         let Some(uffd) = self.prepare_uffd(
             saved_regions,

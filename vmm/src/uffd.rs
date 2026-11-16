@@ -350,6 +350,11 @@ pub(crate) struct FileUffdMemorySource {
     /// read from the file.
     seek_holes: bool,
     zeroes: Vec<u8>,
+    /// What the source did, logged when it is dropped: lseek calls made,
+    /// pages resolved with zeroes as holes, and pages read from the file.
+    lookups: u64,
+    hole_pages: u64,
+    read_pages: u64,
 }
 
 /// `[start, end)` offsets of a file, all of it a hole or all of it data.
@@ -368,7 +373,22 @@ impl FileUffdMemorySource {
             extent: None,
             seek_holes: true,
             zeroes: Vec::new(),
+            lookups: 0,
+            hole_pages: 0,
+            read_pages: 0,
         }
+    }
+
+    /// Stops looking holes up after `op` failed at `pos`: every page is then
+    /// read from the file, which is correct whatever the failure was.
+    fn stop_seeking(&mut self, op: &str, pos: u64, e: &io::Error) {
+        log::info!(
+            "UFFD restore: lseek({op}) at {pos:#x} of the snapshot file failed \
+             (errno {}), every fault reads the file from now on: {e}",
+            e.raw_os_error().unwrap_or(0)
+        );
+        self.seek_holes = false;
+        self.extent = None;
     }
 
     /// Whether `[pos, pos + len)` of the file lies wholly inside one hole.
@@ -384,25 +404,27 @@ impl FileUffdMemorySource {
         {
             return e.hole && pos.saturating_add(len) <= e.end;
         }
-        let fd = self.file.as_fd();
-        let hole_end = match seek_data(fd, pos) {
-            Ok(Some(data)) => {
-                // The page holds data unless that data starts past the page.
-                // Keep the extent it starts so that the pages after this one
-                // need no lookup, as for the pages of the hole before it.
-                if data < pos.saturating_add(len)
-                    && let Ok(end) = seek_hole(fd, data)
-                    && end > data
-                {
-                    self.extent = Some(FileExtent {
-                        start: data,
-                        end,
-                        hole: false,
-                    });
-                    return false;
+        self.lookups += 1;
+        let hole_end = match seek_data(self.file.as_fd(), pos) {
+            Ok(Some(data)) if data < pos.saturating_add(len) => {
+                // The page holds data. Keep the extent it starts so that the
+                // pages after this one need no lookup, as for the pages of
+                // a hole.
+                self.lookups += 1;
+                match seek_hole(self.file.as_fd(), data) {
+                    Ok(end) if end > data => {
+                        self.extent = Some(FileExtent {
+                            start: data,
+                            end,
+                            hole: false,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.stop_seeking("SEEK_HOLE", data, &e),
                 }
-                data
+                return false;
             }
+            Ok(Some(data)) => data,
             // No data at or after pos: in a hole that runs to the end of the
             // file, or at or past the end.
             Ok(None) => match self.file.metadata() {
@@ -410,11 +432,7 @@ impl FileUffdMemorySource {
                 Err(_) => return false,
             },
             Err(e) => {
-                log::info!(
-                    "UFFD restore: snapshot file holes unknown, every fault reads the file: {e}"
-                );
-                self.seek_holes = false;
-                self.extent = None;
+                self.stop_seeking("SEEK_DATA", pos, &e);
                 return false;
             }
         };
@@ -444,7 +462,9 @@ impl UffdMemorySource for FileUffdMemorySource {
         if self.in_hole(file_pos, range.page_size) {
             // A copied page of zeroes, private to this VM like every page it
             // touches, rather than the zero page every process shares.
-            return copy_zeroes(uffd_fd, range, page_idx, &mut self.zeroes);
+            copy_zeroes(uffd_fd, range, page_idx, &mut self.zeroes)?;
+            self.hole_pages += 1;
+            return Ok(());
         }
 
         if self.buf.len() < page_size {
@@ -452,6 +472,7 @@ impl UffdMemorySource for FileUffdMemorySource {
         }
         self.file
             .read_exact_at(&mut self.buf[..page_size], file_pos)?;
+        self.read_pages += 1;
 
         match copy(uffd_fd, page_addr, self.buf.as_ptr(), range.page_size) {
             Ok(()) => Ok(()),
@@ -468,6 +489,17 @@ impl UffdMemorySource for FileUffdMemorySource {
 
     fn requires_uffd_minor_mode(&self) -> bool {
         false
+    }
+}
+
+impl Drop for FileUffdMemorySource {
+    fn drop(&mut self) {
+        log::info!(
+            "UFFD restore: snapshot file pages resolved: holes={} read={} lookups={}",
+            self.hole_pages,
+            self.read_pages,
+            self.lookups
+        );
     }
 }
 
@@ -732,6 +764,27 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn in_hole_looks_up_each_extent_once() {
+        // Data in pages 0 to 15 and 48 to 63, a hole in between.
+        let pages = 64;
+        let Some(file) = file_with_data_pages(pages, |idx| !(16..48).contains(&idx)) else {
+            return;
+        };
+        let mut source = FileUffdMemorySource::new(file);
+        for idx in 0..pages {
+            assert_eq!(source.in_hole(idx * PAGE, PAGE), (16..48).contains(&idx));
+        }
+        // SEEK_DATA and SEEK_HOLE for each data extent, SEEK_DATA for the
+        // hole; every other page was answered from the extent kept.
+        assert_eq!(source.lookups, 5);
+        // Faults back inside the last extent need no lookup either.
+        for idx in (48..pages).rev() {
+            assert!(!source.in_hole(idx * PAGE, PAGE));
+        }
+        assert_eq!(source.lookups, 5);
     }
 
     #[test]
