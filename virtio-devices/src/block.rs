@@ -2363,6 +2363,9 @@ mod tests {
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             None
         }
+        fn set_io_worker_limits(&mut self, _: IoWorkerLimits) -> IoResult<()> {
+            Ok(())
+        }
     }
 
     fn make_block_with_serial(dir: &Path, serial: Option<&str>, num_queues: u16) -> Block {
@@ -2683,6 +2686,9 @@ mod tests {
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             self.1.pop()
         }
+        fn set_io_worker_limits(&mut self, _: IoWorkerLimits) -> IoResult<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -2760,6 +2766,10 @@ mod tests {
 
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             self.completion.take()
+        }
+
+        fn set_io_worker_limits(&mut self, _: IoWorkerLimits) -> IoResult<()> {
+            Ok(())
         }
     }
 
@@ -3094,6 +3104,9 @@ mod tests {
         }
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             self.completions.lock().unwrap().pop_front()
+        }
+        fn set_io_worker_limits(&mut self, _: IoWorkerLimits) -> IoResult<()> {
+            Ok(())
         }
     }
 
