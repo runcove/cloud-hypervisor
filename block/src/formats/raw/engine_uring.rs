@@ -5,13 +5,15 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::fs::File;
+use std::io;
 use std::os::unix::io::AsRawFd;
 
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::async_io::{
     AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, BlockingOffload,
-    BlockingOp, BlockingOpFn, UringDataIo, WorkerThreadInit, offload_fn, spawn_offload,
+    BlockingOp, BlockingOpFn, IoWorkerLimits, UringDataIo, WorkerThreadInit, offload_fn,
+    spawn_offload,
 };
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::sparse::{punch_hole, write_zeroes, write_zeroes_unmap};
@@ -106,6 +108,10 @@ impl AsyncIo for RawAsync {
         if let Some(offload) = &mut self.offload {
             offload.set_thread_init(init);
         }
+    }
+
+    fn set_io_worker_limits(&mut self, limits: IoWorkerLimits) -> io::Result<()> {
+        self.data_io.set_max_workers(limits)
     }
 
     fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {

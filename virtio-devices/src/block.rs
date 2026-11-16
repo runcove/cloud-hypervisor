@@ -24,7 +24,10 @@ use std::time::{Duration, Instant};
 use std::{io, mem, result, thread};
 
 use anyhow::anyhow;
-use block::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoError, OFFLOAD_DEPTH, OffloadedOp};
+use block::async_io::{
+    AsyncIo, AsyncIoCompletion, AsyncIoError, IoWorkerLimits, OFFLOAD_DEPTH, OffloadedOp,
+    apply_io_worker_limits,
+};
 use block::disk_file::AsyncFullDiskFile;
 use block::error::BlockError;
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
@@ -1609,6 +1612,9 @@ pub struct Block {
     exit_evt: EventFd,
     serial: Box<[u8]>,
     queue_affinity: BTreeMap<u16, Box<[usize]>>,
+    // Configured cap on each queue's io_uring workers; `None` applies the
+    // default on a best-effort basis.
+    iouring_max_workers: Option<IoWorkerLimits>,
     lock_granularity_choice: LockGranularityChoice,
     device_status: Arc<AtomicU8>,
     active_request_count: Arc<AtomicUsize>,
@@ -1647,6 +1653,7 @@ impl Block {
         sparse: bool,
         lock_granularity: LockGranularityChoice,
         guest_block_size: Option<u32>,
+        iouring_max_workers: Option<IoWorkerLimits>,
     ) -> io::Result<Self> {
         let (disk_nsectors, avail_features, acked_features, config, paused) =
             if let Some(state) = state {
@@ -1780,6 +1787,7 @@ impl Block {
             exit_evt,
             serial,
             queue_affinity,
+            iouring_max_workers,
             lock_granularity_choice: lock_granularity,
             device_status: Arc::new(AtomicU8::new(0)),
             active_request_count: Arc::new(AtomicUsize::new(0)),
@@ -2043,6 +2051,7 @@ impl VirtioDevice for Block {
         // of every queue.
         let offload_budget = Arc::new(OffloadBudget::new(OFFLOAD_DEPTH, clone_queue_evts()?));
         self.queue_evts = clone_queue_evts()?;
+        let mut warned_uncapped = false;
 
         for i in 0..queues.len() {
             let (_, mut queue, queue_evt) = queues.remove(0);
@@ -2059,6 +2068,27 @@ impl VirtioDevice for Block {
                         error!("failed to create new AsyncIo: {e}");
                         ActivateError::BadActivate
                     })?;
+            // Before the queue thread submits anything: the kernel applies
+            // the limits when a thread first submits to the ring.
+            match apply_io_worker_limits(disk_image.as_mut(), self.iouring_max_workers) {
+                Ok(None) => {}
+                Ok(Some(e)) => {
+                    if !warned_uncapped {
+                        warn!(
+                            "{}: io_uring workers run uncapped, the default limits were refused: {e}",
+                            self.id
+                        );
+                        warned_uncapped = true;
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "{}: failed to apply iouring_max_workers {:?}: {e}",
+                        self.id, self.iouring_max_workers
+                    );
+                    return Err(ActivateError::BadActivate);
+                }
+            }
             // Worker threads the backend spawns for this queue get the same
             // seccomp filter as the queue thread.
             let seccomp_filter = get_seccomp_filter(&self.seccomp_action, Thread::VirtioBlock)
@@ -2253,7 +2283,13 @@ mod tests {
     use std::sync::mpsc::{self, Sender};
     use std::{env, mem, panic, slice};
 
-    use block::async_io::{AsyncIoOperation, AsyncIoResult};
+    use block::async_io::{AsyncIoOperation, AsyncIoResult, BorrowedDiskFd};
+    use block::disk_file::{
+        AsyncDiskFile, DiskFd, DiskFile, DiskSize, Geometry, MetadataSync, PhysicalSize, Resizable,
+        SparseCapable,
+    };
+    use block::error::BlockResult;
+    use block::formats::raw::{RawBackend, RawDisk};
     use block::{BLKDISCARD, BLKZEROOUT};
     use hypervisor::Vm;
     use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
@@ -4482,5 +4518,175 @@ mod tests {
         .unwrap();
         assert!(read_only.0 >= 0, "read-only open refused: {read_only:?}");
         assert_eq!(writable, (-1, Some(libc::EPERM)));
+    }
+
+    /// A raw disk whose queue backends record the io_uring worker limits
+    /// they are given, and refuse them when `refuse` is set.
+    #[derive(Debug)]
+    struct LimitsDisk {
+        inner: RawDisk,
+        refuse: bool,
+        applied: Arc<Mutex<Vec<IoWorkerLimits>>>,
+    }
+
+    impl LimitsDisk {
+        fn new(file: &TempFile, refuse: bool) -> Self {
+            file.as_file().set_len(1 << 20).unwrap();
+            Self {
+                inner: RawDisk::new(file.as_file().try_clone().unwrap(), RawBackend::Sync, false),
+                refuse,
+                applied: Arc::default(),
+            }
+        }
+    }
+
+    impl DiskSize for LimitsDisk {
+        fn logical_size(&self) -> BlockResult<u64> {
+            self.inner.logical_size()
+        }
+    }
+    impl PhysicalSize for LimitsDisk {
+        fn physical_size(&self) -> BlockResult<u64> {
+            self.inner.physical_size()
+        }
+    }
+    impl DiskFd for LimitsDisk {
+        fn fd(&self) -> BorrowedDiskFd<'_> {
+            self.inner.fd()
+        }
+    }
+    impl Geometry for LimitsDisk {}
+    impl SparseCapable for LimitsDisk {}
+    impl Resizable for LimitsDisk {
+        fn resize(&mut self, size: u64) -> BlockResult<()> {
+            self.inner.resize(size)
+        }
+    }
+    impl MetadataSync for LimitsDisk {}
+    impl DiskFile for LimitsDisk {}
+    impl AsyncDiskFile for LimitsDisk {
+        fn try_clone(&self) -> BlockResult<Box<dyn AsyncDiskFile>> {
+            unreachable!()
+        }
+        fn create_async_io(&self, _ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
+            Ok(Box::new(LimitsIo {
+                noop: Noop(EventFd::new(EFD_NONBLOCK).unwrap()),
+                refuse: self.refuse,
+                applied: Arc::clone(&self.applied),
+            }))
+        }
+    }
+
+    struct LimitsIo {
+        noop: Noop,
+        refuse: bool,
+        applied: Arc<Mutex<Vec<IoWorkerLimits>>>,
+    }
+
+    impl AsyncIo for LimitsIo {
+        fn notifier(&self) -> &EventFd {
+            AsyncIo::notifier(&self.noop)
+        }
+        fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
+            self.noop.submit_data_operation(op)
+        }
+        fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
+            self.noop.fsync(user_data)
+        }
+        fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
+            self.noop.punch_hole(offset, length, user_data)
+        }
+        fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
+            self.noop.write_zeroes(offset, length, user_data)
+        }
+        fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
+            None
+        }
+        fn set_io_worker_limits(&mut self, limits: IoWorkerLimits) -> io::Result<()> {
+            self.applied.lock().unwrap().push(limits);
+            if self.refuse {
+                Err(IoError::from_raw_os_error(libc::EINVAL))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    const CAP: IoWorkerLimits = IoWorkerLimits {
+        bounded: 8,
+        unbounded: 2,
+    };
+
+    /// Activates a two-queue block device on `disk` with `iouring_max_workers`
+    /// set to `cap`.
+    fn activate_limits_disk(
+        disk: LimitsDisk,
+        cap: Option<IoWorkerLimits>,
+    ) -> (Block, ActivateResult) {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vqs = [
+            GuestQ::new(GuestAddress(0x1000), &mem, 64),
+            GuestQ::new(GuestAddress(0x4000), &mem, 64),
+        ];
+        let mut blk = Block::new(
+            "limits".to_string(),
+            Box::new(disk),
+            PathBuf::from("/limits"),
+            false,
+            false,
+            vqs.len(),
+            64,
+            None,
+            SeccompAction::Allow,
+            None,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            None,
+            BTreeMap::new(),
+            false,
+            LockGranularityChoice::default(),
+            None,
+            cap,
+        )
+        .unwrap();
+        let queues = vqs
+            .iter()
+            .enumerate()
+            .map(|(i, vq)| {
+                (
+                    i as u16,
+                    vq.create_queue(),
+                    EventFd::new(EFD_NONBLOCK).unwrap(),
+                )
+            })
+            .collect();
+        let result = blk.activate(ActivationContext {
+            mem: GuestMemoryAtomic::new(mem.clone()),
+            interrupt_cb: Arc::new(Noop(EventFd::new(EFD_NONBLOCK).unwrap())),
+            queues,
+            device_status: Arc::new(AtomicU8::new(0)),
+        });
+        (blk, result)
+    }
+
+    #[test]
+    fn activate_applies_configured_io_worker_limits_to_every_queue() {
+        let file = TempFile::new().unwrap();
+        let disk = LimitsDisk::new(&file, false);
+        let applied = Arc::clone(&disk.applied);
+        let (mut blk, result) = activate_limits_disk(disk, Some(CAP));
+        blk.reset();
+        result.unwrap();
+        assert_eq!(*applied.lock().unwrap(), [CAP, CAP]);
+    }
+
+    #[test]
+    fn activate_fails_when_configured_io_worker_limits_are_refused() {
+        let file = TempFile::new().unwrap();
+        let disk = LimitsDisk::new(&file, true);
+        let applied = Arc::clone(&disk.applied);
+        let (mut blk, result) = activate_limits_disk(disk, Some(CAP));
+        blk.reset();
+        assert!(matches!(result, Err(ActivateError::BadActivate)));
+        assert_eq!(*applied.lock().unwrap(), [CAP]);
     }
 }
