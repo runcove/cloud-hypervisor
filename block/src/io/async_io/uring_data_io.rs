@@ -13,7 +13,7 @@ use log::{Level, error, log, warn};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::common::{duplicate_user_data_error, validate_batch};
-use super::{AsyncIoCompletion, AsyncIoOperation, CompletionCommon};
+use super::{AsyncIoCompletion, AsyncIoOperation, CompletionCommon, IoWorkerLimits};
 
 /// Number of times a data operation is resubmitted after the kernel reports a
 /// retryable result before the error is reported to the caller.
@@ -71,6 +71,32 @@ impl UringDataIo {
             completions,
             needs_submit_retry: false,
         })
+    }
+
+    /// Caps the io_uring worker threads the kernel may start for this ring
+    /// (`IORING_REGISTER_IOWQ_MAX_WORKERS`).
+    ///
+    /// The kernel stores the limits on the ring and applies them to each
+    /// thread when it first submits to the ring, so this must be called
+    /// before the thread that drives the ring submits anything. The bounded
+    /// limit is never set above the ring's size: a ring never has more
+    /// requests in flight than it has entries.
+    pub fn set_max_workers(&self, limits: IoWorkerLimits) -> io::Result<()> {
+        // A zero leaves that limit unchanged in the kernel: refuse it rather
+        // than silently run uncapped.
+        if limits.bounded == 0 || limits.unbounded == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("io_uring worker limits must not be zero: {limits:?}"),
+            ));
+        }
+        let mut max = [
+            limits.bounded.min(self.io_uring.params().sq_entries()),
+            limits.unbounded,
+        ];
+        self.io_uring
+            .submitter()
+            .register_iowq_max_workers(&mut max)
     }
 
     /// Returns the eventfd signaled when completions are available.
@@ -440,15 +466,21 @@ impl Drop for UringDataIo {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+    use std::fs::{self, OpenOptions};
     use std::io;
-    use std::os::fd::{AsRawFd, RawFd};
-    use std::thread::sleep;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::ffi::OsStringExt;
+    use std::sync::Mutex;
+    use std::thread::{self, sleep};
     use std::time::Duration;
 
+    use io_uring::{opcode, squeue, types};
+    use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::{MAX_RESUBMISSIONS, RetainedOperation, UringDataIo};
-    use crate::async_io::{AsyncIoCompletion, AsyncIoOperation, OwnedIoBuffer};
+    use crate::async_io::{AsyncIoCompletion, AsyncIoOperation, IoWorkerLimits, OwnedIoBuffer};
 
     fn wait_for_completion(data_io: &mut UringDataIo) -> AsyncIoCompletion {
         for _ in 0..1000 {
@@ -473,6 +505,217 @@ mod tests {
                 resubmissions: 0,
             }),
         );
+    }
+
+    // Reads the limits now in force for the calling thread's io_uring
+    // workers: a zero for both changes nothing and returns the current ones.
+    fn worker_limits_in_force(data_io: &UringDataIo) -> [u32; 2] {
+        let mut max = [0, 0];
+        data_io
+            .io_uring
+            .submitter()
+            .register_iowq_max_workers(&mut max)
+            .unwrap();
+        max
+    }
+
+    // Counts the io_uring workers the kernel has started for thread `tid`.
+    fn worker_count(tid: libc::pid_t) -> usize {
+        let name = format!("iou-wrk-{tid}");
+        fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|task| fs::read_to_string(task.ok()?.path().join("comm")).ok())
+            .filter(|comm| comm.trim_end() == name)
+            .count()
+    }
+
+    // Creates a ring of `count` entries on the calling thread, caps it at
+    // `limits` if given, and drives it from a new thread, as a disk's queue
+    // is: submits `count` copies of `entry`, each forced to a kernel worker,
+    // where it must block. Then calls `unblock`, keeps what it returns until
+    // every request has completed, and returns the most workers seen at once.
+    fn peak_workers_on_blocked_requests<G>(
+        limits: Option<IoWorkerLimits>,
+        count: u32,
+        entry: impl Fn() -> squeue::Entry + Sync,
+        unblock: impl FnOnce() -> G + Send,
+    ) -> usize {
+        let data_io = UringDataIo::new(count).unwrap();
+        if let Some(limits) = limits {
+            data_io.set_max_workers(limits).unwrap();
+        }
+
+        thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut data_io = data_io;
+                    // SAFETY: gettid has no preconditions.
+                    let tid = unsafe { libc::gettid() };
+                    for user_data in 0..u64::from(count) {
+                        let entry = entry().flags(squeue::Flags::ASYNC).user_data(user_data);
+                        data_io.submit_kernel_entry(user_data, &entry).unwrap();
+                    }
+
+                    let mut peak = 0;
+                    for _ in 0..25 {
+                        peak = peak.max(worker_count(tid));
+                        if peak >= count as usize {
+                            break;
+                        }
+                        sleep(Duration::from_millis(20));
+                    }
+
+                    let guard = unblock();
+                    for _ in 0..count {
+                        let completion = wait_for_completion(&mut data_io);
+                        assert!(
+                            completion.result >= 0,
+                            "request failed: {}",
+                            completion.result
+                        );
+                        if completion.result > 0 {
+                            // SAFETY: only an open completes with a positive
+                            // result here, a file descriptor nothing else owns.
+                            unsafe { libc::close(completion.result) };
+                        }
+                    }
+                    drop(guard);
+                    peak
+                })
+                .join()
+                .unwrap()
+        })
+    }
+
+    // Opens of a FIFO that has no writer block in the worker, and count as
+    // bounded work.
+    fn peak_workers_on_blocked_opens(limits: Option<IoWorkerLimits>, count: u32) -> usize {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("fifo");
+        let fifo = CString::new(path.clone().into_os_string().into_vec()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        peak_workers_on_blocked_requests(
+            limits,
+            count,
+            || {
+                opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), fifo.as_ptr())
+                    .flags(libc::O_RDONLY | libc::O_CLOEXEC)
+                    .build()
+            },
+            // A writer lets every open complete, blocked or still queued.
+            || OpenOptions::new().write(true).open(&path).unwrap(),
+        )
+    }
+
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe2 writes.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: pipe2 succeeded, so both are open descriptors nothing else owns.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    // A tee from an empty pipe blocks in the worker, and counts as unbounded
+    // work (a pipe is not a regular file or block device).
+    fn peak_workers_on_blocked_tees(limits: Option<IoWorkerLimits>, count: u32) -> usize {
+        let (input, input_writer) = pipe();
+        let (_output, output_writer) = pipe();
+        let input_writer = Mutex::new(Some(input_writer));
+
+        peak_workers_on_blocked_requests(
+            limits,
+            count,
+            || {
+                opcode::Tee::new(
+                    types::Fd(input.as_raw_fd()),
+                    types::Fd(output_writer.as_raw_fd()),
+                    1,
+                )
+                .build()
+            },
+            // Closing the input's only writer ends every tee with 0 bytes.
+            || drop(input_writer.lock().unwrap().take()),
+        )
+    }
+
+    #[test]
+    fn uring_caps_bounded_workers() {
+        let limits = IoWorkerLimits {
+            bounded: 2,
+            unbounded: 64,
+        };
+        let peak = peak_workers_on_blocked_opens(Some(limits), 32);
+        assert!(peak > 0, "the test started no worker");
+        assert!(peak <= 2, "{peak} bounded workers under a cap of 2");
+
+        // Without the cap the same requests start more workers than that, so
+        // the check above can see a missing cap.
+        assert!(peak_workers_on_blocked_opens(None, 32) > 2);
+    }
+
+    #[test]
+    fn uring_caps_unbounded_workers() {
+        let limits = IoWorkerLimits {
+            bounded: 64,
+            unbounded: 2,
+        };
+        let peak = peak_workers_on_blocked_tees(Some(limits), 32);
+        assert!(peak > 0, "the test started no worker");
+        assert!(peak <= 2, "{peak} unbounded workers under a cap of 2");
+
+        assert!(peak_workers_on_blocked_tees(None, 32) > 2);
+    }
+
+    #[test]
+    fn uring_applies_limits_to_the_thread_that_drives_the_ring() {
+        // Capped on this thread, as at device activation; the bounded limit
+        // is clamped to the ring's 8 entries.
+        let mut data_io = UringDataIo::new(8).unwrap();
+        data_io.set_max_workers(IoWorkerLimits::DEFAULT).unwrap();
+
+        let in_force = thread::spawn(move || {
+            // The kernel applies the limits when this thread first submits.
+            data_io.submit_nop(1).unwrap();
+            wait_for_completion(&mut data_io);
+            worker_limits_in_force(&data_io)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(in_force, [8, 4]);
+    }
+
+    #[test]
+    fn uring_refuses_zero_limits() {
+        let data_io = UringDataIo::new(8).unwrap();
+        for limits in [
+            IoWorkerLimits {
+                bounded: 0,
+                unbounded: 4,
+            },
+            IoWorkerLimits {
+                bounded: 16,
+                unbounded: 0,
+            },
+        ] {
+            let e = data_io.set_max_workers(limits).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn uring_reports_limits_the_kernel_refuses() {
+        // The kernel refuses a limit above INT_MAX with EINVAL, as a kernel
+        // without IORING_REGISTER_IOWQ_MAX_WORKERS refuses every call.
+        let data_io = UringDataIo::new(8).unwrap();
+        let e = data_io
+            .set_max_workers(IoWorkerLimits {
+                bounded: 16,
+                unbounded: u32::MAX,
+            })
+            .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]

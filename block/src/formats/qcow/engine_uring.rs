@@ -19,7 +19,8 @@ use super::decoder::Decoder;
 use super::metadata::{BackingRead, ClusterReadMapping, QcowMetadata};
 use super::qcow_raw_file::QcowRawFile;
 use crate::async_io::{
-    AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, UringDataIo,
+    AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, IoWorkerLimits,
+    UringDataIo,
 };
 
 /// Per queue QCOW2 I/O worker using io_uring.
@@ -135,6 +136,10 @@ impl QcowAsync {
 impl AsyncIo for QcowAsync {
     fn notifier(&self) -> &EventFd {
         self.data_io.notifier()
+    }
+
+    fn set_io_worker_limits(&mut self, limits: IoWorkerLimits) -> io::Result<()> {
+        self.data_io.set_max_workers(limits)
     }
 
     fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {

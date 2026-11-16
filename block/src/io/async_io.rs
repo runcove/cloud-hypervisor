@@ -14,6 +14,7 @@ mod owned_io_buffer;
 #[cfg(feature = "io_uring")]
 mod uring_data_io;
 
+use std::str::FromStr;
 use std::{io, result};
 
 pub use aio_data_io::AioDataIo;
@@ -28,6 +29,7 @@ pub use completion::{AsyncIoCompletion, OffloadedOp};
 pub use guest_memory_target::GuestMemoryTarget;
 pub use operation::AsyncIoOperation;
 pub use owned_io_buffer::OwnedIoBuffer;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 #[cfg(feature = "io_uring")]
 pub use uring_data_io::UringDataIo;
@@ -108,6 +110,64 @@ pub type AsyncIoResult<T> = result::Result<T, AsyncIoError>;
 /// Runs on a worker thread spawned by an [`AsyncIo`] backend before the
 /// thread does any I/O, for instance to apply a seccomp filter.
 pub type WorkerThreadInit = Box<dyn FnOnce() -> io::Result<()> + Send>;
+
+/// The most io_uring worker threads (io-wq) the kernel may start for one
+/// queue's ring.
+///
+/// Requests that cannot complete without blocking are handed to a pool of
+/// kernel worker threads, which count against the process's task limit. Work
+/// on regular files and block devices is "bounded", every other kind is
+/// "unbounded"; each kind has its own limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IoWorkerLimits {
+    pub bounded: u32,
+    pub unbounded: u32,
+}
+
+#[derive(Error, Debug)]
+#[error("Expected <bounded>:<unbounded>, two whole numbers: {0}")]
+pub struct IoWorkerLimitsParseError(String);
+
+/// Parses `<bounded>:<unbounded>`, for instance `16:4`.
+impl FromStr for IoWorkerLimits {
+    type Err = IoWorkerLimitsParseError;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        let error = || IoWorkerLimitsParseError(s.to_owned());
+        let (bounded, unbounded) = s.split_once(':').ok_or_else(error)?;
+        Ok(Self {
+            bounded: bounded.parse().map_err(|_| error())?,
+            unbounded: unbounded.parse().map_err(|_| error())?,
+        })
+    }
+}
+
+impl IoWorkerLimits {
+    /// The limits a disk gets when its configuration sets none.
+    pub const DEFAULT: Self = Self {
+        bounded: 16,
+        unbounded: 4,
+    };
+}
+
+/// Caps the io_uring workers of `io` at `configured`, or at
+/// [`IoWorkerLimits::DEFAULT`] when no limits are configured.
+///
+/// Configured limits are all or nothing: if they cannot be applied, the error
+/// is returned, so a disk never runs uncapped while its configuration says it
+/// is capped. The default is best effort: if it cannot be applied (a kernel
+/// before 5.15 refuses the call), the error is returned as `Ok(Some(_))` and
+/// the ring runs with the kernel's own limits.
+pub fn apply_io_worker_limits(
+    io: &mut dyn AsyncIo,
+    configured: Option<IoWorkerLimits>,
+) -> io::Result<Option<io::Error>> {
+    match io.set_io_worker_limits(configured.unwrap_or(IoWorkerLimits::DEFAULT)) {
+        Ok(()) => Ok(None),
+        Err(e) if configured.is_none() => Ok(Some(e)),
+        Err(e) => Err(e),
+    }
+}
 
 pub trait AsyncIo: Send {
     fn notifier(&self) -> &EventFd;
@@ -196,6 +256,15 @@ pub trait AsyncIo: Send {
     /// submitted. Backends without worker threads drop it.
     fn set_worker_thread_init(&mut self, _init: WorkerThreadInit) {}
 
+    /// Caps the io_uring worker threads the kernel may start for this
+    /// backend's ring. Must be called before any request is submitted, from
+    /// any thread: the kernel applies the limits to each thread when it first
+    /// submits to the ring. Backends without an io_uring ring start no such
+    /// workers and return `Ok`.
+    fn set_io_worker_limits(&mut self, _limits: IoWorkerLimits) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Returns the next owned completion, if one is available.
     ///
     /// Read completions from owned host-memory buffers return that buffer here.
@@ -221,5 +290,109 @@ pub trait AsyncIo: Send {
 
     fn alignment(&self) -> Option<u64> {
         Some(SECTOR_SIZE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Records the limits it is given and refuses them if told to.
+    struct FakeIo {
+        notifier: EventFd,
+        refuse: bool,
+        limits: Option<IoWorkerLimits>,
+    }
+
+    impl FakeIo {
+        fn new(refuse: bool) -> Self {
+            Self {
+                notifier: EventFd::new(0).unwrap(),
+                refuse,
+                limits: None,
+            }
+        }
+    }
+
+    impl AsyncIo for FakeIo {
+        fn notifier(&self) -> &EventFd {
+            &self.notifier
+        }
+        fn submit_data_operation(&mut self, _op: AsyncIoOperation) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn fsync(&mut self, _user_data: Option<u64>) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn punch_hole(&mut self, _offset: u64, _length: u64, _user_data: u64) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn write_zeroes(
+            &mut self,
+            _offset: u64,
+            _length: u64,
+            _user_data: u64,
+        ) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
+            None
+        }
+        fn set_io_worker_limits(&mut self, limits: IoWorkerLimits) -> io::Result<()> {
+            self.limits = Some(limits);
+            if self.refuse {
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    const CONFIGURED: IoWorkerLimits = IoWorkerLimits {
+        bounded: 8,
+        unbounded: 2,
+    };
+
+    #[test]
+    fn io_worker_limits_parse() {
+        assert_eq!(
+            "16:4".parse::<IoWorkerLimits>().unwrap(),
+            IoWorkerLimits::DEFAULT
+        );
+        for bad in ["", "16", "16:", ":4", "16:4:1", "-1:4", "a:4", "16:4.5"] {
+            bad.parse::<IoWorkerLimits>().unwrap_err();
+        }
+    }
+
+    #[test]
+    fn apply_io_worker_limits_applies_the_configured_limits() {
+        let mut io = FakeIo::new(false);
+        assert!(
+            apply_io_worker_limits(&mut io, Some(CONFIGURED))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(io.limits, Some(CONFIGURED));
+    }
+
+    #[test]
+    fn apply_io_worker_limits_applies_the_default_when_none_is_configured() {
+        let mut io = FakeIo::new(false);
+        assert!(apply_io_worker_limits(&mut io, None).unwrap().is_none());
+        assert_eq!(io.limits, Some(IoWorkerLimits::DEFAULT));
+    }
+
+    #[test]
+    fn apply_io_worker_limits_fails_when_configured_limits_are_refused() {
+        let mut io = FakeIo::new(true);
+        let e = apply_io_worker_limits(&mut io, Some(CONFIGURED)).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[test]
+    fn apply_io_worker_limits_runs_uncapped_when_the_default_is_refused() {
+        let mut io = FakeIo::new(true);
+        let refused = apply_io_worker_limits(&mut io, None).unwrap().unwrap();
+        assert_eq!(refused.raw_os_error(), Some(libc::EINVAL));
     }
 }
