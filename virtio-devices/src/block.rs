@@ -2086,6 +2086,10 @@ impl VirtioDevice for Block {
                         "{}: failed to apply iouring_max_workers {:?}: {e}",
                         self.id, self.iouring_max_workers
                     );
+                    // All or nothing, as when a queue thread fails to spawn:
+                    // stop and join the queues already started, so that a
+                    // failed activation leaves no queue running.
+                    self.common.reset();
                     return Err(ActivateError::BadActivate);
                 }
             }
@@ -2327,6 +2331,9 @@ mod tests {
         }
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             None
+        }
+        fn set_io_worker_limits(&mut self, _: IoWorkerLimits) -> IoResult<()> {
+            Ok(())
         }
     }
 
@@ -2572,6 +2579,9 @@ mod tests {
         }
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             self.completions.lock().unwrap().pop_front()
+        }
+        fn set_io_worker_limits(&mut self, _: IoWorkerLimits) -> IoResult<()> {
+            Ok(())
         }
     }
 
@@ -4521,20 +4531,21 @@ mod tests {
     }
 
     /// A raw disk whose queue backends record the io_uring worker limits
-    /// they are given, and refuse them when `refuse` is set.
+    /// they are given, and refuse them from the `refuse_from`th call on
+    /// (counting from 0).
     #[derive(Debug)]
     struct LimitsDisk {
         inner: RawDisk,
-        refuse: bool,
+        refuse_from: Option<usize>,
         applied: Arc<Mutex<Vec<IoWorkerLimits>>>,
     }
 
     impl LimitsDisk {
-        fn new(file: &TempFile, refuse: bool) -> Self {
+        fn new(file: &TempFile, refuse_from: Option<usize>) -> Self {
             file.as_file().set_len(1 << 20).unwrap();
             Self {
                 inner: RawDisk::new(file.as_file().try_clone().unwrap(), RawBackend::Sync, false),
-                refuse,
+                refuse_from,
                 applied: Arc::default(),
             }
         }
@@ -4571,7 +4582,7 @@ mod tests {
         fn create_async_io(&self, _ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
             Ok(Box::new(LimitsIo {
                 noop: Noop(EventFd::new(EFD_NONBLOCK).unwrap()),
-                refuse: self.refuse,
+                refuse_from: self.refuse_from,
                 applied: Arc::clone(&self.applied),
             }))
         }
@@ -4579,7 +4590,7 @@ mod tests {
 
     struct LimitsIo {
         noop: Noop,
-        refuse: bool,
+        refuse_from: Option<usize>,
         applied: Arc<Mutex<Vec<IoWorkerLimits>>>,
     }
 
@@ -4603,8 +4614,9 @@ mod tests {
             None
         }
         fn set_io_worker_limits(&mut self, limits: IoWorkerLimits) -> io::Result<()> {
-            self.applied.lock().unwrap().push(limits);
-            if self.refuse {
+            let mut applied = self.applied.lock().unwrap();
+            applied.push(limits);
+            if self.refuse_from.is_some_and(|n| applied.len() > n) {
                 Err(IoError::from_raw_os_error(libc::EINVAL))
             } else {
                 Ok(())
@@ -4671,7 +4683,7 @@ mod tests {
     #[test]
     fn activate_applies_configured_io_worker_limits_to_every_queue() {
         let file = TempFile::new().unwrap();
-        let disk = LimitsDisk::new(&file, false);
+        let disk = LimitsDisk::new(&file, None);
         let applied = Arc::clone(&disk.applied);
         let (mut blk, result) = activate_limits_disk(disk, Some(CAP));
         blk.reset();
@@ -4682,11 +4694,29 @@ mod tests {
     #[test]
     fn activate_fails_when_configured_io_worker_limits_are_refused() {
         let file = TempFile::new().unwrap();
-        let disk = LimitsDisk::new(&file, true);
+        let disk = LimitsDisk::new(&file, Some(0));
         let applied = Arc::clone(&disk.applied);
         let (mut blk, result) = activate_limits_disk(disk, Some(CAP));
         blk.reset();
         assert!(matches!(result, Err(ActivateError::BadActivate)));
         assert_eq!(*applied.lock().unwrap(), [CAP]);
+    }
+
+    #[test]
+    fn activate_stops_earlier_queues_when_a_later_queue_refuses_io_worker_limits() {
+        let file = TempFile::new().unwrap();
+        let disk = LimitsDisk::new(&file, Some(1));
+        let applied = Arc::clone(&disk.applied);
+        let (mut blk, result) = activate_limits_disk(disk, Some(CAP));
+        // The first queue's thread was started; a failed activation must
+        // have stopped and joined it, before any reset by the caller.
+        let left_running = blk.common.workers.is_some();
+        blk.reset();
+        assert!(matches!(result, Err(ActivateError::BadActivate)));
+        assert_eq!(*applied.lock().unwrap(), [CAP, CAP]);
+        assert!(
+            !left_running,
+            "a failed activation left queue threads running"
+        );
     }
 }

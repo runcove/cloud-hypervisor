@@ -697,13 +697,16 @@ impl Request {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::Arc;
 
     use vm_memory::GuestMemoryMmap;
     use vmm_sys_util::eventfd::EventFd;
 
     use super::*;
-    use crate::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoOperation, AsyncIoResult};
+    use crate::async_io::{
+        AsyncIo, AsyncIoCompletion, AsyncIoOperation, AsyncIoResult, IoWorkerLimits,
+    };
 
     /// Records submitted data operations instead of performing them.
     struct RecordingAsyncIo {
@@ -739,6 +742,9 @@ mod tests {
         }
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             None
+        }
+        fn set_io_worker_limits(&mut self, _: IoWorkerLimits) -> io::Result<()> {
+            Ok(())
         }
     }
 

@@ -132,6 +132,9 @@ and older kernels with per-NUMA-node io-wq pools apply it per node). When
 unset, a cap of `16:4` is applied if the kernel accepts it; if not, a warning
 is logged and the queues run with the kernel's own limits. Backends without an
 io_uring ring start no such workers.
+The trait method `set_io_worker_limits` has no default on purpose: every
+disk-backing implementation must forward or apply the cap, so a rebase that
+adds a wrapper fails to compile instead of dropping the cap.
 
 Raw and fixed VHD data requests under `direct=on` must have offsets and total
 lengths aligned to the backing file's direct I/O requirement. Unaligned requests

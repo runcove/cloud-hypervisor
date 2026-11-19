@@ -11,6 +11,7 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::AlignedFile;
 use crate::async_io::{
     AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, CompletionCommon,
+    IoWorkerLimits,
 };
 use crate::formats::vmdk::descriptor::ExtentAccess;
 use crate::formats::vmdk::flat::VmdkExtent;
@@ -270,6 +271,11 @@ impl AsyncIo for FlatVmdkSync {
                 .complete(AsyncIoCompletion::new(user_data, 0, None));
         }
 
+        Ok(())
+    }
+
+    fn set_io_worker_limits(&mut self, _limits: IoWorkerLimits) -> io::Result<()> {
+        // No io_uring ring: the kernel starts no io_uring workers here.
         Ok(())
     }
 
