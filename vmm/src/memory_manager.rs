@@ -1424,9 +1424,15 @@ impl MemoryManager {
         // faulted, and nothing scans the file. Otherwise the holes are found
         // below and marked served, so a fault on one is resolved as for a
         // discarded page and never reaches the source. Without SEEK_HOLE
-        // support every page is read.
+        // support every page is read. The source opens the file for itself:
+        // it turns the kernel's readahead off on its open file, which a clone
+        // of `snapshot_file` would share with the snapshot writer of a
+        // copy-on-access VM. It opens it through `snapshot_file`'s fd rather
+        // than by path, so that both read the same inode even if the path is
+        // renamed over in between.
         let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(
-            snapshot_file.try_clone().map_err(Error::SnapshotOpen)?,
+            File::open(format!("/proc/self/fd/{}", snapshot_file.as_raw_fd()))
+                .map_err(Error::SnapshotOpen)?,
         ));
         info!(
             "UFFD restore: snapshot file holes are {} and resolved without reading the \
