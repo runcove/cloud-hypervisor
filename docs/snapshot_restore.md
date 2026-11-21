@@ -122,6 +122,17 @@ guest RAM before restore completes. This mode is strict: if Cloud Hypervisor
 cannot enable the `userfaultfd` restore path, restore fails instead of falling
 back to `copy`.
 
+`ondemand` and `copyonaccess` read the snapshot memory file without the
+kernel's readahead, which would read past the snapshot's data into the holes
+beside it and cache a zero page for each hole page. A page in a hole is
+resolved with zeroes without reading the file. When pages are read in order
+(as the background copy of `ondemand` reads them), Cloud Hypervisor reads ahead
+itself, in windows of at most 512 KiB that stop at the end of the data they
+start in, so the host page cache holds no hole page. If the filesystem cannot
+report holes (`lseek` with `SEEK_DATA` or `SEEK_HOLE` fails), every page from
+then on is read from the file and the kernel's readahead is turned back on, so
+the page cache can then hold hole pages too.
+
 If the page source fails during the restore, the guest memory that was not
 restored yet is poisoned so that the guest cannot use it. This needs Linux
 6.6 or later. On older kernels Cloud Hypervisor exits with an error instead.

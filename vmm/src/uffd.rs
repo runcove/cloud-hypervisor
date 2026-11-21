@@ -338,6 +338,12 @@ pub(crate) trait UffdMemorySource: Send {
 /// when a page is resolved, with `lseek(SEEK_DATA)`, rather than listed
 /// up front, so that a fragmented file costs nothing before the guest runs
 /// and no memory beyond the one extent kept here.
+///
+/// The kernel's readahead is turned off for the file, as it reads past the
+/// end of a data extent into the hole beside it and caches zero pages there.
+/// The source reads ahead itself instead, inside the data extent of the page
+/// it reads. The advice holds for the open file description, so `file` must
+/// be opened for the source alone, not cloned from a file read elsewhere.
 pub(crate) struct FileUffdMemorySource {
     file: File,
     buf: Vec<u8>,
@@ -350,6 +356,19 @@ pub(crate) struct FileUffdMemorySource {
     /// read from the file.
     seek_holes: bool,
     zeroes: Vec<u8>,
+    /// The page the source last asked the kernel to read ahead from, and the
+    /// end of what it asked for.
+    read_ahead: (u64, u64),
+    /// How much the source last asked for, before cutting it at the end of
+    /// an extent. Reads in order grow it, up to `READ_AHEAD`.
+    read_ahead_size: u64,
+    /// Whether the last window may end at or past the end of its data
+    /// extent. Otherwise it ends inside data, so no later extent can follow
+    /// on from it.
+    read_ahead_at_extent_end: bool,
+    /// Whether the kernel's own readahead is on for the file: off while the
+    /// source reads ahead itself.
+    kernel_read_ahead: bool,
     /// What the source did, logged when it is dropped: lseek calls made,
     /// pages resolved with zeroes as holes, and pages read from the file.
     lookups: u64,
@@ -367,16 +386,34 @@ struct FileExtent {
 
 impl FileUffdMemorySource {
     pub(crate) fn new(file: File) -> Self {
-        Self {
+        let mut source = Self {
             file,
             buf: Vec::new(),
             extent: None,
             seek_holes: true,
             zeroes: Vec::new(),
+            read_ahead: (0, 0),
+            read_ahead_size: 0,
+            read_ahead_at_extent_end: false,
+            kernel_read_ahead: true,
             lookups: 0,
             hole_pages: 0,
             read_pages: 0,
-        }
+        };
+        source.set_kernel_read_ahead(false);
+        source
+    }
+
+    /// Turns the kernel's readahead on the file on or off. This fails only
+    /// where the file cannot read ahead anyway (a pipe).
+    fn set_kernel_read_ahead(&mut self, on: bool) {
+        let advice = if on {
+            libc::POSIX_FADV_NORMAL
+        } else {
+            libc::POSIX_FADV_RANDOM
+        };
+        advise(&self.file, 0, 0, advice);
+        self.kernel_read_ahead = on;
     }
 
     /// Stops looking holes up after `op` failed at `pos`: every page is then
@@ -389,6 +426,8 @@ impl FileUffdMemorySource {
         );
         self.seek_holes = false;
         self.extent = None;
+        // Without extents the source cannot read ahead: the kernel does.
+        self.set_kernel_read_ahead(true);
     }
 
     /// Whether `[pos, pos + len)` of the file lies wholly inside one hole.
@@ -446,6 +485,97 @@ impl FileUffdMemorySource {
         });
         pos.saturating_add(len) <= hole_end
     }
+
+    /// Asks the kernel to read the file ahead of a read of `len` bytes at
+    /// `pos`, never past the end of the data extent `pos` is in. A read that
+    /// does not follow on from the last one asks for nothing more, so that
+    /// scattered reads cache only the pages read. A read that follows on, or
+    /// reaches half way through the last window, asks for the next window:
+    /// `READ_AHEAD_MIN` bytes first, then four, then two times as many each
+    /// time, up to `READ_AHEAD`, so that reads in order find their pages
+    /// already read. The first page of a data extent follows on from a
+    /// window that ended at the end of the extent before it.
+    ///
+    /// With huge pages the window can be shorter than the read, so reads in
+    /// order do not grow it; each read still caches its whole page.
+    fn read_ahead_in_extent(&mut self, pos: u64, len: u64) {
+        let Some(extent) = self
+            .extent
+            .filter(|e| !e.hole && e.start <= pos && pos < e.end)
+        else {
+            return;
+        };
+        let (start, end) = self.read_ahead;
+        // Four times as large while small, as the kernel grows its own.
+        let factor = if self.read_ahead_size < READ_AHEAD / 4 {
+            4
+        } else {
+            2
+        };
+        let grown = (self.read_ahead_size * factor).min(READ_AHEAD);
+        let (from, size) = if start < end && start <= pos && pos <= end {
+            if end - pos > self.read_ahead_size / 2 {
+                return;
+            }
+            (end, grown)
+        } else if start < end
+            && self.read_ahead_at_extent_end
+            && pos == extent.start
+            && pos > end
+            && {
+                // `extent.start` is where `in_hole` looked the extent up, so
+                // `pos` is the first read in it, not necessarily the extent's
+                // first page. It is that page, following on from a window
+                // that ended at the end of the extent before it past one hole,
+                // if the next data after the window starts at `pos`.
+                self.lookups += 1;
+                matches!(seek_data(self.file.as_fd(), end), Ok(Some(data)) if data == pos)
+            }
+        {
+            (pos, grown)
+        } else {
+            // The window is the read itself, sized so that a read following
+            // on from it asks for `READ_AHEAD_MIN`.
+            self.read_ahead = (pos, pos.saturating_add(len));
+            self.read_ahead_size = READ_AHEAD_MIN / 4;
+            self.read_ahead_at_extent_end = self.read_ahead.1 >= extent.end;
+            return;
+        };
+        let to = extent.end.min(from.saturating_add(size));
+        if from < to {
+            // The kernel may read less than asked, capped by the device's
+            // readahead limits; a later read then reads the rest itself.
+            advise(&self.file, from, to - from, libc::POSIX_FADV_WILLNEED);
+            self.read_ahead = (pos, to);
+            self.read_ahead_size = size;
+            self.read_ahead_at_extent_end = to == extent.end;
+        }
+    }
+}
+
+/// The first window the source asks the kernel to read, when a read follows
+/// on from one that did not.
+const READ_AHEAD_MIN: u64 = 64 << 10;
+
+/// The most the source asks the kernel to read ahead at once, as reads in
+/// order grow the window. With a cold page cache, reading the 571 MB of data
+/// of a sparse 2 GiB file in order took 6.4 s on XFS and 4.2 s on btrfs,
+/// against 11.3 s and 4.3 s with the kernel's readahead (one run each).
+const READ_AHEAD: u64 = 512 << 10;
+
+/// `posix_fadvise(2)` on `[offset, offset + len)` of `file`, all of it when
+/// `len` is 0. Advice only changes how the file is cached, so a failure is
+/// ignored.
+fn advise(file: &File, offset: u64, len: u64, advice: libc::c_int) {
+    // SAFETY: FFI call on an fd `file` owns; no memory is passed.
+    unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            offset as libc::off_t,
+            len as libc::off_t,
+            advice,
+        )
+    };
 }
 
 impl UffdMemorySource for FileUffdMemorySource {
@@ -470,6 +600,7 @@ impl UffdMemorySource for FileUffdMemorySource {
         if self.buf.len() < page_size {
             self.buf.resize(page_size, 0);
         }
+        self.read_ahead_in_extent(file_pos, range.page_size);
         self.file
             .read_exact_at(&mut self.buf[..page_size], file_pos)?;
         self.read_pages += 1;
@@ -826,9 +957,295 @@ mod tests {
         let (read_end, _write_end) =
             unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
         let mut source = FileUffdMemorySource::new(read_end);
+        assert!(!source.kernel_read_ahead);
         assert!(!source.in_hole(0, PAGE));
         assert!(!source.seek_holes);
+        // The kernel reads ahead again, as the source no longer can.
+        assert!(source.kernel_read_ahead);
         assert!(!source.in_hole(PAGE, PAGE));
         assert_eq!(source.extent, None);
+    }
+
+    // Pages of `file` in the page cache, of the `pages` pages from 0.
+    fn cached_pages(file: &File, pages: u64) -> Vec<u64> {
+        use std::ptr;
+
+        let len = (pages * PAGE) as usize;
+        // SAFETY: maps `len` bytes of `file` read-only; unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        let mut vec = vec![0u8; pages as usize];
+        // SAFETY: `vec` holds one byte per page of the mapping.
+        assert_eq!(unsafe { libc::mincore(addr, len, vec.as_mut_ptr()) }, 0);
+        // SAFETY: unmaps the mapping made above.
+        unsafe { libc::munmap(addr, len) };
+        (0..pages)
+            .filter(|&idx| vec[idx as usize] & 1 != 0)
+            .collect()
+    }
+
+    // Drops `file` from the page cache. False where its pages stay cached,
+    // as on tmpfs, where page cache checks are moot. Pages still being read
+    // ahead cannot be dropped yet, so it tries again for a while.
+    fn drop_cached(file: &File, pages: u64) -> bool {
+        use std::time::Duration;
+
+        // Dirty pages stay cached.
+        file.sync_all().unwrap();
+        for _ in 0..50 {
+            // SAFETY: drops the clean pages of `file` from the page cache.
+            let ret =
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            assert_eq!(ret, 0);
+            if cached_pages(file, pages).is_empty() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        eprintln!("note: the file stays in the page cache here, so the page cache check is moot");
+        false
+    }
+
+    // Opens `file` afresh, with `advice` if any.
+    fn reopen(file: &File, advice: Option<libc::c_int>) -> File {
+        let fresh = File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        if let Some(advice) = advice {
+            advise(&fresh, 0, 0, advice);
+        }
+        fresh
+    }
+
+    // Reads the pages `idxs` of `file` through `read`, starting with none
+    // cached, and returns the pages cached then. Leaves none cached.
+    fn cached_after_reads(file: &File, read: &File, idxs: &[u64], pages: u64) -> Vec<u64> {
+        assert!(drop_cached(file, pages));
+        for idx in idxs {
+            read.read_exact_at(&mut [0u8; PAGE as usize], idx * PAGE)
+                .unwrap();
+        }
+        let cached = cached_pages(file, pages);
+        drop_cached(file, pages);
+        cached
+    }
+
+    // The pages cached by reads of `idxs` on `file` opened afresh, with no
+    // advice and with POSIX_FADV_RANDOM. None where that check is moot: the
+    // file stays in the page cache (tmpfs) or the advice changes nothing.
+    fn kernel_read_ahead_effect(file: &File, idxs: &[u64], pages: u64) -> Option<[Vec<u64>; 2]> {
+        if !drop_cached(file, pages) {
+            return None;
+        }
+        let normal = cached_after_reads(file, &reopen(file, None), idxs, pages);
+        let random = cached_after_reads(
+            file,
+            &reopen(file, Some(libc::POSIX_FADV_RANDOM)),
+            idxs,
+            pages,
+        );
+        if normal == random {
+            eprintln!(
+                "note: POSIX_FADV_RANDOM changes nothing here, so the page cache check is moot"
+            );
+            return None;
+        }
+        Some([normal, random])
+    }
+
+    #[test]
+    fn source_turns_kernel_read_ahead_off() {
+        let pages = 64;
+        let Some(file) = file_with_data_pages(pages, |_| true) else {
+            return;
+        };
+        let reads = [8, 9, 10, 11];
+        let effect = kernel_read_ahead_effect(&file, &reads, pages);
+        let source = FileUffdMemorySource::new(reopen(&file, None));
+        assert!(!source.kernel_read_ahead);
+        // Reads in order through the source's file cache fewer pages than
+        // the kernel reads ahead for them.
+        if let Some([normal, _]) = effect {
+            let cached = cached_after_reads(&file, &source.file, &reads, pages);
+            assert!(cached.len() < normal.len(), "{cached:?} {normal:?}");
+        }
+    }
+
+    #[test]
+    fn read_ahead_stays_inside_the_data_extent() {
+        // Data in pages 0 to 199 and 264 to 299, a hole in between.
+        let ra_min = READ_AHEAD_MIN / PAGE;
+        let ra = READ_AHEAD / PAGE;
+        assert_eq!((ra_min, ra), (16, 128), "windows below assume these");
+        let pages = 300;
+        let data = |idx| !(200..264).contains(&idx);
+        let Some(file) = file_with_data_pages(pages, data) else {
+            return;
+        };
+        let checks_cache = drop_cached(&file, pages);
+        let mut source = FileUffdMemorySource::new(file.try_clone().unwrap());
+        let mut buf = [0u8; PAGE as usize];
+        // Each data page in order, as resolve reads it.
+        let mut windows = Vec::new();
+        for idx in (0..pages).filter(|&idx| data(idx)) {
+            assert!(!source.in_hole(idx * PAGE, PAGE));
+            source.read_ahead_in_extent(idx * PAGE, PAGE);
+            if windows.last() != Some(&source.read_ahead) {
+                windows.push(source.read_ahead);
+            }
+            source.file.read_exact_at(&mut buf, idx * PAGE).unwrap();
+        }
+        // The first page alone; from the second page on, a window of 16
+        // pages, then 64, then 128, each asked for half way through the last
+        // and cut at the end of the extent. The second extent follows on
+        // from the first past the hole, so its window stays at 128 pages,
+        // cut at the end of the file.
+        assert_eq!(
+            windows,
+            [(0, 1), (1, 17), (9, 81), (49, 200), (264, 300)].map(|(s, e)| (s * PAGE, e * PAGE))
+        );
+        // Nothing read ahead into the hole.
+        if checks_cache {
+            let cached = cached_pages(&file, pages);
+            assert!(cached.iter().all(|&idx| data(idx)), "cached {cached:?}");
+        }
+    }
+
+    #[test]
+    fn scattered_reads_read_nothing_ahead() {
+        let pages = 300;
+        let Some(file) = file_with_data_pages(pages, |_| true) else {
+            return;
+        };
+        let reads = [150, 10, 280, 12];
+        // What the reads cache on their own, with no readahead.
+        let read_alone = drop_cached(&file, pages).then(|| {
+            let random = reopen(&file, Some(libc::POSIX_FADV_RANDOM));
+            cached_after_reads(&file, &random, &reads, pages)
+        });
+        let mut source = FileUffdMemorySource::new(reopen(&file, None));
+        let mut buf = [0u8; PAGE as usize];
+        for idx in reads {
+            assert!(!source.in_hole(idx * PAGE, PAGE));
+            source.read_ahead_in_extent(idx * PAGE, PAGE);
+            assert_eq!(source.read_ahead, (idx * PAGE, (idx + 1) * PAGE));
+            source.file.read_exact_at(&mut buf, idx * PAGE).unwrap();
+        }
+        if let Some(read_alone) = read_alone {
+            assert_eq!(cached_pages(&file, pages), read_alone);
+        }
+    }
+
+    #[test]
+    fn stopping_hole_lookups_turns_kernel_read_ahead_back_on() {
+        let pages = 64;
+        let Some(file) = file_with_data_pages(pages, |_| true) else {
+            return;
+        };
+        let reads = [8, 9, 10, 11];
+        let effect = kernel_read_ahead_effect(&file, &reads, pages);
+        let mut source = FileUffdMemorySource::new(reopen(&file, None));
+        source.stop_seeking("SEEK_DATA", 0, &io::Error::from_raw_os_error(libc::EIO));
+        assert!(source.kernel_read_ahead);
+        assert!(!source.in_hole(0, PAGE));
+        source.read_ahead_in_extent(0, PAGE);
+        assert_eq!(source.read_ahead, (0, 0));
+        // Reads in order cache more than the pages read: the kernel reads
+        // ahead for them.
+        if effect.is_some() {
+            let cached = cached_after_reads(&file, &source.file, &reads, pages);
+            assert!(cached.len() > reads.len(), "{cached:?}");
+        }
+    }
+
+    // Resolves the read of `len` bytes at page `idx` as `resolve` does, up to
+    // the read, and returns the window then.
+    fn read_ahead_for(source: &mut FileUffdMemorySource, idx: u64, len: u64) -> (u64, u64) {
+        assert!(!source.in_hole(idx * PAGE, len));
+        source.read_ahead_in_extent(idx * PAGE, len);
+        source.read_ahead
+    }
+
+    #[test]
+    fn forward_jump_into_a_new_extent_reads_nothing_ahead() {
+        // Data in pages 0 to 99 and 164 to 299, a hole in between.
+        let pages = 300;
+        let data = |idx| !(100..164).contains(&idx);
+        let Some(file) = file_with_data_pages(pages, data) else {
+            return;
+        };
+        let pg = |(s, e): (u64, u64)| (s * PAGE, e * PAGE);
+
+        // A window that ends inside data: a jump past it into the next
+        // extent, data in between, needs no lseek to tell it does not follow
+        // on.
+        let mut source = FileUffdMemorySource::new(file.try_clone().unwrap());
+        read_ahead_for(&mut source, 0, PAGE);
+        assert_eq!(read_ahead_for(&mut source, 1, PAGE), pg((1, 17)));
+        let lookups = source.lookups;
+        assert_eq!(read_ahead_for(&mut source, 200, PAGE), pg((200, 201)));
+        // Two to find the extent of page 200, none to check the window.
+        assert_eq!(source.lookups, lookups + 2);
+
+        // A window that ends at the end of its extent: a jump into the next
+        // extent past its first page, data in between, looks the next data
+        // up from the end of the window, which is not the page read.
+        let mut source = FileUffdMemorySource::new(file.try_clone().unwrap());
+        read_ahead_for(&mut source, 98, PAGE);
+        assert_eq!(read_ahead_for(&mut source, 99, PAGE), pg((99, 100)));
+        assert!(source.read_ahead_at_extent_end);
+        let lookups = source.lookups;
+        assert_eq!(read_ahead_for(&mut source, 180, PAGE), pg((180, 181)));
+        assert_eq!(source.lookups, lookups + 3);
+        assert_eq!(source.read_ahead_size, READ_AHEAD_MIN / 4);
+
+        // The same window, then the first page of the next extent: it
+        // follows on, past the hole.
+        let mut source = FileUffdMemorySource::new(file);
+        read_ahead_for(&mut source, 98, PAGE);
+        read_ahead_for(&mut source, 99, PAGE);
+        assert_eq!(read_ahead_for(&mut source, 164, PAGE), pg((164, 228)));
+    }
+
+    #[test]
+    fn read_ahead_of_huge_pages_stays_inside_the_data_extent() {
+        // Four huge pages of data, one of hole, then one of data.
+        const HUGE: u64 = 2 << 20;
+        let per_huge = HUGE / PAGE;
+        let pages = 6 * per_huge;
+        let data = |idx| idx / per_huge != 4;
+        let Some(file) = file_with_data_pages(pages, data) else {
+            return;
+        };
+        let mut source = FileUffdMemorySource::new(file);
+        let mut windows = Vec::new();
+        for huge in (0..6).filter(|&huge| huge != 4) {
+            let window = read_ahead_for(&mut source, huge * per_huge, HUGE);
+            windows.push((window.0 / PAGE, window.1 / PAGE));
+        }
+        // The first read is its own window. The next follows on and asks for
+        // 16 pages, its own first ones, so the third does not follow on from
+        // that window and starts again. The last huge page holds a new extent
+        // that does not follow on from the window inside the one before it.
+        let p = per_huge;
+        assert_eq!(
+            windows,
+            [
+                (0, p),
+                (p, p + 16),
+                (2 * p, 3 * p),
+                (3 * p, 3 * p + 16),
+                (5 * p, 6 * p)
+            ]
+        );
+        // No window reaches the hole.
+        assert!(windows.iter().all(|&(s, e)| e <= 4 * p || s >= 5 * p));
     }
 }
