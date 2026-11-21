@@ -1347,4 +1347,71 @@ mod tests {
         // No window reaches the hole.
         assert!(windows.iter().all(|&(s, e)| e <= 4 * p || s >= 5 * p));
     }
+
+    // The file source runs on the vmm thread, where it is built, and on the
+    // uffd-handler thread, which inherits the vmm thread's filter. Each
+    // system call it makes must pass that filter: one that does not killed
+    // every UFFD restore with SIGSYS. The filter here fails a refused call
+    // with EUCLEAN rather than killing the test.
+    #[cfg(feature = "kvm")]
+    #[test]
+    fn file_source_passes_the_vmm_seccomp_filter() {
+        use seccompiler::SeccompAction;
+
+        use crate::seccomp_filters::{Thread, get_seccomp_filter};
+
+        // Data in pages 0 to 31 and 48 to 63, a hole in between.
+        let pages = 64;
+        let data = |idx| !(32..48).contains(&idx);
+        let Some(file) = file_with_data_pages(pages, data) else {
+            return;
+        };
+        let filter = get_seccomp_filter(
+            &SeccompAction::Errno(libc::EUCLEAN as u32),
+            Thread::Vmm,
+            Some(hypervisor::HypervisorType::Kvm),
+        )
+        .unwrap();
+        thread::spawn(move || {
+            seccompiler::apply_filter(&filter).unwrap();
+            let fadvise = |advice| {
+                // SAFETY: FFI call on an fd `file` owns; no memory is passed.
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) }
+            };
+            // The filter is in force: advice the source never gives is
+            // refused.
+            assert_eq!(fadvise(libc::POSIX_FADV_DONTNEED), libc::EUCLEAN);
+            // Each advice the source gives passes.
+            for advice in [
+                libc::POSIX_FADV_RANDOM,
+                libc::POSIX_FADV_WILLNEED,
+                libc::POSIX_FADV_NORMAL,
+            ] {
+                assert_eq!(fadvise(advice), 0, "advice {advice}");
+            }
+
+            // The source's own path: opened as restore_by_uffd opens it,
+            // holes looked up with SEEK_DATA and SEEK_HOLE, the file's size
+            // read past the last data, reads ahead and reads in order, and
+            // the kernel's readahead turned back on.
+            let mut source = FileUffdMemorySource::new(
+                File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap(),
+            );
+            let mut buf = [0u8; PAGE as usize];
+            for idx in 0..pages {
+                assert_eq!(source.in_hole(idx * PAGE, PAGE), !data(idx), "page {idx}");
+                if data(idx) {
+                    source.read_ahead_in_extent(idx * PAGE, PAGE);
+                    source.file.read_exact_at(&mut buf, idx * PAGE).unwrap();
+                }
+            }
+            assert!(source.seek_holes, "a hole lookup failed");
+            assert!(source.read_ahead.1 > PAGE, "nothing was read ahead");
+            assert!(!source.in_hole(pages * PAGE, PAGE));
+            source.stop_seeking("SEEK_DATA", 0, &io::Error::from_raw_os_error(libc::EIO));
+            assert!(source.kernel_read_ahead);
+        })
+        .join()
+        .unwrap();
+    }
 }
