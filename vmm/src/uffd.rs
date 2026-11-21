@@ -1261,12 +1261,16 @@ mod tests {
 
         use crate::seccomp_filters::{Thread, get_seccomp_filter};
 
-        // Data in pages 0 to 31 and 48 to 63, a hole in between.
+        // Data in pages 0 to 31 and 48 to 63, a hole in between. None on a
+        // filesystem without SEEK_HOLE: the filter is checked all the same,
+        // on a plain file, and only the source's own path is skipped.
         let pages = 64;
         let data = |idx| !(32..48).contains(&idx);
-        let Some(file) = file_with_data_pages(pages, data) else {
-            return;
-        };
+        let holey = file_with_data_pages(pages, data);
+        if holey.is_none() {
+            eprintln!("skipping: the source's own path, the filter is still checked");
+        }
+        let plain = tempfile::tempfile().unwrap();
         let filter = get_seccomp_filter(
             &SeccompAction::Errno(libc::EUCLEAN as u32),
             Thread::Vmm,
@@ -1276,8 +1280,8 @@ mod tests {
         thread::spawn(move || {
             seccompiler::apply_filter(&filter).unwrap();
             let fadvise = |advice| {
-                // SAFETY: FFI call on an fd `file` owns; no memory is passed.
-                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) }
+                // SAFETY: FFI call on an fd `plain` owns; no memory is passed.
+                unsafe { libc::posix_fadvise(plain.as_raw_fd(), 0, 0, advice) }
             };
             // The filter is in force: advice the source never gives is
             // refused.
@@ -1291,6 +1295,9 @@ mod tests {
                 assert_eq!(fadvise(advice), 0, "advice {advice}");
             }
 
+            let Some(file) = holey else {
+                return;
+            };
             // The source's own path: opened as restore_by_uffd opens it,
             // holes looked up with SEEK_DATA and SEEK_HOLE, the file's size
             // read past the last data, reads ahead and reads in order, and
