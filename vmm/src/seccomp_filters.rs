@@ -758,6 +758,33 @@ fn vmm_thread_rules(
         (libc::SYS_eventfd2, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_exit_group, vec![]),
+        // UFFD restore's file source, built on this thread and run on the
+        // uffd-handler thread it spawns (which inherits this filter), turns
+        // the kernel's readahead off and on and reads ahead itself. Only
+        // the advice it gives.
+        (
+            libc::SYS_fadvise64,
+            or![
+                and![Cond::new(
+                    3,
+                    ArgLen::Dword,
+                    Eq,
+                    libc::POSIX_FADV_NORMAL as u64
+                )?],
+                and![Cond::new(
+                    3,
+                    ArgLen::Dword,
+                    Eq,
+                    libc::POSIX_FADV_RANDOM as u64
+                )?],
+                and![Cond::new(
+                    3,
+                    ArgLen::Dword,
+                    Eq,
+                    libc::POSIX_FADV_WILLNEED as u64
+                )?],
+            ],
+        ),
         (libc::SYS_fallocate, vec![]),
         (libc::SYS_fcntl, vec![]),
         (libc::SYS_fdatasync, vec![]),
