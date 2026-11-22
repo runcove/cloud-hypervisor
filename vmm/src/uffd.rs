@@ -437,12 +437,12 @@ impl FileUffdMemorySource {
             Ok(reopened) => match Self::same_inode(snapshot, &reopened) {
                 Ok(true) => return Ok(reopened),
                 Ok(false) => "it opened a different file".to_string(),
-                Err(e) => format!("cannot compare it with the snapshot file: {e}"),
+                Err(e) => format!("it could not be compared with the snapshot file: {e}"),
             },
-            Err(e) => e.to_string(),
+            Err(e) => format!("the open failed: {e}"),
         };
         log::warn!(
-            "UFFD restore: cannot open the snapshot file again through {}: {why}; \
+            "UFFD restore: did not reopen the snapshot file through {} ({why}); \
              reading it through a clone of its descriptor, which shares the \
              source's readahead advice with the snapshot writer",
             path.display()
@@ -1461,6 +1461,7 @@ mod tests {
     #[test]
     fn file_source_passes_the_vmm_seccomp_filter() {
         use std::io::{Seek, SeekFrom};
+        use std::mem::MaybeUninit;
 
         use seccompiler::SeccompAction;
 
@@ -1517,6 +1518,18 @@ mod tests {
             ] {
                 assert_eq!(fadvise(advice), 0, "advice {advice}");
             }
+
+            // This guards the SYS_fstat syscall that musl's fstat makes: the
+            // shipped static binary is musl. std's metadata() is statx on gnu
+            // and fstat on musl, so the inode check below passes by whichever
+            // the build uses. Make the syscall directly, because glibc 2.33+
+            // may route fstat() to newfstatat, which would leave SYS_fstat
+            // unexercised on a gnu build.
+            let mut st = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: FFI call on an fd `plain` owns, with a pointer to
+            // storage for one stat that the call fills in or leaves unread.
+            let ret = unsafe { libc::syscall(libc::SYS_fstat, plain.as_raw_fd(), st.as_mut_ptr()) };
+            assert_eq!(ret, 0, "fstat was refused: {}", io::Error::last_os_error());
 
             // The file a source reads through, as restore_by_uffd gets it:
             // reopened through /proc and checked to be the same inode, and,
