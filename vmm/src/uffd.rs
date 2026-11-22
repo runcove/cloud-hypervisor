@@ -17,6 +17,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Error, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileExt;
+use std::path::Path;
 use std::{fmt, thread};
 
 use vm_allocator::page_size::get_page_size;
@@ -473,6 +474,39 @@ impl FileUffdMemorySource {
         };
         source.set_kernel_read_ahead(false);
         source
+    }
+
+    /// A file for a source to read `snapshot` through: `snapshot` opened
+    /// again through `/proc/self/fd`, a new open file description of the
+    /// same inode, so that the advice the source gives does not reach
+    /// whoever else reads `snapshot`.
+    ///
+    /// Where that fails, as where `/proc` is not mounted, it is a clone
+    /// (`dup`) of `snapshot` instead, and the restore still reads the same
+    /// pages of the same inode. What the clone gives up is that separation:
+    /// the two share one open file description, so the source's
+    /// `POSIX_FADV_RANDOM` turns the kernel's readahead off for `snapshot`
+    /// too. A copy-on-access VM's snapshot writer then reads the pages the
+    /// guest never accessed from `snapshot` without kernel readahead, which
+    /// is slower but reads the same bytes. Both read at explicit offsets
+    /// (`pread`, `lseek(SEEK_DATA)`), so the file position they now share
+    /// changes nothing.
+    pub(crate) fn open_file(snapshot: &File) -> io::Result<File> {
+        Self::open_file_in(snapshot, Path::new("/proc/self/fd"))
+    }
+
+    /// `open_file` with `fd_dir` in place of `/proc/self/fd`.
+    pub(crate) fn open_file_in(snapshot: &File, fd_dir: &Path) -> io::Result<File> {
+        let path = fd_dir.join(snapshot.as_raw_fd().to_string());
+        File::open(&path).or_else(|e| {
+            log::warn!(
+                "UFFD restore: cannot open the snapshot file again through {}: {e}; \
+                 reading it through a clone of its descriptor, which shares the \
+                 source's readahead advice with the snapshot writer",
+                path.display()
+            );
+            snapshot.try_clone()
+        })
     }
 
     /// Turns the kernel's readahead on the file on or off. This fails only
@@ -961,6 +995,38 @@ mod tests {
             }
         }
         Some(file)
+    }
+
+    #[test]
+    fn open_file_falls_back_to_a_clone_without_proc() {
+        use std::io::{Seek, SeekFrom};
+
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(&[0x5a; PAGE as usize], 0).unwrap();
+        // The open file description is told apart by its position: a clone
+        // shares it, a file opened again does not.
+        let shares_position = |other: &File| {
+            (&*other).seek(SeekFrom::Start(0)).unwrap();
+            (&file).seek(SeekFrom::Start(7)).unwrap();
+            (&*other).stream_position().unwrap() == 7
+        };
+
+        if Path::new("/proc/self/fd").is_dir() {
+            let reopened = FileUffdMemorySource::open_file(&file).unwrap();
+            assert!(!shares_position(&reopened));
+        } else {
+            eprintln!("note: /proc is not mounted here, so the reopen is not checked");
+        }
+
+        // Where the reopen fails, the source reads the same file through a
+        // clone, and reads the right page.
+        let no_proc = tempfile::tempdir().unwrap();
+        let cloned = FileUffdMemorySource::open_file_in(&file, &no_proc.path().join("fd")).unwrap();
+        assert!(shares_position(&cloned));
+        let source = FileUffdMemorySource::new(cloned);
+        let mut buf = [0u8; PAGE as usize];
+        source.file.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(buf, [0x5a; PAGE as usize]);
     }
 
     #[test]

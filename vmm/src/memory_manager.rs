@@ -1424,15 +1424,15 @@ impl MemoryManager {
         // faulted, and nothing scans the file. Otherwise the holes are found
         // below and marked served, so a fault on one is resolved as for a
         // discarded page and never reaches the source. Without SEEK_HOLE
-        // support every page is read. The source opens the file for itself:
-        // it turns the kernel's readahead off on its open file, which a clone
-        // of `snapshot_file` would share with the snapshot writer of a
+        // support every page is read. The source opens the file for itself: it
+        // turns the kernel's readahead off on its open file, which a clone of
+        // `snapshot_file` would share with the snapshot writer of a
         // copy-on-access VM. It opens it through `snapshot_file`'s fd rather
         // than by path, so that both read the same inode even if the path is
-        // renamed over in between.
+        // renamed over in between. Where /proc is not mounted it reads through
+        // a clone instead (see `open_file`).
         let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(
-            File::open(format!("/proc/self/fd/{}", snapshot_file.as_raw_fd()))
-                .map_err(Error::SnapshotOpen)?,
+            FileUffdMemorySource::open_file(&snapshot_file).map_err(Error::SnapshotOpen)?,
         ));
         info!(
             "UFFD restore: snapshot file holes are {} and resolved without reading the \
@@ -6928,6 +6928,52 @@ mod tests {
     #[test]
     fn copy_on_access_handler_copies_only_accessed_pages_shared() {
         check_copy_on_access_handler(true);
+    }
+
+    #[test]
+    fn uffd_handler_serves_pages_through_a_clone_without_proc() {
+        use std::os::unix::fs::FileExt;
+
+        let page = get_page_size();
+        let pages = 8;
+        let len = pages * page;
+        let gm = test_guest_memory(false, len);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let ranges: Box<[UffdRange]> = uffd.ranges().into();
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
+        let file = tempfile::tempfile().unwrap();
+        for idx in 0..pages {
+            file.write_all_at(&vec![0xb0 + idx as u8; page as usize], idx * page)
+                .unwrap();
+        }
+        // As where /proc is not mounted: the reopen fails, so the source
+        // reads through a clone of `file`.
+        let no_proc = tempfile::tempdir().unwrap();
+        let source_file =
+            FileUffdMemorySource::open_file_in(&file, &no_proc.path().join("fd")).unwrap();
+        let handler = TestHandler::spawn(uffd, source_file, Arc::clone(&served), true);
+
+        // Each page the guest reads is the file's page at its offset, out of
+        // order as faults come.
+        for idx in [5, 0, 7, 2] {
+            let gpa = GuestAddress(idx * page);
+            assert_eq!(
+                gm.read_obj::<u64>(gpa).unwrap(),
+                u64::from_ne_bytes([0xb0 + idx as u8; 8])
+            );
+            let last = GuestAddress(idx * page + page - 1);
+            assert_eq!(gm.read_obj::<u8>(last).unwrap(), 0xb0 + idx as u8);
+        }
+        handler.stop();
+        for idx in 0..pages {
+            assert_eq!(
+                served[0].is_bit_set(idx as usize),
+                [5, 0, 7, 2].contains(&idx),
+                "page {idx}"
+            );
+        }
     }
 
     // How many of the pages of `[off, off + len)` of `file` are in the
