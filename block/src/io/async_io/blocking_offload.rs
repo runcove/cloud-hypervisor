@@ -385,6 +385,23 @@ mod tests {
         }
     }
 
+    /// Reads the completion eventfd, waiting until it is readable: the worker
+    /// queues a completion before it signals, so `wait_completion` can return
+    /// before the write lands, and the non-blocking read would get EAGAIN.
+    fn read_notifier(notifier: &EventFd, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match notifier.read() {
+                Ok(count) => return count,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "Timed out waiting for notifier");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("Failed reading notifier: {e}"),
+            }
+        }
+    }
+
     fn enospc(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSPC))
     }
@@ -451,7 +468,7 @@ mod tests {
             offload.submit(BlockingOp::PunchHole, 0, 4096, 7);
             let completion = wait_completion(&mut offload, Duration::from_secs(5));
             assert_eq!((completion.user_data, completion.result), (7, expected));
-            assert_eq!(notifier.read().unwrap(), 1);
+            assert_eq!(read_notifier(&notifier, Duration::from_secs(5)), 1);
         }
     }
 
