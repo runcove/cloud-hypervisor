@@ -16,7 +16,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Error, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::{fmt, thread};
 
@@ -425,17 +425,37 @@ impl FileUffdMemorySource {
     }
 
     /// `open_file` with `fd_dir` in place of `/proc/self/fd`.
+    ///
+    /// A file opened through `fd_dir` is used only if it is the same inode
+    /// as `snapshot` (same `st_dev` and `st_ino`): if something other than
+    /// the kernel's `/proc` is mounted there, the source would otherwise
+    /// serve the guest another file's pages. Where it is not, the source
+    /// reads through a clone as where the open fails.
     pub(crate) fn open_file_in(snapshot: &File, fd_dir: &Path) -> io::Result<File> {
         let path = fd_dir.join(snapshot.as_raw_fd().to_string());
-        File::open(&path).or_else(|e| {
-            log::warn!(
-                "UFFD restore: cannot open the snapshot file again through {}: {e}; \
-                 reading it through a clone of its descriptor, which shares the \
-                 source's readahead advice with the snapshot writer",
-                path.display()
-            );
-            snapshot.try_clone()
-        })
+        let why = match File::open(&path) {
+            Ok(reopened) => match Self::same_inode(snapshot, &reopened) {
+                Ok(true) => return Ok(reopened),
+                Ok(false) => "it opened a different file".to_string(),
+                Err(e) => format!("cannot compare it with the snapshot file: {e}"),
+            },
+            Err(e) => e.to_string(),
+        };
+        log::warn!(
+            "UFFD restore: cannot open the snapshot file again through {}: {why}; \
+             reading it through a clone of its descriptor, which shares the \
+             source's readahead advice with the snapshot writer",
+            path.display()
+        );
+        snapshot.try_clone()
+    }
+
+    /// Whether `a` and `b` are the same inode: the same `st_dev` and
+    /// `st_ino`, from the metadata of each (`statx` or `fstat`, depending
+    /// on the libc).
+    fn same_inode(a: &File, b: &File) -> io::Result<bool> {
+        let (a, b) = (a.metadata()?, b.metadata()?);
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
     }
 
     /// Turns the kernel's readahead on the file on or off. This fails only
@@ -945,6 +965,31 @@ mod tests {
     }
 
     #[test]
+    fn open_file_falls_back_to_a_clone_when_the_reopen_is_another_file() {
+        use std::fs;
+        use std::io::{Seek, SeekFrom};
+
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(&[0x5a; PAGE as usize], 0).unwrap();
+        // Something other than /proc where the fd directory should be: the
+        // name of `file`'s fd opens another file, which the source must not
+        // serve the guest.
+        let fake_proc = tempfile::tempdir().unwrap();
+        let other = fake_proc.path().join(file.as_raw_fd().to_string());
+        fs::write(&other, [0xa5; PAGE as usize]).unwrap();
+
+        let opened = FileUffdMemorySource::open_file_in(&file, fake_proc.path()).unwrap();
+        // It is a clone of `file`: one open file description, so a seek on
+        // one moves the other.
+        (&opened).seek(SeekFrom::Start(0)).unwrap();
+        (&file).seek(SeekFrom::Start(7)).unwrap();
+        assert_eq!((&opened).stream_position().unwrap(), 7);
+        let mut buf = [0u8; PAGE as usize];
+        opened.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(buf, [0x5a; PAGE as usize]);
+    }
+
+    #[test]
     fn in_hole_finds_each_hole_of_a_fragmented_file() {
         // 2048 holes of one page each, between pages of data.
         let pages = 4096;
@@ -1415,6 +1460,8 @@ mod tests {
     #[cfg(feature = "kvm")]
     #[test]
     fn file_source_passes_the_vmm_seccomp_filter() {
+        use std::io::{Seek, SeekFrom};
+
         use seccompiler::SeccompAction;
 
         use crate::seccomp_filters::{Thread, get_seccomp_filter};
@@ -1429,6 +1476,24 @@ mod tests {
             eprintln!("skipping: the source's own path, the filter is still checked");
         }
         let plain = tempfile::tempfile().unwrap();
+        // Made, and removed, outside the filter, which refuses mkdir.
+        let no_proc = tempfile::tempdir().unwrap();
+        let no_proc_fd = no_proc.path().join("fd");
+        // Whether /proc/self/fd reopens `plain` here, checked before the
+        // filter is in force, so that a reopen the filter refuses fails the
+        // test rather than passing as a fallback. Reading metadata here also
+        // settles std's statx probe, so that inside the filter std does not
+        // quietly fall back from a refused statx to fstat.
+        let proc_usable = File::open(format!("/proc/self/fd/{}", plain.as_raw_fd()))
+            .and_then(|f| FileUffdMemorySource::same_inode(&plain, &f))
+            .unwrap_or(false);
+        plain.metadata().unwrap();
+        if !proc_usable {
+            eprintln!(
+                "note: /proc/self/fd does not reopen a file here, so the reopen \
+                 is not checked under the filter"
+            );
+        }
         let filter = get_seccomp_filter(
             &SeccompAction::Errno(libc::EUCLEAN as u32),
             Thread::Vmm,
@@ -1453,6 +1518,28 @@ mod tests {
                 assert_eq!(fadvise(advice), 0, "advice {advice}");
             }
 
+            // The file a source reads through, as restore_by_uffd gets it:
+            // reopened through /proc and checked to be the same inode, and,
+            // where the reopen fails, a clone of the held fd instead. Both
+            // paths pass the filter. open_file falls back to a clone when a
+            // call is refused, so each path is told apart by whether it
+            // shares `plain`'s file position (lseek passes the filter).
+            let shares_position = |other: &File| {
+                (&*other).seek(SeekFrom::Start(0)).unwrap();
+                (&plain).seek(SeekFrom::Start(7)).unwrap();
+                (&*other).stream_position().unwrap() == 7
+            };
+            if proc_usable {
+                let reopened = FileUffdMemorySource::open_file(&plain).unwrap();
+                assert!(
+                    !shares_position(&reopened),
+                    "the /proc reopen or its inode check was refused"
+                );
+                assert!(FileUffdMemorySource::same_inode(&plain, &reopened).unwrap());
+            }
+            let cloned = FileUffdMemorySource::open_file_in(&plain, &no_proc_fd).unwrap();
+            assert!(shares_position(&cloned));
+
             let Some(file) = holey else {
                 return;
             };
@@ -1460,9 +1547,8 @@ mod tests {
             // holes looked up with SEEK_DATA and SEEK_HOLE, the file's size
             // read past the last data, reads ahead and reads in order, and
             // the kernel's readahead turned back on.
-            let mut source = FileUffdMemorySource::new(
-                File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap(),
-            );
+            let mut source =
+                FileUffdMemorySource::new(FileUffdMemorySource::open_file(&file).unwrap());
             let mut buf = [0u8; PAGE as usize];
             for idx in 0..pages {
                 assert_eq!(source.in_hole(idx * PAGE, PAGE), !data(idx), "page {idx}");
