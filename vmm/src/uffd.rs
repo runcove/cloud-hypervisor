@@ -980,12 +980,26 @@ mod tests {
 
     // A file of `pages` pages of 4 KiB, data in each page `data` picks and
     // holes elsewhere. None unless SEEK_DATA reports exactly that.
+    //
+    // The data does not compress, as a guest's memory mostly does not: btrfs
+    // mounted with compression reads a compressed extent, up to 128 KiB,
+    // whole into the page cache, whatever the advice, which hid the kernel's
+    // readahead from the page cache checks below.
     fn file_with_data_pages(pages: u64, data: impl Fn(u64) -> bool) -> Option<File> {
         let file = tempfile::tempfile().unwrap();
         file.set_len(pages * PAGE).unwrap();
+        let mut buf = [0u8; PAGE as usize];
         for idx in (0..pages).filter(|&idx| data(idx)) {
-            file.write_all_at(&[0xa5; PAGE as usize], idx * PAGE)
-                .unwrap();
+            // splitmix64, seeded by the page's index.
+            let mut x = idx.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            for word in buf.as_chunks_mut::<8>().0 {
+                x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = x;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                *word = (z ^ (z >> 31)).to_ne_bytes();
+            }
+            file.write_all_at(&buf, idx * PAGE).unwrap();
         }
         for idx in 0..pages {
             let seen = seek_data(file.as_fd(), idx * PAGE);
@@ -1166,6 +1180,27 @@ mod tests {
             .collect()
     }
 
+    // The filesystem `file` is on, for the notes below.
+    fn fs_name(file: &File) -> String {
+        use std::mem;
+
+        // SAFETY: a statfs is plain data, for which all zeroes is valid.
+        let mut st: libc::statfs = unsafe { mem::zeroed() };
+        // SAFETY: fstatfs() writes only `st`, for an fd `file` owns.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } != 0 {
+            return "an unknown filesystem".to_string();
+        }
+        let name = match st.f_type {
+            libc::BTRFS_SUPER_MAGIC => "btrfs",
+            libc::EXT4_SUPER_MAGIC => "ext4",
+            libc::XFS_SUPER_MAGIC => "xfs",
+            libc::TMPFS_MAGIC => "tmpfs",
+            libc::OVERLAYFS_SUPER_MAGIC => "overlayfs",
+            other => return format!("the filesystem of type {other:#x}"),
+        };
+        name.to_string()
+    }
+
     // Drops `file` from the page cache. False where its pages stay cached,
     // as on tmpfs, where page cache checks are moot. Pages still being read
     // ahead cannot be dropped yet, so it tries again for a while.
@@ -1184,7 +1219,11 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        eprintln!("note: the file stays in the page cache here, so the page cache check is moot");
+        eprintln!(
+            "note: on {}, POSIX_FADV_DONTNEED leaves the file in the page cache (on tmpfs \
+             the page cache is the file), so the page cache check is moot",
+            fs_name(file)
+        );
         false
     }
 
@@ -1226,7 +1265,9 @@ mod tests {
         );
         if normal == random {
             eprintln!(
-                "note: POSIX_FADV_RANDOM changes nothing here, so the page cache check is moot"
+                "note: on {}, reads of pages {idxs:?} cache pages {normal:?} with the kernel's \
+                 readahead on and off alike, so the page cache check is moot",
+                fs_name(file)
             );
             return None;
         }
@@ -1249,6 +1290,49 @@ mod tests {
             let cached = cached_after_reads(&file, &source.file, &reads, pages);
             assert!(cached.len() < normal.len(), "{cached:?} {normal:?}");
         }
+    }
+
+    // What POSIX_FADV_RANDOM is for: reads in order of a data extent with a
+    // hole after it, as a guest's faults on the pages a snapshot holds, read
+    // ahead into the hole with the kernel's readahead on (the control: the
+    // test can see readahead) and cache only the pages read through the
+    // source's file. A lone read away from the start of a file is not read
+    // ahead even with readahead on, so the extent is read in order.
+    #[test]
+    fn source_reads_nothing_ahead_into_a_hole() {
+        // Data in pages 0 to 15, a hole of 4 MiB from page 16 to the end.
+        let pages = 1024;
+        let data = |idx| idx < 16;
+        let Some(file) = file_with_data_pages(pages, data) else {
+            return;
+        };
+        let fs = fs_name(&file);
+        if !drop_cached(&file, pages) {
+            eprintln!("skipping: on {fs} the page cache cannot be emptied, so cannot be checked");
+            return;
+        }
+        let reads: Vec<u64> = (0..pages).filter(|&idx| data(idx)).collect();
+        let normal = cached_after_reads(&file, &reopen(&file, None), &reads, pages);
+        let source = FileUffdMemorySource::new(reopen(&file, None));
+        let cached = cached_after_reads(&file, &source.file, &reads, pages);
+        let in_hole = |cached: &[u64]| cached.iter().filter(|&&idx| !data(idx)).count();
+        eprintln!(
+            "{fs}: {} pages read; with readahead {} cached, {} of them in the hole; \
+             through the source {} cached, {} in the hole",
+            reads.len(),
+            normal.len(),
+            in_hole(&normal),
+            cached.len(),
+            in_hole(&cached)
+        );
+        if in_hole(&normal) == 0 {
+            eprintln!(
+                "skipping: on {fs} the kernel read nothing ahead into the hole even with its \
+                 readahead on (cached {normal:?}), so this test cannot see readahead here"
+            );
+            return;
+        }
+        assert_eq!(cached, reads);
     }
 
     #[test]
