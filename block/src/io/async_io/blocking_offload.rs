@@ -427,11 +427,32 @@ mod tests {
         Ok(())
     }
 
-    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    fn succeeds(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        Ok(())
+    }
 
-    fn counting_slow(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
-        RUNS.fetch_add(1, Ordering::SeqCst);
-        thread::sleep(SLOW);
+    /// Polls `condition` until it holds. The timeout only stops a broken
+    /// test from hanging; it is never what a test asserts.
+    fn wait_until(timeout: Duration, what: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !condition() {
+            assert!(Instant::now() < deadline, "Timed out waiting until {what}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // Only drop_skips_queued_operations uses these.
+    static GATED_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static GATE_OPEN: AtomicBool = AtomicBool::new(false);
+
+    /// Counts the run, then blocks until the gate opens, so the test decides
+    /// when the operation in progress finishes. Once open, the gate stays
+    /// open, so operations that should have been skipped still return.
+    fn gated(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        GATED_RUNS.fetch_add(1, Ordering::SeqCst);
+        wait_until(Duration::from_secs(30), "the gate opens", || {
+            GATE_OPEN.load(Ordering::SeqCst)
+        });
         Ok(())
     }
 
@@ -550,13 +571,13 @@ mod tests {
 
     #[test]
     fn failed_thread_init_fails_requests() {
-        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, slow);
+        // The operation always succeeds, so EIO shows the worker failed it
+        // without running it.
+        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, succeeds);
         offload.set_thread_init(Box::new(|| Err(io::Error::other("init failed"))));
         offload.submit(BlockingOp::PunchHole, 0, 4096, 1);
-        let start = Instant::now();
         let completion = wait_completion(&mut offload, Duration::from_secs(5));
         assert_eq!((completion.user_data, completion.result), (1, -libc::EIO));
-        assert!(start.elapsed() < SLOW, "Operation ran after a failed init");
     }
 
     #[test]
@@ -627,20 +648,31 @@ mod tests {
 
     #[test]
     fn drop_skips_queued_operations() {
-        RUNS.store(0, Ordering::SeqCst);
-        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, counting_slow);
+        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, gated);
         for user_data in 0..OFFLOAD_DEPTH as u64 {
             offload.submit(BlockingOp::PunchHole, 0, 4096, user_data);
         }
-        // Let the worker start the first operation.
-        thread::sleep(SLOW / 4);
-        let start = Instant::now();
-        drop(offload);
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < SLOW,
-            "Drop waited {elapsed:?} for queued operations"
+        // The first operation is in progress and the others are queued.
+        wait_until(
+            Duration::from_secs(30),
+            "the first operation starts",
+            || GATED_RUNS.load(Ordering::SeqCst) == 1,
         );
-        assert_eq!(RUNS.load(Ordering::SeqCst), 1);
+        // Drop on another thread, as it waits for the operation in progress,
+        // and let that operation finish only once the drop has asked the
+        // worker to stop.
+        let stop = Arc::clone(&offload.stop);
+        let dropper = thread::spawn(move || drop(offload));
+        wait_until(Duration::from_secs(30), "the drop stops the worker", || {
+            stop.load(Ordering::Acquire)
+        });
+        GATE_OPEN.store(true, Ordering::SeqCst);
+        dropper.join().unwrap();
+        // The drop has joined the worker, so no operation runs from now on.
+        assert_eq!(
+            GATED_RUNS.load(Ordering::SeqCst),
+            1,
+            "The worker ran queued operations after the drop"
+        );
     }
 }
