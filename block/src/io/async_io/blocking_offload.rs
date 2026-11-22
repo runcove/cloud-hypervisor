@@ -456,6 +456,28 @@ mod tests {
         Ok(())
     }
 
+    // Only full_worker_fails_request_instead_of_running_it uses these.
+    static HELD_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static HELD_RELEASED: AtomicBool = AtomicBool::new(false);
+
+    /// Like `gated`, with its own counter and gate so the two tests can run
+    /// in parallel.
+    fn held(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        HELD_RUNS.fetch_add(1, Ordering::SeqCst);
+        wait_until(Duration::from_secs(30), "the operation is released", || {
+            HELD_RELEASED.load(Ordering::SeqCst)
+        });
+        Ok(())
+    }
+
+    // Only disconnected_worker_fails_request uses this.
+    static COUNTED_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counted(_: &mut File, _: BlockingOp, _: u64, _: u64) -> io::Result<()> {
+        COUNTED_RUNS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     #[test]
     fn offload_only_for_block_devices() {
         assert!(offload_fn(true).is_some());
@@ -611,39 +633,47 @@ mod tests {
     #[test]
     fn full_worker_fails_request_instead_of_running_it() {
         // Depth 1: with one job in flight, a second submission is refused.
-        let (mut offload, _notifier) = offload(1, slow);
+        // The job in flight is held until the test releases it, so the
+        // refusal has to complete first, and a submission that ran the
+        // operation inline would block on the held gate and time out.
+        let (mut offload, _notifier) = offload(1, held);
         offload.submit(BlockingOp::PunchHole, 0, 4096, 1);
-        let start = Instant::now();
         offload.submit(BlockingOp::PunchHole, 0, 4096, 2);
-        assert!(
-            start.elapsed() < SLOW / 4,
-            "Submission ran the operation inline"
-        );
-        let completion = wait_completion(&mut offload, Duration::from_secs(5));
+        let completion = wait_completion(&mut offload, Duration::from_secs(30));
         assert_eq!((completion.user_data, completion.result), (2, -libc::EIO));
         assert!(
-            start.elapsed() < SLOW / 2,
-            "Refused submission waited for the one in flight"
+            offload.next_completion().is_none(),
+            "The job in flight completed before it was released"
+        );
+        HELD_RELEASED.store(true, Ordering::SeqCst);
+        let completion = wait_completion(&mut offload, Duration::from_secs(30));
+        assert_eq!((completion.user_data, completion.result), (1, 0));
+        assert_eq!(
+            HELD_RUNS.load(Ordering::SeqCst),
+            1,
+            "The refused operation ran"
         );
     }
 
     #[test]
     fn disconnected_worker_fails_request() {
-        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, slow);
+        let (mut offload, _notifier) = offload(OFFLOAD_DEPTH, counted);
         // Stop the worker as if it had died.
         offload.stop.store(true, Ordering::Release);
         offload.submit(BlockingOp::PunchHole, 0, 4096, 1);
-        offload.worker.take().unwrap().join().unwrap();
+        let worker = offload.worker.take().unwrap();
+        wait_until(Duration::from_secs(30), "the worker exits", || {
+            worker.is_finished()
+        });
+        worker.join().unwrap();
         // Drain the completion of the skipped job: there is none.
         assert!(offload.next_completion().is_none());
-        let start = Instant::now();
         offload.submit(BlockingOp::WriteZeroes, 0, 4096, 2);
-        assert!(
-            start.elapsed() < SLOW / 4,
-            "Submission ran the operation inline"
-        );
-        let completion = wait_completion(&mut offload, Duration::from_secs(5));
+        let completion = wait_completion(&mut offload, Duration::from_secs(30));
         assert_eq!((completion.user_data, completion.result), (2, -libc::EIO));
+        // Neither the skipped job nor the failed one ran, on the worker or
+        // inline in submit().
+        assert_eq!(COUNTED_RUNS.load(Ordering::SeqCst), 0, "An operation ran");
     }
 
     #[test]
