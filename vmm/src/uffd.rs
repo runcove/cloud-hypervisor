@@ -498,6 +498,10 @@ impl FileUffdMemorySource {
     ///
     /// With huge pages the window can be shorter than the read, so reads in
     /// order do not grow it; each read still caches its whole page.
+    ///
+    /// Called after the read, not before: the advice can block, and the
+    /// read must not wait for it. What is asked for does not depend on the
+    /// read, only on `pos`, `len` and the extent `in_hole` found.
     fn read_ahead_in_extent(&mut self, pos: u64, len: u64) {
         let Some(extent) = self
             .extent
@@ -600,22 +604,26 @@ impl UffdMemorySource for FileUffdMemorySource {
         if self.buf.len() < page_size {
             self.buf.resize(page_size, 0);
         }
-        self.read_ahead_in_extent(file_pos, range.page_size);
         self.file
             .read_exact_at(&mut self.buf[..page_size], file_pos)?;
         self.read_pages += 1;
 
         match copy(uffd_fd, page_addr, self.buf.as_ptr(), range.page_size) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                 // Installed concurrently. Wake any blocked threads.
                 if let Err(e) = wake(uffd_fd, page_addr, range.page_size) {
                     log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
                 }
-                Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
         }
+        // Read ahead only once the faulting page is in place: WILLNEED can
+        // block while it submits the I/O, and the vCPU waiting on this
+        // fault would wait for it too. A failed read or copy returns its
+        // error without asking for anything.
+        self.read_ahead_in_extent(file_pos, range.page_size);
+        Ok(())
     }
 
     fn requires_uffd_minor_mode(&self) -> bool {
@@ -1309,8 +1317,8 @@ mod tests {
             for idx in 0..pages {
                 assert_eq!(source.in_hole(idx * PAGE, PAGE), !data(idx), "page {idx}");
                 if data(idx) {
-                    source.read_ahead_in_extent(idx * PAGE, PAGE);
                     source.file.read_exact_at(&mut buf, idx * PAGE).unwrap();
+                    source.read_ahead_in_extent(idx * PAGE, PAGE);
                 }
             }
             assert!(source.seek_holes, "a hole lookup failed");
