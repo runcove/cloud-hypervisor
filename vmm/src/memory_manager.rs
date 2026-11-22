@@ -1429,8 +1429,10 @@ impl MemoryManager {
         // `snapshot_file` would share with the snapshot writer of a
         // copy-on-access VM. It opens it through `snapshot_file`'s fd rather
         // than by path, so that both read the same inode even if the path is
-        // renamed over in between. Where /proc is not mounted it reads through
-        // a clone instead (see `open_file`).
+        // renamed over in between. If that reopen fails (as where /proc is not
+        // mounted) or opens a different inode, it reads through a clone of
+        // `snapshot_file`'s fd instead, sharing its open file description (see
+        // `open_file`).
         let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(
             FileUffdMemorySource::open_file(&snapshot_file).map_err(Error::SnapshotOpen)?,
         ));
