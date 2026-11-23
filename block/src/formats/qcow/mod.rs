@@ -22,6 +22,8 @@ mod refcount;
 mod test_util;
 mod util;
 mod vec_cache;
+#[cfg(test)]
+mod zero_tests;
 
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
