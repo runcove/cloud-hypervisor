@@ -58,17 +58,38 @@ pub struct UringDataIo {
     // `needs_submit_retry` is set when SQEs have been published to the ring,
     // but the submit syscall failed before confirming kernel ownership.
     needs_submit_retry: bool,
+    // Set once anything has been submitted to the ring. The ring is then
+    // driven by some thread, whose worker pool a later cap would not reach.
+    submitted: bool,
 }
 
 impl UringDataIo {
     /// Creates an io_uring queue and registers its completion eventfd.
     pub fn new(ring_depth: u32) -> io::Result<Self> {
-        let io_uring = IoUring::builder().setup_r_disabled().build(ring_depth)?;
         let completions = CompletionCommon::new();
-        io_uring
-            .submitter()
-            .register_eventfd(completions.notifier().as_raw_fd())?;
+        let io_uring = Self::build_ring(ring_depth, completions.notifier(), None)?;
 
+        Ok(Self {
+            io_uring,
+            in_flight: HashMap::new(),
+            completions,
+            needs_submit_retry: false,
+            submitted: false,
+        })
+    }
+
+    /// Creates a ring disabled, registers its completion eventfd, the worker
+    /// limits `max_workers` if given and the restrictions, then enables it.
+    ///
+    /// The worker limits are registered before the ring is enabled: once it
+    /// is, the restrictions refuse every register op but enabling, so a ring
+    /// cannot be capped later.
+    fn build_ring(
+        ring_depth: u32,
+        notifier: &EventFd,
+        max_workers: Option<[u32; 2]>,
+    ) -> io::Result<IoUring> {
+        let io_uring = Self::build_disabled_ring(ring_depth, notifier, max_workers)?;
         io_uring.submitter().register_restrictions(&mut [
             Restriction::register_op(IORING_REGISTER_ENABLE_RINGS),
             Restriction::sqe_op(opcode::Nop::CODE),
@@ -81,12 +102,28 @@ impl UringDataIo {
         ])?;
         io_uring.submitter().register_enable_rings()?;
 
-        Ok(Self {
-            io_uring,
-            in_flight: HashMap::new(),
-            completions,
-            needs_submit_retry: false,
-        })
+        Ok(io_uring)
+    }
+
+    /// The part of `build_ring` before the restrictions: a disabled ring,
+    /// which accepts no submission, with its completion eventfd and the
+    /// worker limits `max_workers` if given registered. Only `build_ring`
+    /// enables one outside tests, after restricting it.
+    fn build_disabled_ring(
+        ring_depth: u32,
+        notifier: &EventFd,
+        max_workers: Option<[u32; 2]>,
+    ) -> io::Result<IoUring> {
+        let io_uring = IoUring::builder().setup_r_disabled().build(ring_depth)?;
+        io_uring
+            .submitter()
+            .register_eventfd(notifier.as_raw_fd())?;
+
+        if let Some(mut max) = max_workers {
+            io_uring.submitter().register_iowq_max_workers(&mut max)?;
+        }
+
+        Ok(io_uring)
     }
 
     /// Caps the io_uring worker threads the kernel may start for the thread
@@ -107,7 +144,15 @@ impl UringDataIo {
     ///
     /// The bounded limit is never set above the ring's size: a ring never has
     /// more requests in flight than it has entries.
-    pub fn set_max_workers(&self, limits: IoWorkerLimits) -> io::Result<()> {
+    ///
+    /// The ring's restrictions refuse this registration once the ring is
+    /// enabled, so the ring is replaced by a new one, with the same size and
+    /// completion eventfd, that is capped before it is enabled. It is refused
+    /// once anything has been submitted to the ring: a replaced ring would
+    /// lose requests in flight, and a cap set after the driving thread has
+    /// used io_uring would not reach that thread's workers. If the kernel
+    /// refuses the limits, the ring in use is kept, uncapped.
+    pub fn set_max_workers(&mut self, limits: IoWorkerLimits) -> io::Result<()> {
         // A zero leaves that limit unchanged in the kernel: refuse it rather
         // than silently run uncapped.
         if limits.bounded == 0 || limits.unbounded == 0 {
@@ -116,13 +161,16 @@ impl UringDataIo {
                 format!("io_uring worker limits must not be zero: {limits:?}"),
             ));
         }
-        let mut max = [
-            limits.bounded.min(self.io_uring.params().sq_entries()),
-            limits.unbounded,
-        ];
-        self.io_uring
-            .submitter()
-            .register_iowq_max_workers(&mut max)
+        if self.submitted || !self.in_flight.is_empty() || self.needs_submit_retry {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "io_uring worker limits must be set before the ring is used",
+            ));
+        }
+        let ring_depth = self.io_uring.params().sq_entries();
+        let max = [limits.bounded.min(ring_depth), limits.unbounded];
+        self.io_uring = Self::build_ring(ring_depth, self.completions.notifier(), Some(max))?;
+        Ok(())
     }
 
     /// Returns the eventfd signaled when completions are available.
@@ -145,6 +193,7 @@ impl UringDataIo {
     }
 
     fn submit_kernel_entry(&mut self, user_data: u64, entry: &squeue::Entry) -> io::Result<()> {
+        self.submitted = true;
         self.reserve_user_data(user_data)?;
 
         let (submitter, mut sq, _) = self.io_uring.split();
@@ -177,6 +226,7 @@ impl UringDataIo {
         if batch.is_empty() {
             return Ok(());
         }
+        self.submitted = true;
 
         validate_batch(|user_data| self.in_flight.contains_key(&user_data), &batch)?;
 
@@ -502,7 +552,7 @@ mod tests {
     use std::time::Duration;
     use std::{env, io, ptr};
 
-    use io_uring::{opcode, squeue, types};
+    use io_uring::{IoUring, opcode, squeue, types};
     use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
@@ -536,14 +586,29 @@ mod tests {
 
     // Reads the limits now in force for the calling thread's io_uring
     // workers: a zero for both changes nothing and returns the current ones.
-    fn worker_limits_in_force(data_io: &UringDataIo) -> [u32; 2] {
+    // A data ring's restrictions refuse the registration, so it is made on a
+    // ring of its own: the limits are the thread's, whichever ring asks.
+    fn worker_limits_in_force() -> [u32; 2] {
         let mut max = [0, 0];
-        data_io
-            .io_uring
+        IoUring::new(1)
+            .unwrap()
             .submitter()
             .register_iowq_max_workers(&mut max)
             .unwrap();
         max
+    }
+
+    // A ring capped at `limits` if given, without the restrictions, which
+    // refuse the opens and tees the worker cap tests block in a worker.
+    fn unrestricted_ring(ring_depth: u32, limits: Option<IoWorkerLimits>) -> UringDataIo {
+        let mut data_io = UringDataIo::new(ring_depth).unwrap();
+        let max = limits.map(|l| [l.bounded, l.unbounded]);
+        let io_uring =
+            UringDataIo::build_disabled_ring(ring_depth, data_io.completions.notifier(), max)
+                .unwrap();
+        io_uring.submitter().register_enable_rings().unwrap();
+        data_io.io_uring = io_uring;
+        data_io
     }
 
     // Counts every io_uring worker in this process. The kernel names a worker
@@ -571,10 +636,7 @@ mod tests {
         entry: impl Fn() -> squeue::Entry + Sync,
         unblock: impl FnOnce() -> G + Send,
     ) -> usize {
-        let data_io = UringDataIo::new(count).unwrap();
-        if let Some(limits) = limits {
-            data_io.set_max_workers(limits).unwrap();
-        }
+        let data_io = unrestricted_ring(count, limits);
 
         thread::scope(|scope| {
             scope
@@ -777,7 +839,7 @@ mod tests {
             // The kernel applies the limits when this thread first submits.
             data_io.submit_nop(1).unwrap();
             wait_for_completion(&mut data_io);
-            worker_limits_in_force(&data_io)
+            worker_limits_in_force()
         })
         .join()
         .unwrap();
@@ -785,8 +847,32 @@ mod tests {
     }
 
     #[test]
+    fn uring_caps_a_restricted_ring_larger_than_the_bounded_limit() {
+        // The production path: `set_max_workers` on a restricted ring with
+        // more entries than the bounded limit, so the limit itself, not the
+        // ring's size, is what must reach the kernel.
+        let mut data_io = UringDataIo::new(64).unwrap();
+        data_io
+            .set_max_workers(IoWorkerLimits {
+                bounded: 3,
+                unbounded: 4,
+            })
+            .unwrap();
+
+        let in_force = thread::spawn(move || {
+            data_io.submit_nop(1).unwrap();
+            wait_for_completion(&mut data_io);
+            assert_restricted(&mut data_io);
+            worker_limits_in_force()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(in_force, [3, 4]);
+    }
+
+    #[test]
     fn uring_refuses_zero_limits() {
-        let data_io = UringDataIo::new(8).unwrap();
+        let mut data_io = UringDataIo::new(8).unwrap();
         for limits in [
             IoWorkerLimits {
                 bounded: 0,
@@ -806,7 +892,7 @@ mod tests {
     fn uring_reports_limits_the_kernel_refuses() {
         // The kernel refuses a limit above INT_MAX with EINVAL, as a kernel
         // without IORING_REGISTER_IOWQ_MAX_WORKERS refuses every call.
-        let data_io = UringDataIo::new(8).unwrap();
+        let mut data_io = UringDataIo::new(8).unwrap();
         let e = data_io
             .set_max_workers(IoWorkerLimits {
                 bounded: 16,
@@ -814,6 +900,83 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+
+        // The ring in use is kept: it still works, and is still restricted.
+        data_io.submit_nop(1).unwrap();
+        assert_eq!(wait_for_completion(&mut data_io).result, 0);
+        assert_restricted(&mut data_io);
+    }
+
+    // The ring refuses a registration change and a socket operation, as the
+    // restrictions `UringDataIo::new` registers make it.
+    fn assert_restricted(data_io: &mut UringDataIo) {
+        assert_eq!(
+            data_io
+                .io_uring
+                .submitter()
+                .register_eventfd(data_io.notifier().as_raw_fd())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let socket = opcode::Socket::new(libc::AF_UNIX, libc::SOCK_STREAM, 0)
+            .build()
+            .user_data(u64::MAX);
+        data_io.submit_kernel_entry(u64::MAX, &socket).unwrap();
+        let completion = wait_for_completion(data_io);
+        if completion.result >= 0 {
+            // SAFETY: IORING_OP_SOCKET returned a new owned descriptor.
+            drop(unsafe { OwnedFd::from_raw_fd(completion.result) });
+        }
+        assert_eq!(completion.result, -libc::EACCES);
+    }
+
+    #[test]
+    fn uring_capped_ring_is_restricted_and_signals_the_same_eventfd() {
+        // The cap replaces the ring with one capped before it is enabled
+        // (v55 restricts every ring, and the restrictions refuse the cap's
+        // registration once the ring is enabled). The new ring keeps the
+        // restrictions and the completion eventfd callers already wait on.
+        let mut data_io = UringDataIo::new(8).unwrap();
+        let notifier = data_io.notifier().as_raw_fd();
+        data_io.set_max_workers(IoWorkerLimits::DEFAULT).unwrap();
+        assert_eq!(data_io.notifier().as_raw_fd(), notifier);
+
+        data_io.submit_nop(1).unwrap();
+        for _ in 0..1000 {
+            let mut fds = [libc::pollfd {
+                fd: notifier,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            // SAFETY: `fds` is one valid pollfd.
+            if unsafe { libc::poll(fds.as_mut_ptr(), 1, 1) } == 1 {
+                break;
+            }
+        }
+        assert!(data_io.notifier().read().unwrap() > 0);
+        assert_eq!(wait_for_completion(&mut data_io).result, 0);
+        assert_restricted(&mut data_io);
+    }
+
+    #[test]
+    fn uring_refuses_limits_once_the_ring_is_in_use() {
+        // Replacing a ring with requests in flight would lose them.
+        let mut data_io = UringDataIo::new(8).unwrap();
+        data_io.submit_nop(1).unwrap();
+        let e = data_io
+            .set_max_workers(IoWorkerLimits::DEFAULT)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
+        assert_eq!(wait_for_completion(&mut data_io).result, 0);
+
+        // Drained, the ring has still been used: its driving thread's
+        // workers would not take a cap set now.
+        assert!(data_io.in_flight.is_empty());
+        let e = data_io
+            .set_max_workers(IoWorkerLimits::DEFAULT)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
     }
 
     #[test]
