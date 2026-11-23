@@ -13,7 +13,7 @@
 use std::any::Any;
 #[cfg(target_arch = "x86_64")]
 use std::cmp;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(feature = "sev_snp")]
 use std::fmt;
 #[cfg(feature = "kvm")]
@@ -209,6 +209,10 @@ pub enum DeviceManagerError {
     /// Cannot create EventFd.
     #[error("Cannot create EventFd")]
     EventFd(#[source] io::Error),
+
+    /// The restore config lacks virtio devices that the snapshot contains
+    #[error("Restore config lacks virtio devices present in the snapshot: {0}")]
+    RestoreMissingDevices(String),
 
     /// Cannot open disk path
     #[error("Cannot open disk path")]
@@ -1236,6 +1240,7 @@ impl DeviceManager {
             .transpose()
             .map_err(DeviceManagerError::RestoreGetState)?;
         let (device_tree, device_id_cnt) = if let Some(state) = &state {
+            check_restore_virtio_devices(&state.device_tree, &config.lock().unwrap())?;
             (
                 Arc::new(Mutex::new(state.device_tree.clone())),
                 state.device_id_cnt,
@@ -6754,6 +6759,62 @@ impl Drop for DeviceManager {
     }
 }
 
+/// Fails if the saved device tree holds a virtio device that is created from
+/// the VM config but has no entry in it. Restoring such a config would start
+/// the guest with a virtio device that has no backend.
+///
+/// Virtio devices created by the VMM itself have ids starting with "__", and
+/// the virtio-mem devices are named after their memory zone, so neither are
+/// expected in the device lists of the config.
+fn check_restore_virtio_devices(
+    device_tree: &DeviceTree,
+    config: &VmConfig,
+) -> DeviceManagerResult<()> {
+    fn ids<T>(
+        devices: &Option<Vec<T>>,
+        id: fn(&T) -> &Option<String>,
+    ) -> impl Iterator<Item = &str> {
+        devices
+            .iter()
+            .flatten()
+            .filter_map(move |d| id(d).as_deref())
+    }
+
+    let mut config_ids: HashSet<&str> = HashSet::new();
+    config_ids.extend(ids(&config.disks, |d| &d.pci_common.id));
+    config_ids.extend(ids(&config.net, |d| &d.pci_common.id));
+    config_ids.extend(ids(&config.fs, |d| &d.pci_common.id));
+    config_ids.extend(ids(&config.pmem, |d| &d.pci_common.id));
+    config_ids.extend(ids(&config.vdpa, |d| &d.pci_common.id));
+    config_ids.extend(ids(&config.generic_vhost_user, |d| &d.pci_common.id));
+    config_ids.extend(
+        config
+            .vsock
+            .iter()
+            .filter_map(|v| v.pci_common.id.as_deref()),
+    );
+    config_ids.extend(config.memory.zones.iter().flatten().map(|z| z.id.as_str()));
+
+    // A virtio device node is the child of its virtio-pci node.
+    let mut missing: Vec<&str> = device_tree
+        .iter()
+        .filter(|(id, node)| {
+            !id.starts_with("__")
+                && node.parent.as_deref()
+                    == Some(format!("{VIRTIO_PCI_DEVICE_NAME_PREFIX}-{id}").as_str())
+                && !config_ids.contains(id.as_str())
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_unstable();
+    Err(DeviceManagerError::RestoreMissingDevices(
+        missing.join(", "),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -6857,6 +6918,115 @@ mod tests {
     }
 
     use super::*;
+
+    fn restore_tree(virtio_ids: &[&str], other_ids: &[&str]) -> DeviceTree {
+        let mut tree = DeviceTree::new();
+        for id in virtio_ids {
+            let pci_id = format!("{VIRTIO_PCI_DEVICE_NAME_PREFIX}-{id}");
+            let mut node = DeviceNode::new(id.to_string(), None);
+            node.parent = Some(pci_id.clone());
+            tree.insert(id.to_string(), node);
+            let mut pci_node = DeviceNode::new(pci_id.clone(), None);
+            pci_node.children = vec![id.to_string()];
+            tree.insert(pci_id, pci_node);
+        }
+        for id in other_ids {
+            tree.insert(id.to_string(), DeviceNode::new(id.to_string(), None));
+        }
+        tree
+    }
+
+    fn restore_config(disks: &[&str]) -> VmConfig {
+        let disks: Vec<_> = disks
+            .iter()
+            .map(|id| serde_json::json!({"path": "/disk.img", "id": id}))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "payload": {"kernel": "/vmlinux"},
+            "disks": disks,
+            "net": [{"id": "net0"}],
+            "vsock": {"cid": 3, "socket": "/vsock.sock", "id": "vsock0"},
+            "memory": {"size": 1048576, "zones": [{"id": "mem0", "size": 1048576}]},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_check_names_disk_missing_from_config() {
+        let tree = restore_tree(&["_disk0", "_disk1", "net0", "vsock0", "mem0"], &[]);
+        let err = check_restore_virtio_devices(&tree, &restore_config(&["_disk0"])).unwrap_err();
+        assert!(matches!(
+            err,
+            DeviceManagerError::RestoreMissingDevices(ref ids) if ids == "_disk1"
+        ));
+        assert!(err.to_string().contains("_disk1"));
+    }
+
+    #[test]
+    fn restore_check_accepts_matching_config() {
+        let tree = restore_tree(&["_disk0", "_disk1", "net0", "vsock0", "mem0"], &[]);
+        check_restore_virtio_devices(&tree, &restore_config(&["_disk0", "_disk1"])).unwrap();
+    }
+
+    // Ids that the device creation code generates are prefix + counter. Build
+    // them from the same constants so a rename keeps the check matching, and a
+    // prefix that collides with the VMM-internal "__" namespace fails loudly.
+    #[test]
+    fn restore_check_matches_generated_device_ids() {
+        for prefix in [
+            DISK_DEVICE_NAME_PREFIX,
+            NET_DEVICE_NAME_PREFIX,
+            FS_DEVICE_NAME_PREFIX,
+            PMEM_DEVICE_NAME_PREFIX,
+            VDPA_DEVICE_NAME_PREFIX,
+            VSOCK_DEVICE_NAME_PREFIX,
+            GENERIC_VHOST_USER_DEVICE_NAME_PREFIX,
+        ] {
+            assert!(
+                !prefix.starts_with("__"),
+                "{prefix} is in the internal namespace"
+            );
+        }
+
+        let disk0 = format!("{DISK_DEVICE_NAME_PREFIX}0");
+        let disk1 = format!("{DISK_DEVICE_NAME_PREFIX}1");
+        let net = format!("{NET_DEVICE_NAME_PREFIX}2");
+        let vsock = format!("{VSOCK_DEVICE_NAME_PREFIX}3");
+        let tree = restore_tree(&[&disk0, &disk1, &net, &vsock], &[]);
+
+        let mut config = restore_config(&[&disk0]);
+        config.net = Some(vec![
+            serde_json::from_value(serde_json::json!({"id": net})).unwrap(),
+        ]);
+        config.vsock = serde_json::from_value(
+            serde_json::json!({"cid": 3, "socket": "/vsock.sock", "id": vsock}),
+        )
+        .unwrap();
+        config.memory.zones = None;
+
+        let err = check_restore_virtio_devices(&tree, &config).unwrap_err();
+        assert!(matches!(
+            err,
+            DeviceManagerError::RestoreMissingDevices(ref ids) if *ids == disk1
+        ));
+        config
+            .disks
+            .clone_from(&restore_config(&[&disk0, &disk1]).disks);
+        check_restore_virtio_devices(&tree, &config).unwrap();
+    }
+
+    #[test]
+    fn restore_check_ignores_vmm_internal_devices() {
+        let tree = restore_tree(
+            &["_disk0", "__console", "__rng", "__balloon", "__iommu"],
+            &["__serial", "__ioapic", "_pci_segment0"],
+        );
+        let mut config = restore_config(&["_disk0"]);
+        config.net = None;
+        config.vsock = None;
+        config.memory.zones = None;
+        check_restore_virtio_devices(&tree, &config).unwrap();
+    }
 
     #[test]
     fn test_s5_sleep_state_uses_complete_package() {
