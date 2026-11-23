@@ -9641,6 +9641,11 @@ mod ivshmem {
     }
 
     #[test]
+    fn test_snapshot_restore_refuses_missing_disk() {
+        snapshot_restore_common::_test_snapshot_restore_refuses_missing_disk();
+    }
+
+    #[test]
     fn test_snapshot_restore_offload() {
         snapshot_restore_common::_test_snapshot_restore_offload(false, false);
     }
@@ -10450,6 +10455,126 @@ mod snapshot_restore_common {
             assert!(String::from_utf8_lossy(&output.stdout).contains(&console_text));
         });
 
+        handle_child_output(r, &output);
+    }
+
+    // A snapshot of a VM with two disks, restored from a config that lists only
+    // the first, is refused with an error naming the second; restored from its
+    // own config, it runs and the second disk still reads.
+    pub(crate) fn _test_snapshot_restore_refuses_missing_disk() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let kernel_path = direct_kernel_boot_path();
+
+        let api_socket_source = format!("{}.1", temp_api_path(&guest.tmp_dir));
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_source])
+            .args(["--event-monitor", format!("path={event_path}").as_str()])
+            .args(["--cpus", "boot=2"])
+            .args(["--memory", "size=1G"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .default_disks()
+            .default_net()
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            snapshot_and_check_events(&api_socket_source, &snapshot_dir, &event_path);
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        // Drop the second disk from the snapshot's config, as a restore that
+        // lost its config disk would.
+        let config_path = Path::new(&snapshot_dir).join("config.json");
+        let full_config = read_to_string(&config_path).unwrap();
+        let mut config: serde_json::Value = serde_json::from_str(&full_config).unwrap();
+        let disks = config["disks"].as_array_mut().unwrap();
+        assert_eq!(disks.len(), 2);
+        let dropped = disks.pop().unwrap();
+        let dropped_id = dropped["id"].as_str().unwrap().to_string();
+        fs::write(&config_path, serde_json::to_string(&config).unwrap()).unwrap();
+
+        let api_socket_refused = format!("{}.2", temp_api_path(&guest.tmp_dir));
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_refused])
+            .args([
+                "--restore",
+                format!("source_url=file://{snapshot_dir}").as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let exited = child.wait_timeout(Duration::from_secs(30)).unwrap();
+        if exited.is_none() {
+            kill_child(&mut child);
+        }
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(exited.is_some(), "the restore was not refused: {stderr}");
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains("Restore config lacks virtio devices present in the snapshot")
+                && stderr.contains(&dropped_id),
+            "the refusal does not name {dropped_id}: {stderr}"
+        );
+
+        // The snapshot's own config restores and the second disk reads.
+        fs::write(&config_path, full_config).unwrap();
+
+        let api_socket_restored = format!("{}.3", temp_api_path(&guest.tmp_dir));
+        let event_path_restored = format!("{}.3", temp_event_monitor_path(&guest.tmp_dir));
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_restored])
+            .args([
+                "--event-monitor",
+                format!("path={event_path_restored}").as_str(),
+            ])
+            .args([
+                "--restore",
+                format!("source_url=file://{snapshot_dir}").as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            assert!(wait_for_latest_events_exact_str(
+                Duration::from_secs(30),
+                &["restored"],
+                &event_path_restored
+            ));
+            assert!(remote_command(&api_socket_restored, "resume", None));
+            assert!(wait_for_latest_events_exact_str(
+                Duration::from_secs(30),
+                &["resuming", "resumed"],
+                &event_path_restored
+            ));
+            assert_eq!(
+                guest
+                    .ssh_command(
+                        "sudo timeout 10 dd if=/dev/vdb of=/dev/null bs=4096 count=1 \
+                         iflag=direct status=none && echo read-ok"
+                    )
+                    .unwrap()
+                    .trim(),
+                "read-ok"
+            );
+        });
+
+        let _ = remove_dir_all(snapshot_dir.as_str());
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
         handle_child_output(r, &output);
     }
 
