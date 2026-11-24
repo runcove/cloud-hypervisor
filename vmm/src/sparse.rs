@@ -14,6 +14,39 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::FileExt;
 
+/// The first offset at or after `offset` of `fd` that holds data, from
+/// `lseek(SEEK_DATA)`, or `Ok(None)` if there is none: `offset` is in a hole
+/// that runs to the end of the file, or at or past the end. Errors if the
+/// filesystem does not support `SEEK_HOLE` (e.g. hugetlbfs).
+pub fn seek_data(fd: BorrowedFd<'_>, offset: u64) -> io::Result<Option<u64>> {
+    // SAFETY: BorrowedFd guarantees the fd is valid for the lifetime of
+    // the borrow; lseek does not consume or close it.
+    let data_off = unsafe { libc::lseek(fd.as_raw_fd(), offset as i64, libc::SEEK_DATA) };
+    if data_off < 0 {
+        let e = io::Error::last_os_error();
+        // ENXIO from SEEK_DATA means there is no more data at or after
+        // offset. Any other error means the filesystem does not support
+        // SEEK_HOLE.
+        return if e.raw_os_error() == Some(libc::ENXIO) {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+    Ok(Some(data_off as u64))
+}
+
+/// The first offset at or after `offset` of `fd` that is in a hole, from
+/// `lseek(SEEK_HOLE)`. The end of the file counts as a hole.
+pub fn seek_hole(fd: BorrowedFd<'_>, offset: u64) -> io::Result<u64> {
+    // SAFETY: as in seek_data.
+    let hole_off = unsafe { libc::lseek(fd.as_raw_fd(), offset as i64, libc::SEEK_HOLE) };
+    if hole_off < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(hole_off as u64)
+}
+
 /// Find the next populated (data) extent in `[cursor, end)` of `fd`,
 /// driven by `lseek(SEEK_DATA)` / `lseek(SEEK_HOLE)`. Returns
 /// `Ok(Some((offset, len)))` for the next data extent within the window,
@@ -26,31 +59,13 @@ pub fn next_data_extent(
     cursor: u64,
     end: u64,
 ) -> io::Result<Option<(u64, u64)>> {
-    let raw = fd.as_raw_fd();
-    // SAFETY: BorrowedFd guarantees the fd is valid for the lifetime of
-    // the borrow; lseek does not consume or close it.
-    let data_off = unsafe { libc::lseek(raw, cursor as i64, libc::SEEK_DATA) };
-    if data_off < 0 {
-        let e = io::Error::last_os_error();
-        // ENXIO from SEEK_DATA means there is no more data at or after
-        // cursor. Any other error means the filesystem does not support
-        // SEEK_HOLE; the caller falls back to the dense path.
-        return if e.raw_os_error() == Some(libc::ENXIO) {
-            Ok(None)
-        } else {
-            Err(e)
-        };
-    }
-    let data_off = data_off as u64;
+    let Some(data_off) = seek_data(fd, cursor)? else {
+        return Ok(None);
+    };
     if data_off >= end {
         return Ok(None);
     }
-    // SAFETY: same as above.
-    let hole_off = unsafe { libc::lseek(raw, data_off as i64, libc::SEEK_HOLE) };
-    if hole_off < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let hole_off = (hole_off as u64).min(end);
+    let hole_off = seek_hole(fd, data_off)?.min(end);
     Ok(Some((data_off, hole_off - data_off)))
 }
 
