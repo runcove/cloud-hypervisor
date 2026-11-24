@@ -461,6 +461,12 @@ struct SnapshotOrigin {
 /// when a page is resolved, with `lseek(SEEK_DATA)`, rather than listed
 /// up front, so that a fragmented file costs nothing before the guest runs
 /// and no memory beyond the one extent kept here.
+///
+/// The kernel's readahead is turned off for the file, as it reads past the
+/// end of a data extent into the hole beside it and caches zero pages there.
+/// The source reads ahead itself instead, inside the data extent of the page
+/// it reads. The advice holds for the open file description, so `file` must
+/// be opened for the source alone, not cloned from a file read elsewhere.
 pub(crate) struct FileUffdMemorySource {
     file: File,
     buf: Vec<u8>,
@@ -473,6 +479,19 @@ pub(crate) struct FileUffdMemorySource {
     /// read from the file.
     seek_holes: bool,
     zeroes: Vec<u8>,
+    /// The page the source last asked the kernel to read ahead from, and the
+    /// end of what it asked for.
+    read_ahead: (u64, u64),
+    /// How much the source last asked for, before cutting it at the end of
+    /// an extent. Reads in order grow it, up to `READ_AHEAD`.
+    read_ahead_size: u64,
+    /// Whether the last window may end at or past the end of its data
+    /// extent. Otherwise it ends inside data, so no later extent can follow
+    /// on from it.
+    read_ahead_at_extent_end: bool,
+    /// Whether the kernel's own readahead is on for the file: off while the
+    /// source reads ahead itself.
+    kernel_read_ahead: bool,
     /// What the source did, logged when it is dropped: lseek calls made,
     /// pages resolved with zeroes as holes, and pages read from the file.
     lookups: u64,
@@ -491,17 +510,88 @@ struct FileExtent {
 
 impl FileUffdMemorySource {
     pub(crate) fn new(file: File) -> Self {
-        Self {
+        let mut source = Self {
             file,
             buf: Vec::new(),
             extent: None,
             seek_holes: true,
             zeroes: Vec::new(),
+            read_ahead: (0, 0),
+            read_ahead_size: 0,
+            read_ahead_at_extent_end: false,
+            kernel_read_ahead: true,
             lookups: 0,
             hole_pages: 0,
             read_pages: 0,
             origin: None,
-        }
+        };
+        source.set_kernel_read_ahead(false);
+        source
+    }
+
+    /// A file for a source to read `snapshot` through: `snapshot` opened
+    /// again through `/proc/self/fd`, a new open file description of the
+    /// same inode, so that the advice the source gives does not reach
+    /// whoever else reads `snapshot`.
+    ///
+    /// Where that fails, as where `/proc` is not mounted, it is a clone
+    /// (`dup`) of `snapshot` instead, and the restore still reads the same
+    /// pages of the same inode. What the clone gives up is that separation:
+    /// the two share one open file description, so the source's
+    /// `POSIX_FADV_RANDOM` turns the kernel's readahead off for `snapshot`
+    /// too. A copy-on-access VM's snapshot writer then reads the pages the
+    /// guest never accessed from `snapshot` without kernel readahead, which
+    /// is slower but reads the same bytes. Both read at explicit offsets
+    /// (`pread`, `lseek(SEEK_DATA)`), so the file position they now share
+    /// changes nothing.
+    pub(crate) fn open_file(snapshot: &File) -> io::Result<File> {
+        Self::open_file_in(snapshot, Path::new("/proc/self/fd"))
+    }
+
+    /// `open_file` with `fd_dir` in place of `/proc/self/fd`.
+    ///
+    /// A file opened through `fd_dir` is used only if it is the same inode
+    /// as `snapshot` (same `st_dev` and `st_ino`): if something other than
+    /// the kernel's `/proc` is mounted there, the source would otherwise
+    /// serve the guest another file's pages. Where it is not, the source
+    /// reads through a clone as where the open fails.
+    pub(crate) fn open_file_in(snapshot: &File, fd_dir: &Path) -> io::Result<File> {
+        let path = fd_dir.join(snapshot.as_raw_fd().to_string());
+        let why = match File::open(&path) {
+            Ok(reopened) => match Self::same_inode(snapshot, &reopened) {
+                Ok(true) => return Ok(reopened),
+                Ok(false) => "it opened a different file".to_string(),
+                Err(e) => format!("it could not be compared with the snapshot file: {e}"),
+            },
+            Err(e) => format!("the open failed: {e}"),
+        };
+        log::warn!(
+            "UFFD restore: did not reopen the snapshot file through {} ({why}); \
+             reading it through a clone of its descriptor, which shares the \
+             source's readahead advice with the snapshot writer",
+            path.display()
+        );
+        snapshot.try_clone()
+    }
+
+    /// Whether `a` and `b` are the same inode: the same `st_dev` and
+    /// `st_ino`, from the metadata of each (`statx` or `fstat`, depending
+    /// on the libc).
+    fn same_inode(a: &File, b: &File) -> io::Result<bool> {
+        let (a, b) = (a.metadata()?, b.metadata()?);
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
+    }
+
+    /// Turns the kernel's readahead on the file on or off. This fails only
+    /// where the file cannot read ahead anyway (a pipe).
+    fn set_kernel_read_ahead(&mut self, on: bool) {
+        let advice = if on {
+            libc::POSIX_FADV_NORMAL
+        } else {
+            libc::POSIX_FADV_RANDOM
+        };
+        advise(&self.file, 0, 0, advice);
+        self.kernel_read_ahead = on;
     }
 
     /// A source for the snapshot file at `path`, which records the file's
@@ -566,6 +656,8 @@ impl FileUffdMemorySource {
         );
         self.seek_holes = false;
         self.extent = None;
+        // Without extents the source cannot read ahead: the kernel does.
+        self.set_kernel_read_ahead(true);
     }
 
     /// Whether `[pos, pos + len)` of the file lies wholly inside one hole.
@@ -623,6 +715,101 @@ impl FileUffdMemorySource {
         });
         pos.saturating_add(len) <= hole_end
     }
+
+    /// Asks the kernel to read the file ahead of a read of `len` bytes at
+    /// `pos`, never past the end of the data extent `pos` is in. A read that
+    /// does not follow on from the last one asks for nothing more, so that
+    /// scattered reads cache only the pages read. A read that follows on, or
+    /// reaches half way through the last window, asks for the next window:
+    /// `READ_AHEAD_MIN` bytes first, then four, then two times as many each
+    /// time, up to `READ_AHEAD`, so that reads in order find their pages
+    /// already read. The first page of a data extent follows on from a
+    /// window that ended at the end of the extent before it.
+    ///
+    /// With huge pages the window can be shorter than the read, so reads in
+    /// order do not grow it; each read still caches its whole page.
+    ///
+    /// Called after the read, not before: the advice can block, and the
+    /// read must not wait for it. What is asked for does not depend on the
+    /// read, only on `pos`, `len` and the extent `in_hole` found.
+    fn read_ahead_in_extent(&mut self, pos: u64, len: u64) {
+        let Some(extent) = self
+            .extent
+            .filter(|e| !e.hole && e.start <= pos && pos < e.end)
+        else {
+            return;
+        };
+        let (start, end) = self.read_ahead;
+        // Four times as large while small, as the kernel grows its own.
+        let factor = if self.read_ahead_size < READ_AHEAD / 4 {
+            4
+        } else {
+            2
+        };
+        let grown = (self.read_ahead_size * factor).min(READ_AHEAD);
+        let (from, size) = if start < end && start <= pos && pos <= end {
+            if end - pos > self.read_ahead_size / 2 {
+                return;
+            }
+            (end, grown)
+        } else if start < end
+            && self.read_ahead_at_extent_end
+            && pos == extent.start
+            && pos > end
+            && {
+                // `extent.start` is where `in_hole` looked the extent up, so
+                // `pos` is the first read in it, not necessarily the extent's
+                // first page. It is that page, following on from a window
+                // that ended at the end of the extent before it past one hole,
+                // if the next data after the window starts at `pos`.
+                self.lookups += 1;
+                matches!(seek_data(self.file.as_fd(), end), Ok(Some(data)) if data == pos)
+            }
+        {
+            (pos, grown)
+        } else {
+            // The window is the read itself, sized so that a read following
+            // on from it asks for `READ_AHEAD_MIN`.
+            self.read_ahead = (pos, pos.saturating_add(len));
+            self.read_ahead_size = READ_AHEAD_MIN / 4;
+            self.read_ahead_at_extent_end = self.read_ahead.1 >= extent.end;
+            return;
+        };
+        let to = extent.end.min(from.saturating_add(size));
+        if from < to {
+            // The kernel may read less than asked, capped by the device's
+            // readahead limits; a later read then reads the rest itself.
+            advise(&self.file, from, to - from, libc::POSIX_FADV_WILLNEED);
+            self.read_ahead = (pos, to);
+            self.read_ahead_size = size;
+            self.read_ahead_at_extent_end = to == extent.end;
+        }
+    }
+}
+
+/// The first window the source asks the kernel to read, when a read follows
+/// on from one that did not.
+const READ_AHEAD_MIN: u64 = 64 << 10;
+
+/// The most the source asks the kernel to read ahead at once, as reads in
+/// order grow the window. With a cold page cache, reading the 571 MB of data
+/// of a sparse 2 GiB file in order took 6.4 s on XFS and 4.2 s on btrfs,
+/// against 11.3 s and 4.3 s with the kernel's readahead (one run each).
+const READ_AHEAD: u64 = 512 << 10;
+
+/// `posix_fadvise(2)` on `[offset, offset + len)` of `file`, all of it when
+/// `len` is 0. Advice only changes how the file is cached, so a failure is
+/// ignored.
+fn advise(file: &File, offset: u64, len: u64, advice: libc::c_int) {
+    // SAFETY: FFI call on an fd `file` owns; no memory is passed.
+    unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            offset as libc::off_t,
+            len as libc::off_t,
+            advice,
+        )
+    };
 }
 
 impl UffdMemorySource for FileUffdMemorySource {
@@ -657,16 +844,21 @@ impl UffdMemorySource for FileUffdMemorySource {
         self.read_pages += 1;
 
         match copy(uffd_fd, page_addr, self.buf.as_ptr(), range.page_size) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                 // Installed concurrently. Wake any blocked threads.
                 if let Err(e) = wake(uffd_fd, page_addr, range.page_size) {
                     log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
                 }
-                Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
         }
+        // Read ahead only once the faulting page is in place: WILLNEED can
+        // block while it submits the I/O, and the vCPU waiting on this
+        // fault would wait for it too. A failed read or copy returns its
+        // error without asking for anything.
+        self.read_ahead_in_extent(file_pos, range.page_size);
+        Ok(())
     }
 
     fn requires_uffd_minor_mode(&self) -> bool {
@@ -920,12 +1112,26 @@ mod tests {
 
     // A file of `pages` pages of 4 KiB, data in each page `data` picks and
     // holes elsewhere. None unless SEEK_DATA reports exactly that.
+    //
+    // The data does not compress, as a guest's memory mostly does not: btrfs
+    // mounted with compression reads a compressed extent, up to 128 KiB,
+    // whole into the page cache, whatever the advice, which hid the kernel's
+    // readahead from the page cache checks below.
     fn file_with_data_pages(pages: u64, data: impl Fn(u64) -> bool) -> Option<File> {
         let file = tempfile::tempfile().unwrap();
         file.set_len(pages * PAGE).unwrap();
+        let mut buf = [0u8; PAGE as usize];
         for idx in (0..pages).filter(|&idx| data(idx)) {
-            file.write_all_at(&[0xa5; PAGE as usize], idx * PAGE)
-                .unwrap();
+            // splitmix64, seeded by the page's index.
+            let mut x = idx.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            for word in buf.as_chunks_mut::<8>().0 {
+                x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = x;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                *word = (z ^ (z >> 31)).to_ne_bytes();
+            }
+            file.write_all_at(&buf, idx * PAGE).unwrap();
         }
         for idx in 0..pages {
             let seen = seek_data(file.as_fd(), idx * PAGE);
@@ -935,6 +1141,63 @@ mod tests {
             }
         }
         Some(file)
+    }
+
+    #[test]
+    fn open_file_falls_back_to_a_clone_without_proc() {
+        use std::io::{Seek, SeekFrom};
+
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(&[0x5a; PAGE as usize], 0).unwrap();
+        // The open file description is told apart by its position: a clone
+        // shares it, a file opened again does not.
+        let shares_position = |other: &File| {
+            (&*other).seek(SeekFrom::Start(0)).unwrap();
+            (&file).seek(SeekFrom::Start(7)).unwrap();
+            (&*other).stream_position().unwrap() == 7
+        };
+
+        if Path::new("/proc/self/fd").is_dir() {
+            let reopened = FileUffdMemorySource::open_file(&file).unwrap();
+            assert!(!shares_position(&reopened));
+        } else {
+            eprintln!("note: /proc is not mounted here, so the reopen is not checked");
+        }
+
+        // Where the reopen fails, the source reads the same file through a
+        // clone, and reads the right page.
+        let no_proc = tempfile::tempdir().unwrap();
+        let cloned = FileUffdMemorySource::open_file_in(&file, &no_proc.path().join("fd")).unwrap();
+        assert!(shares_position(&cloned));
+        let source = FileUffdMemorySource::new(cloned);
+        let mut buf = [0u8; PAGE as usize];
+        source.file.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(buf, [0x5a; PAGE as usize]);
+    }
+
+    #[test]
+    fn open_file_falls_back_to_a_clone_when_the_reopen_is_another_file() {
+        use std::fs;
+        use std::io::{Seek, SeekFrom};
+
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(&[0x5a; PAGE as usize], 0).unwrap();
+        // Something other than /proc where the fd directory should be: the
+        // name of `file`'s fd opens another file, which the source must not
+        // serve the guest.
+        let fake_proc = tempfile::tempdir().unwrap();
+        let other = fake_proc.path().join(file.as_raw_fd().to_string());
+        fs::write(&other, [0xa5; PAGE as usize]).unwrap();
+
+        let opened = FileUffdMemorySource::open_file_in(&file, fake_proc.path()).unwrap();
+        // It is a clone of `file`: one open file description, so a seek on
+        // one moves the other.
+        (&opened).seek(SeekFrom::Start(0)).unwrap();
+        (&file).seek(SeekFrom::Start(7)).unwrap();
+        assert_eq!((&opened).stream_position().unwrap(), 7);
+        let mut buf = [0u8; PAGE as usize];
+        opened.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(buf, [0x5a; PAGE as usize]);
     }
 
     #[test]
@@ -1038,10 +1301,494 @@ mod tests {
         let (read_end, _write_end) =
             unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
         let mut source = FileUffdMemorySource::new(read_end);
+        assert!(!source.kernel_read_ahead);
         assert!(!source.in_hole(0, PAGE));
         assert!(!source.seek_holes);
+        // The kernel reads ahead again, as the source no longer can.
+        assert!(source.kernel_read_ahead);
         assert!(!source.in_hole(PAGE, PAGE));
         assert_eq!(source.extent, None);
+    }
+
+    // Pages of `file` in the page cache, of the `pages` pages from 0.
+    fn cached_pages(file: &File, pages: u64) -> Vec<u64> {
+        use std::ptr;
+
+        let len = (pages * PAGE) as usize;
+        // SAFETY: maps `len` bytes of `file` read-only; unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        let mut vec = vec![0u8; pages as usize];
+        // SAFETY: `vec` holds one byte per page of the mapping.
+        assert_eq!(unsafe { libc::mincore(addr, len, vec.as_mut_ptr()) }, 0);
+        // SAFETY: unmaps the mapping made above.
+        unsafe { libc::munmap(addr, len) };
+        (0..pages)
+            .filter(|&idx| vec[idx as usize] & 1 != 0)
+            .collect()
+    }
+
+    // The filesystem `file` is on, for the notes below.
+    fn fs_name(file: &File) -> String {
+        use std::mem;
+
+        // SAFETY: a statfs is plain data, for which all zeroes is valid.
+        let mut st: libc::statfs = unsafe { mem::zeroed() };
+        // SAFETY: fstatfs() writes only `st`, for an fd `file` owns.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } != 0 {
+            return "an unknown filesystem".to_string();
+        }
+        let name = match st.f_type {
+            libc::BTRFS_SUPER_MAGIC => "btrfs",
+            libc::EXT4_SUPER_MAGIC => "ext4",
+            libc::XFS_SUPER_MAGIC => "xfs",
+            libc::TMPFS_MAGIC => "tmpfs",
+            libc::OVERLAYFS_SUPER_MAGIC => "overlayfs",
+            other => return format!("the filesystem of type {other:#x}"),
+        };
+        name.to_string()
+    }
+
+    // Drops `file` from the page cache. False where its pages stay cached,
+    // as on tmpfs, where page cache checks are moot. Pages still being read
+    // ahead cannot be dropped yet, so it tries again for a while.
+    fn drop_cached(file: &File, pages: u64) -> bool {
+        use std::time::Duration;
+
+        // Dirty pages stay cached.
+        file.sync_all().unwrap();
+        for _ in 0..50 {
+            // SAFETY: drops the clean pages of `file` from the page cache.
+            let ret =
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            assert_eq!(ret, 0);
+            if cached_pages(file, pages).is_empty() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        eprintln!(
+            "note: on {}, POSIX_FADV_DONTNEED leaves the file in the page cache (on tmpfs \
+             the page cache is the file), so the page cache check is moot",
+            fs_name(file)
+        );
+        false
+    }
+
+    // Opens `file` afresh, with `advice` if any.
+    fn reopen(file: &File, advice: Option<libc::c_int>) -> File {
+        let fresh = File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        if let Some(advice) = advice {
+            advise(&fresh, 0, 0, advice);
+        }
+        fresh
+    }
+
+    // Reads the pages `idxs` of `file` through `read`, starting with none
+    // cached, and returns the pages cached then. Leaves none cached.
+    fn cached_after_reads(file: &File, read: &File, idxs: &[u64], pages: u64) -> Vec<u64> {
+        assert!(drop_cached(file, pages));
+        for idx in idxs {
+            read.read_exact_at(&mut [0u8; PAGE as usize], idx * PAGE)
+                .unwrap();
+        }
+        let cached = cached_pages(file, pages);
+        drop_cached(file, pages);
+        cached
+    }
+
+    // The pages cached by reads of `idxs` on `file` opened afresh, with no
+    // advice and with POSIX_FADV_RANDOM. None where that check is moot: the
+    // file stays in the page cache (tmpfs) or the advice changes nothing.
+    fn kernel_read_ahead_effect(file: &File, idxs: &[u64], pages: u64) -> Option<[Vec<u64>; 2]> {
+        if !drop_cached(file, pages) {
+            return None;
+        }
+        let normal = cached_after_reads(file, &reopen(file, None), idxs, pages);
+        let random = cached_after_reads(
+            file,
+            &reopen(file, Some(libc::POSIX_FADV_RANDOM)),
+            idxs,
+            pages,
+        );
+        if normal == random {
+            eprintln!(
+                "note: on {}, reads of pages {idxs:?} cache pages {normal:?} with the kernel's \
+                 readahead on and off alike, so the page cache check is moot",
+                fs_name(file)
+            );
+            return None;
+        }
+        Some([normal, random])
+    }
+
+    #[test]
+    fn source_turns_kernel_read_ahead_off() {
+        let pages = 64;
+        let Some(file) = file_with_data_pages(pages, |_| true) else {
+            return;
+        };
+        let reads = [8, 9, 10, 11];
+        let effect = kernel_read_ahead_effect(&file, &reads, pages);
+        let source = FileUffdMemorySource::new(reopen(&file, None));
+        assert!(!source.kernel_read_ahead);
+        // Reads in order through the source's file cache fewer pages than
+        // the kernel reads ahead for them.
+        if let Some([normal, _]) = effect {
+            let cached = cached_after_reads(&file, &source.file, &reads, pages);
+            assert!(cached.len() < normal.len(), "{cached:?} {normal:?}");
+        }
+    }
+
+    // What POSIX_FADV_RANDOM is for: reads in order of a data extent with a
+    // hole after it, as a guest's faults on the pages a snapshot holds, read
+    // ahead into the hole with the kernel's readahead on (the control: the
+    // test can see readahead) and cache only the pages read through the
+    // source's file. A lone read away from the start of a file is not read
+    // ahead even with readahead on, so the extent is read in order.
+    #[test]
+    fn source_reads_nothing_ahead_into_a_hole() {
+        // Data in pages 0 to 15, a hole of 4 MiB from page 16 to the end.
+        let pages = 1024;
+        let data = |idx| idx < 16;
+        let Some(file) = file_with_data_pages(pages, data) else {
+            return;
+        };
+        let fs = fs_name(&file);
+        if !drop_cached(&file, pages) {
+            eprintln!("skipping: on {fs} the page cache cannot be emptied, so cannot be checked");
+            return;
+        }
+        let reads: Vec<u64> = (0..pages).filter(|&idx| data(idx)).collect();
+        let normal = cached_after_reads(&file, &reopen(&file, None), &reads, pages);
+        let source = FileUffdMemorySource::new(reopen(&file, None));
+        let cached = cached_after_reads(&file, &source.file, &reads, pages);
+        let in_hole = |cached: &[u64]| cached.iter().filter(|&&idx| !data(idx)).count();
+        eprintln!(
+            "{fs}: {} pages read; with readahead {} cached, {} of them in the hole; \
+             through the source {} cached, {} in the hole",
+            reads.len(),
+            normal.len(),
+            in_hole(&normal),
+            cached.len(),
+            in_hole(&cached)
+        );
+        if in_hole(&normal) == 0 {
+            eprintln!(
+                "skipping: on {fs} the kernel read nothing ahead into the hole even with its \
+                 readahead on (cached {normal:?}), so this test cannot see readahead here"
+            );
+            return;
+        }
+        assert_eq!(cached, reads);
+    }
+
+    #[test]
+    fn read_ahead_stays_inside_the_data_extent() {
+        // Data in pages 0 to 199 and 264 to 299, a hole in between.
+        let ra_min = READ_AHEAD_MIN / PAGE;
+        let ra = READ_AHEAD / PAGE;
+        assert_eq!((ra_min, ra), (16, 128), "windows below assume these");
+        let pages = 300;
+        let data = |idx| !(200..264).contains(&idx);
+        let Some(file) = file_with_data_pages(pages, data) else {
+            return;
+        };
+        let checks_cache = drop_cached(&file, pages);
+        let mut source = FileUffdMemorySource::new(file.try_clone().unwrap());
+        let mut buf = [0u8; PAGE as usize];
+        // Each data page in order, as resolve reads it.
+        let mut windows = Vec::new();
+        for idx in (0..pages).filter(|&idx| data(idx)) {
+            assert!(!source.in_hole(idx * PAGE, PAGE));
+            source.read_ahead_in_extent(idx * PAGE, PAGE);
+            if windows.last() != Some(&source.read_ahead) {
+                windows.push(source.read_ahead);
+            }
+            source.file.read_exact_at(&mut buf, idx * PAGE).unwrap();
+        }
+        // The first page alone; from the second page on, a window of 16
+        // pages, then 64, then 128, each asked for half way through the last
+        // and cut at the end of the extent. The second extent follows on
+        // from the first past the hole, so its window stays at 128 pages,
+        // cut at the end of the file.
+        assert_eq!(
+            windows,
+            [(0, 1), (1, 17), (9, 81), (49, 200), (264, 300)].map(|(s, e)| (s * PAGE, e * PAGE))
+        );
+        // Nothing read ahead into the hole.
+        if checks_cache {
+            let cached = cached_pages(&file, pages);
+            assert!(cached.iter().all(|&idx| data(idx)), "cached {cached:?}");
+        }
+    }
+
+    #[test]
+    fn scattered_reads_read_nothing_ahead() {
+        let pages = 300;
+        let Some(file) = file_with_data_pages(pages, |_| true) else {
+            return;
+        };
+        let reads = [150, 10, 280, 12];
+        // What the reads cache on their own, with no readahead.
+        let read_alone = drop_cached(&file, pages).then(|| {
+            let random = reopen(&file, Some(libc::POSIX_FADV_RANDOM));
+            cached_after_reads(&file, &random, &reads, pages)
+        });
+        let mut source = FileUffdMemorySource::new(reopen(&file, None));
+        let mut buf = [0u8; PAGE as usize];
+        for idx in reads {
+            assert!(!source.in_hole(idx * PAGE, PAGE));
+            source.read_ahead_in_extent(idx * PAGE, PAGE);
+            assert_eq!(source.read_ahead, (idx * PAGE, (idx + 1) * PAGE));
+            source.file.read_exact_at(&mut buf, idx * PAGE).unwrap();
+        }
+        if let Some(read_alone) = read_alone {
+            assert_eq!(cached_pages(&file, pages), read_alone);
+        }
+    }
+
+    #[test]
+    fn stopping_hole_lookups_turns_kernel_read_ahead_back_on() {
+        let pages = 64;
+        let Some(file) = file_with_data_pages(pages, |_| true) else {
+            return;
+        };
+        let reads = [8, 9, 10, 11];
+        let effect = kernel_read_ahead_effect(&file, &reads, pages);
+        let mut source = FileUffdMemorySource::new(reopen(&file, None));
+        source.stop_seeking("SEEK_DATA", 0, &io::Error::from_raw_os_error(libc::EIO));
+        assert!(source.kernel_read_ahead);
+        assert!(!source.in_hole(0, PAGE));
+        source.read_ahead_in_extent(0, PAGE);
+        assert_eq!(source.read_ahead, (0, 0));
+        // Reads in order cache more than the pages read: the kernel reads
+        // ahead for them.
+        if effect.is_some() {
+            let cached = cached_after_reads(&file, &source.file, &reads, pages);
+            assert!(cached.len() > reads.len(), "{cached:?}");
+        }
+    }
+
+    // Resolves the read of `len` bytes at page `idx` as `resolve` does, up to
+    // the read, and returns the window then.
+    fn read_ahead_for(source: &mut FileUffdMemorySource, idx: u64, len: u64) -> (u64, u64) {
+        assert!(!source.in_hole(idx * PAGE, len));
+        source.read_ahead_in_extent(idx * PAGE, len);
+        source.read_ahead
+    }
+
+    #[test]
+    fn forward_jump_into_a_new_extent_reads_nothing_ahead() {
+        // Data in pages 0 to 99 and 164 to 299, a hole in between.
+        let pages = 300;
+        let data = |idx| !(100..164).contains(&idx);
+        let Some(file) = file_with_data_pages(pages, data) else {
+            return;
+        };
+        let pg = |(s, e): (u64, u64)| (s * PAGE, e * PAGE);
+
+        // A window that ends inside data: a jump past it into the next
+        // extent, data in between, needs no lseek to tell it does not follow
+        // on.
+        let mut source = FileUffdMemorySource::new(file.try_clone().unwrap());
+        read_ahead_for(&mut source, 0, PAGE);
+        assert_eq!(read_ahead_for(&mut source, 1, PAGE), pg((1, 17)));
+        let lookups = source.lookups;
+        assert_eq!(read_ahead_for(&mut source, 200, PAGE), pg((200, 201)));
+        // Two to find the extent of page 200, none to check the window.
+        assert_eq!(source.lookups, lookups + 2);
+
+        // A window that ends at the end of its extent: a jump into the next
+        // extent past its first page, data in between, looks the next data
+        // up from the end of the window, which is not the page read.
+        let mut source = FileUffdMemorySource::new(file.try_clone().unwrap());
+        read_ahead_for(&mut source, 98, PAGE);
+        assert_eq!(read_ahead_for(&mut source, 99, PAGE), pg((99, 100)));
+        assert!(source.read_ahead_at_extent_end);
+        let lookups = source.lookups;
+        assert_eq!(read_ahead_for(&mut source, 180, PAGE), pg((180, 181)));
+        assert_eq!(source.lookups, lookups + 3);
+        assert_eq!(source.read_ahead_size, READ_AHEAD_MIN / 4);
+
+        // The same window, then the first page of the next extent: it
+        // follows on, past the hole.
+        let mut source = FileUffdMemorySource::new(file);
+        read_ahead_for(&mut source, 98, PAGE);
+        read_ahead_for(&mut source, 99, PAGE);
+        assert_eq!(read_ahead_for(&mut source, 164, PAGE), pg((164, 228)));
+    }
+
+    #[test]
+    fn read_ahead_of_huge_pages_stays_inside_the_data_extent() {
+        // Four huge pages of data, one of hole, then one of data.
+        const HUGE: u64 = 2 << 20;
+        let per_huge = HUGE / PAGE;
+        let pages = 6 * per_huge;
+        let data = |idx| idx / per_huge != 4;
+        let Some(file) = file_with_data_pages(pages, data) else {
+            return;
+        };
+        let mut source = FileUffdMemorySource::new(file);
+        let mut windows = Vec::new();
+        for huge in (0..6).filter(|&huge| huge != 4) {
+            let window = read_ahead_for(&mut source, huge * per_huge, HUGE);
+            windows.push((window.0 / PAGE, window.1 / PAGE));
+        }
+        // The first read is its own window. The next follows on and asks for
+        // 16 pages, its own first ones, so the third does not follow on from
+        // that window and starts again. The last huge page holds a new extent
+        // that does not follow on from the window inside the one before it.
+        let p = per_huge;
+        assert_eq!(
+            windows,
+            [
+                (0, p),
+                (p, p + 16),
+                (2 * p, 3 * p),
+                (3 * p, 3 * p + 16),
+                (5 * p, 6 * p)
+            ]
+        );
+        // No window reaches the hole.
+        assert!(windows.iter().all(|&(s, e)| e <= 4 * p || s >= 5 * p));
+    }
+
+    // The file source runs on the vmm thread, where it is built, and on the
+    // uffd-handler thread, which inherits the vmm thread's filter. Each
+    // system call it makes must pass that filter: one that does not killed
+    // every UFFD restore with SIGSYS. The filter here fails a refused call
+    // with EUCLEAN rather than killing the test.
+    #[cfg(feature = "kvm")]
+    #[test]
+    fn file_source_passes_the_vmm_seccomp_filter() {
+        use std::io::{Seek, SeekFrom};
+        use std::mem::MaybeUninit;
+
+        use seccompiler::SeccompAction;
+
+        use crate::seccomp_filters::{Thread, get_seccomp_filter};
+
+        // Data in pages 0 to 31 and 48 to 63, a hole in between. None on a
+        // filesystem without SEEK_HOLE: the filter is checked all the same,
+        // on a plain file, and only the source's own path is skipped.
+        let pages = 64;
+        let data = |idx| !(32..48).contains(&idx);
+        let holey = file_with_data_pages(pages, data);
+        if holey.is_none() {
+            eprintln!("skipping: the source's own path, the filter is still checked");
+        }
+        let plain = tempfile::tempfile().unwrap();
+        // Made, and removed, outside the filter, which refuses mkdir.
+        let no_proc = tempfile::tempdir().unwrap();
+        let no_proc_fd = no_proc.path().join("fd");
+        // Whether /proc/self/fd reopens `plain` here, checked before the
+        // filter is in force, so that a reopen the filter refuses fails the
+        // test rather than passing as a fallback. Reading metadata here also
+        // settles std's statx probe, so that inside the filter std does not
+        // quietly fall back from a refused statx to fstat.
+        let proc_usable = File::open(format!("/proc/self/fd/{}", plain.as_raw_fd()))
+            .and_then(|f| FileUffdMemorySource::same_inode(&plain, &f))
+            .unwrap_or(false);
+        plain.metadata().unwrap();
+        if !proc_usable {
+            eprintln!(
+                "note: /proc/self/fd does not reopen a file here, so the reopen \
+                 is not checked under the filter"
+            );
+        }
+        let filter = get_seccomp_filter(
+            &SeccompAction::Errno(libc::EUCLEAN as u32),
+            Thread::Vmm,
+            Some(hypervisor::HypervisorType::Kvm),
+        )
+        .unwrap();
+        thread::spawn(move || {
+            seccompiler::apply_filter(&filter).unwrap();
+            let fadvise = |advice| {
+                // SAFETY: FFI call on an fd `plain` owns; no memory is passed.
+                unsafe { libc::posix_fadvise(plain.as_raw_fd(), 0, 0, advice) }
+            };
+            // The filter is in force: advice the source never gives is
+            // refused.
+            assert_eq!(fadvise(libc::POSIX_FADV_DONTNEED), libc::EUCLEAN);
+            // Each advice the source gives passes.
+            for advice in [
+                libc::POSIX_FADV_RANDOM,
+                libc::POSIX_FADV_WILLNEED,
+                libc::POSIX_FADV_NORMAL,
+            ] {
+                assert_eq!(fadvise(advice), 0, "advice {advice}");
+            }
+
+            // This guards the SYS_fstat syscall that musl's fstat makes: the
+            // shipped static binary is musl. std's metadata() is statx on gnu
+            // and fstat on musl, so the inode check below passes by whichever
+            // the build uses. Make the syscall directly, because glibc 2.33+
+            // may route fstat() to newfstatat, which would leave SYS_fstat
+            // unexercised on a gnu build.
+            let mut st = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: FFI call on an fd `plain` owns, with a pointer to
+            // storage for one stat that the call fills in or leaves unread.
+            let ret = unsafe { libc::syscall(libc::SYS_fstat, plain.as_raw_fd(), st.as_mut_ptr()) };
+            assert_eq!(ret, 0, "fstat was refused: {}", io::Error::last_os_error());
+
+            // The file a source reads through, as restore_by_uffd gets it:
+            // reopened through /proc and checked to be the same inode, and,
+            // where the reopen fails, a clone of the held fd instead. Both
+            // paths pass the filter. open_file falls back to a clone when a
+            // call is refused, so each path is told apart by whether it
+            // shares `plain`'s file position (lseek passes the filter).
+            let shares_position = |other: &File| {
+                (&*other).seek(SeekFrom::Start(0)).unwrap();
+                (&plain).seek(SeekFrom::Start(7)).unwrap();
+                (&*other).stream_position().unwrap() == 7
+            };
+            if proc_usable {
+                let reopened = FileUffdMemorySource::open_file(&plain).unwrap();
+                assert!(
+                    !shares_position(&reopened),
+                    "the /proc reopen or its inode check was refused"
+                );
+                assert!(FileUffdMemorySource::same_inode(&plain, &reopened).unwrap());
+            }
+            let cloned = FileUffdMemorySource::open_file_in(&plain, &no_proc_fd).unwrap();
+            assert!(shares_position(&cloned));
+
+            let Some(file) = holey else {
+                return;
+            };
+            // The source's own path: opened as restore_by_uffd opens it,
+            // holes looked up with SEEK_DATA and SEEK_HOLE, the file's size
+            // read past the last data, reads ahead and reads in order, and
+            // the kernel's readahead turned back on.
+            let mut source =
+                FileUffdMemorySource::new(FileUffdMemorySource::open_file(&file).unwrap());
+            let mut buf = [0u8; PAGE as usize];
+            for idx in 0..pages {
+                assert_eq!(source.in_hole(idx * PAGE, PAGE), !data(idx), "page {idx}");
+                if data(idx) {
+                    source.file.read_exact_at(&mut buf, idx * PAGE).unwrap();
+                    source.read_ahead_in_extent(idx * PAGE, PAGE);
+                }
+            }
+            assert!(source.seek_holes, "a hole lookup failed");
+            assert!(source.read_ahead.1 > PAGE, "nothing was read ahead");
+            assert!(!source.in_hole(pages * PAGE, PAGE));
+            source.stop_seeking("SEEK_DATA", 0, &io::Error::from_raw_os_error(libc::EIO));
+            assert!(source.kernel_read_ahead);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
