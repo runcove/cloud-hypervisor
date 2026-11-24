@@ -31,6 +31,7 @@
 topic/fork-readme                                   never-upstream
 topic/fork-ci                                       never-upstream
 topic/fork-release      base=topic/fork-ci          never-upstream
+topic/fork-release-tests base=topic/fork-release never-upstream
 
 # Upstreamable, in map order (rows 1-14, then 18).
 topic/iouring-eagain-retry

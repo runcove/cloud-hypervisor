@@ -7,6 +7,8 @@ name: cove-test
 # loop devices and /dev/userfaultfd: block's loop-device tests fail the job if
 # one skips, and the root-only tests that passed are listed in the run's
 # notices, which the public API serves without a token.
+# A second job runs .github/cove-ci/tests/test-release-workflow.sh, which checks
+# cove-release.yml itself.
 
 on:
   push:
@@ -18,6 +20,29 @@ on:
 permissions: {}
 
 jobs:
+  # The release workflow's own test: cove-release.yml's triggers and its check of
+  # the previous release's checkpoint attestation, against a stub gh and a temp
+  # repo. It needs git, python3 with yaml and bash, and runs no tree code.
+  release-workflow:
+    name: release workflow test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the pushed commit
+        run: |
+          git init -q "$GITHUB_WORKSPACE/src"
+          cd "$GITHUB_WORKSPACE/src" || exit 1
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout -q --detach "$GITHUB_SHA"
+          git log -1 --format='checked out %H'
+
+      - name: test-release-workflow.sh
+        run: bash src/.github/cove-ci/tests/test-release-workflow.sh
+
   test:
     name: unit tests
     runs-on: ubuntu-24.04

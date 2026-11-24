@@ -69,7 +69,7 @@ jobs:
       sha: ${{ steps.checkout.outputs.sha }}
     steps:
       # Plain git and no token: full history and tags, because build.rs runs
-      # `git describe` and the release branch is checked below. A test tag is
+      # `git describe` and the release branch is checked below. A ci-test-* tag is
       # dropped from the clone: annotated, it would be what `git describe` says.
       # A push builds the pushed ref at GITHUB_SHA; a dispatch builds its input
       # tag at the commit that tag names. Both go on as TAG and FORK_SHA (and
@@ -371,8 +371,9 @@ jobs:
           pin=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/cove-release.yml"
             --deny-self-hosted-runners)
           if gh attestation verify "$dl/$name" "${pin[@]}" \
-              --source-ref "refs/tags/$prev" --source-digest "$prev_sha" --signer-digest "$prev_sha" </dev/null; then
-            echo "$prev's checkpoint: attested by the push of $prev at $prev_sha"
+              --source-ref "refs/tags/$prev" --source-digest "$prev_sha" --signer-digest "$prev_sha" </dev/null \
+            && git -C "$pc" merge-base --is-ancestor "$prev_sha" "$branch_ref"; then
+            echo "$prev's checkpoint: attested by the push of $prev at $prev_sha, on $branch_ref"
           else
             echo "$prev's checkpoint: not the push shape; trying a dispatch from $branch_ref"
             signer=''
