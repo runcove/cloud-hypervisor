@@ -395,10 +395,18 @@ if [ "$BUILD_PHASE" = test ]; then
   # every test_write_zeroes_unmap_loop_device in block/src must print `ok` on
   # its own line and none may print `Skipping`. Each one that ran is named on
   # a `build-static: root test ran:` line, which run-recipe.sh turns into a
-  # notice. A line without the tests says so and runs none.
-  ROOT_WANT=$(grep -rhoE '\bfn test_write_zeroes_unmap_loop_device\(\)' block/src | wc -l)
+  # notice. The requirement is keyed on the tests' helper: while
+  # test_helpers.rs has `struct LoopDevice`, the tests must be there, so a
+  # rename or removal of them fails here instead of running none. Only a line
+  # with neither the helper nor the tests says so and runs none.
+  ROOT_HELPER=block/src/formats/raw/test_helpers.rs
+  ROOT_WANT=$({ grep -rhoE '\bfn test_write_zeroes_unmap_loop_device\(\)' block/src || true; } | wc -l)
+  if [ -f "$ROOT_HELPER" ] && grep -qE '\bstruct LoopDevice\b' "$ROOT_HELPER"; then
+    [ "$ROOT_WANT" -gt 0 ] \
+      || fail "$ROOT_HELPER has struct LoopDevice but block/src has no test named test_write_zeroes_unmap_loop_device: were the loop-device tests renamed or removed?"
+  fi
   if [ "$ROOT_WANT" -eq 0 ]; then
-    echo "build-static: SKIPPED root-only block tests -- no test named test_write_zeroes_unmap_loop_device in block/src on this line"
+    echo "build-static: SKIPPED root-only block tests -- no struct LoopDevice in $ROOT_HELPER and no test named test_write_zeroes_unmap_loop_device in block/src on this line"
   else
     ROOT_LOG=$(mktemp) || cannot "mktemp failed"
     cargo test --locked -p block --features "$BLOCK_FEATURES" --lib test_write_zeroes_unmap_loop_device \
@@ -415,7 +423,9 @@ if [ "$BUILD_PHASE" = test ]; then
   # The vmm's copy_on_access_* tests fail, never skip, without a userfaultfd
   # (CH_TEST_SKIP_UFFD is unset above), so `ok` means they ran. Each test fn
   # of that name in vmm/src must have passed; each is named for a notice.
-  COA_WANT=$(grep -rhoE '\bfn copy_on_access_[A-Za-z0-9_]+\(\)' vmm/src | wc -l)
+  COA_WANT=$({ grep -rhoE '\bfn copy_on_access_[A-Za-z0-9_]+\(\)' vmm/src || true; } | wc -l)
+  [ "$COA_WANT" -gt 0 ] \
+    || fail "no test named copy_on_access_* in vmm/src: the copy-on-access restore tests were renamed or removed, so none would be checked"
   COA_RAN=$(grep -cE '^test [A-Za-z0-9_:]+::copy_on_access_[A-Za-z0-9_]+ \.\.\. ok$' "$WS_LOG" || true)
   [ "$COA_RAN" -eq "$COA_WANT" ] \
     || fail "$COA_RAN of the vmm's $COA_WANT copy_on_access_* tests passed"

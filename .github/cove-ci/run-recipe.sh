@@ -50,9 +50,14 @@ case "$BUILD_PHASE" in
   # /dev/userfaultfd for the vmm's uffd restore tests, which fail without it.
   # The device, not CAP_SYS_PTRACE or a host-wide sysctl, is the least
   # privilege: it lets this container create userfaultfds and nothing else.
-  # Likewise /dev/loop-control and the loop devices' major (7), for block's
-  # loop-device tests, which skip without them: loop devices are reached
-  # through their nodes, so neither --privileged nor CAP_SYS_ADMIN is needed.
+  # /dev/loop-control and the loop devices' major (7) are for block's
+  # loop-device tests, which skip without them. That is not least privilege:
+  # loop devices are not namespaced, and LOOP_SET_FD and the other loop ioctls
+  # need no capability, so the cgroup rule lets this container open, attach
+  # and detach every loop device on the runner, including ones the host is
+  # using. It is acceptable only because the runner is a throwaway VM that
+  # holds no token; the runner's loop devices are listed before the container
+  # is made, so the log shows what was there.
   test)
     [ -c /dev/userfaultfd ] || cannot "the runner has no /dev/userfaultfd, which the uffd tests need"
     [ -c /dev/loop-control ] || cannot "the runner has no /dev/loop-control, which the loop-device tests need"
@@ -62,6 +67,12 @@ case "$BUILD_PHASE" in
     ;;
   *) cannot "phase '$BUILD_PHASE' is not build, block-tests or test" ;;
 esac
+
+if [ "$BUILD_PHASE" = test ]; then
+  # Prefixed, so a backing file's name cannot start a workflow command.
+  echo "run-recipe: the runner's loop devices before the test phase (losetup -l):"
+  { losetup -l 2>&1 || echo "(losetup -l failed: exit $?)"; } | sed 's/^/run-recipe: losetup: /'
+fi
 
 NAME="cove-${BUILD_PHASE}-${RUN_ID}"
 remove() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
@@ -102,7 +113,7 @@ if [ "$BUILD_PHASE" = test ] && [ "$rc" -eq 0 ]; then
     if [ -n "$names" ]; then
       echo "::notice title=$2::$(wc -l <<<"$names") ran and passed: $(paste -sd' ' <<<"$names")"
     else
-      echo "::notice title=$2::none ran"
+      echo "::warning title=$2::none ran"
     fi
   }
   notice_ran 'root test ran' 'Root-only block tests ran as root (loop devices)'
