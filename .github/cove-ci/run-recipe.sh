@@ -50,10 +50,15 @@ case "$BUILD_PHASE" in
   # /dev/userfaultfd for the vmm's uffd restore tests, which fail without it.
   # The device, not CAP_SYS_PTRACE or a host-wide sysctl, is the least
   # privilege: it lets this container create userfaultfds and nothing else.
+  # Likewise /dev/loop-control and the loop devices' major (7), for block's
+  # loop-device tests, which skip without them: loop devices are reached
+  # through their nodes, so neither --privileged nor CAP_SYS_ADMIN is needed.
   test)
     [ -c /dev/userfaultfd ] || cannot "the runner has no /dev/userfaultfd, which the uffd tests need"
+    [ -c /dev/loop-control ] || cannot "the runner has no /dev/loop-control, which the loop-device tests need"
     OPTS=(--network bridge --memory 14g --memory-swap 14g --security-opt seccomp=unconfined
-          --device /dev/kvm --device /dev/net/tun --device /dev/userfaultfd --cap-add net_admin)
+          --device /dev/kvm --device /dev/net/tun --device /dev/userfaultfd --cap-add net_admin
+          --device /dev/loop-control --device-cgroup-rule 'b 7:* rwm')
     ;;
   *) cannot "phase '$BUILD_PHASE' is not build, block-tests or test" ;;
 esac
@@ -79,12 +84,30 @@ else
 fi
 
 # What the container prints reaches this log until the resume line: none of it
-# runs as a workflow command.
+# runs as a workflow command. A copy is kept for the notices below.
 tok=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+LOG="$RUNNER_TEMP/$NAME.log"
 echo "::stop-commands::$tok"
-rc=0
-docker start -a "$NAME" || rc=$?
+if docker start -a "$NAME" 2>&1 | tee "$LOG"; then rc=0; else rc=${PIPESTATUS[0]}; fi
 printf '\n::%s::\n' "$tok"
+# The test phase names each root-only test that passed on a line of its own.
+# Once it has passed, one notice per kind lists them, readable from the run's
+# annotations without a token. Only names of plain characters are taken, so
+# nothing the container printed becomes a workflow command; the titles hold
+# no comma or colon, which would end them.
+if [ "$BUILD_PHASE" = test ] && [ "$rc" -eq 0 ]; then
+  notice_ran() { # <what the line says before the name> <notice title>
+    local names
+    names=$(sed -n "s/^build-static: $1: \([A-Za-z0-9_:]\{1,200\}\)\$/\1/p" "$LOG" | sort -u)
+    if [ -n "$names" ]; then
+      echo "::notice title=$2::$(wc -l <<<"$names") ran and passed: $(paste -sd' ' <<<"$names")"
+    else
+      echo "::notice title=$2::none ran"
+    fi
+  }
+  notice_ran 'root test ran' 'Root-only block tests ran as root (loop devices)'
+  notice_ran 'uffd test ran' 'copy_on_access tests ran as root (userfaultfd)'
+fi
 [ "$rc" -eq 0 ] || { echo "::error::phase $BUILD_PHASE failed (exit $rc); the error is above."; exit "$rc"; }
 [ "$BUILD_PHASE" = build ] || exit 0
 

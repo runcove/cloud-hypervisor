@@ -3,7 +3,10 @@ name: cove-test
 # The block crate's clippy and tests, and the workspace's unit tests, on a
 # GitHub-hosted runner. The advisory gate and the refusal of a tree carrying
 # .cargo or rust-toolchain run first, before any of the tree's code. All of it
-# is the `test` phase of .github/cove-ci/build-static.sh.
+# is the `test` phase of .github/cove-ci/build-static.sh. It runs as root, with
+# loop devices and /dev/userfaultfd: block's loop-device tests fail the job if
+# one skips, and the root-only tests that passed are listed in the run's
+# notices, which the public API serves without a token.
 
 on:
   push:
