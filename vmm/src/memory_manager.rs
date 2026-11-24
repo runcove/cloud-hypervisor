@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::cmp::Reverse;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::mem::{self, MaybeUninit, zeroed};
@@ -14,7 +16,7 @@ use std::ops::{BitAnd, Not, Sub};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, ffi, panic, process, result, thread, time};
@@ -58,7 +60,9 @@ use crate::coredump::{
 use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
 use crate::pagemap::PageMap;
-use crate::sparse::{clone_file_range, next_data_extent, write_region_sparse};
+use crate::sparse::{
+    clone_file_range, copy_region, copy_region_dense, next_data_extent, write_region_sparse,
+};
 use crate::uffd::{
     self, FileUffdMemorySource, SocketUffdMemorySource, Uffd, UffdHole, UffdMemorySource, UffdRange,
 };
@@ -71,6 +75,11 @@ struct UffdHandler {
     handle: thread::JoinHandle<()>,
     fault_socket_fd: Option<OwnedFd>,
     uffd_registry: Arc<UffdRegistry>,
+    /// Set once the restore can no longer complete: the background fill was
+    /// abandoned after an error, the source failed, or the handler died.
+    /// Demand faults may still be served after an abandoned fill.
+    prefault_failed: Arc<AtomicBool>,
+    copy_on_access: Option<CopyOnAccessPages>,
 }
 
 /// Userfaultfds sent to a UFFD handler.
@@ -142,7 +151,7 @@ impl PostcopyHandler for UffdRegistry {
                 // Faults on `fd` are at the addresses where its process maps
                 // guest memory, so translate the handler ranges to those
                 host_addr: region.backend_addr + (range.host_addr - region.host_addr),
-                ..range.clone()
+                ..*range
             });
         }
 
@@ -178,6 +187,170 @@ impl PostcopyHandler for UffdRegistry {
 
     fn postcopy_done_event(&self) -> &EventFd {
         &self.done
+    }
+}
+
+/// Whether an on-demand restore is still filling guest RAM, and whether its
+/// fill failed, as `(restoring, restore_failed)`. A copy-on-access restore
+/// never fills, so it is neither; a failed fill is no longer filling.
+fn restore_status(
+    copy_on_access: bool,
+    uffd_registry: &UffdRegistry,
+    prefault_failed: &AtomicBool,
+) -> (bool, bool) {
+    if copy_on_access {
+        return (false, false);
+    }
+    let failed = prefault_failed.load(Ordering::Acquire);
+    let complete = uffd_registry.is_done();
+    (!complete && !failed, failed)
+}
+
+/// How a UFFD handler serves guest memory.
+enum UffdServing {
+    /// Serve faults and, with `background_fetch_pages`, copy every page the
+    /// guest has not accessed yet in the background, exiting once all are in.
+    OnDemand { background_fetch_pages: bool },
+    /// Serve faults for the VM's whole lifetime and never copy a page the
+    /// guest has not accessed. A page the guest discarded after accessing it
+    /// (balloon, free page reporting, virtio-mem unplug) comes back as zeroes,
+    /// as after an eager copy. `source` is the restore source, kept for the
+    /// snapshot writer.
+    CopyOnAccess { source: File },
+}
+
+/// What a copy-on-access VM's snapshot writer needs: the pages the guest
+/// never accessed are only in the snapshot the VM was restored from.
+struct CopyOnAccessPages {
+    source: File,
+    ranges: Box<[UffdRange]>,
+    served: Arc<[AtomicBitmap]>,
+    /// Held by the handler from deciding how to resolve a fault until the
+    /// page is installed and `served` updated. Holding it, `served` and the
+    /// pages in memory agree.
+    serve_lock: Arc<Mutex<()>>,
+}
+
+/// A part of a saved memory range and where its content is.
+#[derive(Debug, PartialEq, Eq)]
+enum CopyOnAccessSegment {
+    /// In guest memory: outside every UFFD range, served, or present.
+    Guest { offset: u64, len: u64 },
+    /// Never served and not present: still only in the restore source, at
+    /// `source_offset`.
+    Source {
+        offset: u64,
+        len: u64,
+        source_offset: u64,
+    },
+}
+
+impl CopyOnAccessSegment {
+    fn end(&self) -> u64 {
+        match *self {
+            Self::Guest { offset, len } | Self::Source { offset, len, .. } => offset + len,
+        }
+    }
+
+    /// Extend `self` with `next` if it continues it. Returns whether it did.
+    fn merge(&mut self, next: &Self) -> bool {
+        match (self, next) {
+            (
+                Self::Guest { offset, len },
+                Self::Guest {
+                    offset: next,
+                    len: next_len,
+                },
+            ) if *offset + *len == *next => *len += next_len,
+            (
+                Self::Source {
+                    offset,
+                    len,
+                    source_offset,
+                },
+                Self::Source {
+                    offset: next,
+                    len: next_len,
+                    source_offset: next_source,
+                },
+            ) if *offset + *len == *next && *source_offset + *len == *next_source => {
+                *len += next_len;
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+impl CopyOnAccessPages {
+    /// The longest leading part of the `len` bytes of guest memory mapped at
+    /// `host_addr` whose content is all in one place, at offsets relative to
+    /// `host_addr`. `page_present` tells whether the page at an address is in
+    /// memory; it is asked only about pages never served. Call with
+    /// `serve_lock` held, and the answer holds only as long as it is.
+    fn next_segment(
+        &self,
+        host_addr: u64,
+        len: u64,
+        page_present: &impl Fn(u64) -> bool,
+    ) -> CopyOnAccessSegment {
+        let end = host_addr + len;
+        let mut segment = self.piece(host_addr, host_addr, end, page_present);
+        while host_addr + segment.end() < end {
+            let next = self.piece(host_addr, host_addr + segment.end(), end, page_present);
+            if !segment.merge(&next) {
+                break;
+            }
+        }
+        segment
+    }
+
+    /// The part of `[addr, end)` up to the end of the page at `addr`, or up
+    /// to the next UFFD range when `addr` is in none, at an offset relative
+    /// to `base`.
+    fn piece(
+        &self,
+        base: u64,
+        addr: u64,
+        end: u64,
+        page_present: &impl Fn(u64) -> bool,
+    ) -> CopyOnAccessSegment {
+        let Some((range_idx, range)) = self
+            .ranges
+            .iter()
+            .enumerate()
+            .find(|(_, r)| addr >= r.host_addr && addr < r.host_addr + r.length)
+        else {
+            let next = self
+                .ranges
+                .iter()
+                .map(|r| r.host_addr)
+                .filter(|&start| start > addr && start < end)
+                .min()
+                .unwrap_or(end);
+            return CopyOnAccessSegment::Guest {
+                offset: addr - base,
+                len: next - addr,
+            };
+        };
+
+        let page_idx = (addr - range.host_addr) / range.page_size;
+        let page_end = (range.page_addr(page_idx) + range.page_size)
+            .min(range.host_addr + range.length)
+            .min(end);
+        let offset = addr - base;
+        let len = page_end - addr;
+        if self.served[range_idx].is_bit_set(page_idx as usize)
+            || page_present(range.page_addr(page_idx))
+        {
+            CopyOnAccessSegment::Guest { offset, len }
+        } else {
+            CopyOnAccessSegment::Source {
+                offset,
+                len,
+                source_offset: range.source_offset + (addr - range.host_addr),
+            }
+        }
     }
 }
 
@@ -1047,17 +1220,31 @@ impl MemoryManager {
         file_path: PathBuf,
         saved_regions: &MemoryRangeTable,
     ) -> Result<(), Error> {
+        Self::copy_saved_regions(&self.guest_memory.memory(), file_path, saved_regions)
+    }
+
+    fn copy_saved_regions(
+        guest_memory: &GuestMemory,
+        file_path: PathBuf,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
         // Open (read only) the snapshot file.
         let mut memory_file = OpenOptions::new()
             .read(true)
             .open(file_path)
             .map_err(Error::SnapshotOpen)?;
 
-        let guest_memory = self.guest_memory.memory();
         let mut file_cursor: u64 = 0;
 
         for range in saved_regions.ranges() {
-            let end = file_cursor + range.length;
+            // Every guest address and file offset below lies before these two
+            // ends, so neither sum wraps once both are checked.
+            let end = file_cursor.checked_add(range.length).ok_or_else(|| {
+                invalid_saved_ranges("saved memory ranges overflow a file offset")
+            })?;
+            range.gpa.checked_add(range.length).ok_or_else(|| {
+                invalid_saved_ranges("a saved memory range overflows guest memory")
+            })?;
 
             // First call doubles as a SEEK_HOLE-support probe. On error,
             // take the dense path which seeks-and-streams sequentially.
@@ -1137,25 +1324,16 @@ impl MemoryManager {
         file_path: PathBuf,
         saved_regions: &MemoryRangeTable,
     ) -> Result<(), Error> {
-        let guest_memory = self.guest_memory.memory();
-        if !is_restore_cow_compatible(&guest_memory, saved_regions) {
-            info!("Restore (mode=copyonwrite): guest RAM unsuitable, falling back to copy");
-            return self.fill_saved_regions(file_path, saved_regions);
-        }
-        let memory_file = OpenOptions::new()
-            .read(true)
-            .open(file_path)
-            .map_err(Error::SnapshotOpen)?;
-        // A range mapped past EOF faults SIGBUS at run time, not restore time.
-        let mapped_len: u64 = saved_regions.ranges().iter().map(|r| r.length).sum();
-        let file_len = memory_file.metadata().map_err(Error::SnapshotOpen)?.len();
-        if file_len < mapped_len {
-            return Err(Error::SnapshotMmap(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "snapshot memory file is shorter than the saved ranges",
-            )));
-        }
-        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)?;
+        let Some(memory_file) = Self::cow_map_saved_regions(
+            &self.guest_memory.memory(),
+            &self.memory_zones,
+            self.thp,
+            file_path,
+            saved_regions,
+        )?
+        else {
+            return Ok(());
+        };
         // Landlock applies after the restore, so the pagemap is opened here.
         self.cow_source = match PageMap::open() {
             Ok(pagemap) => Some(CowSource {
@@ -1169,6 +1347,53 @@ impl MemoryManager {
             }
         };
         Ok(())
+    }
+
+    // Returns the snapshot file when the ranges were mapped from it, or None
+    // when the restore fell back to the eager copy.
+    fn cow_map_saved_regions(
+        guest_memory: &GuestMemory,
+        memory_zones: &MemoryZones,
+        thp: bool,
+        file_path: PathBuf,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<Option<File>, Error> {
+        // Overlapping saved ranges land here too. The copy goes in table
+        // order, so where ranges overlap a later range's data replaces an
+        // earlier one's. Where SEEK_DATA works on the snapshot file, the
+        // copy writes only each range's data, and a later range's hole
+        // leaves the earlier range's data in place; where it does not, each
+        // range is copied whole, and a later range's hole overwrites the
+        // earlier range's data with zeroes.
+        if !is_restore_cow_compatible(guest_memory, saved_regions) {
+            info!("Restore (mode=copyonwrite): guest RAM unsuitable, falling back to copy");
+            Self::copy_saved_regions(guest_memory, file_path, saved_regions)?;
+            return Ok(None);
+        }
+        if saved_ranges_in_virtio_mem(memory_zones, saved_regions) {
+            info!("Restore (mode=copyonwrite): plugged virtio-mem blocks, falling back to copy");
+            Self::copy_saved_regions(guest_memory, file_path, saved_regions)?;
+            return Ok(None);
+        }
+        let memory_file = OpenOptions::new()
+            .read(true)
+            .open(file_path)
+            .map_err(Error::SnapshotOpen)?;
+        // A range mapped past EOF faults SIGBUS at run time, not restore time.
+        let mapped_len = saved_regions
+            .ranges()
+            .iter()
+            .try_fold(0u64, |end, r| end.checked_add(r.length))
+            .ok_or_else(|| invalid_saved_ranges("saved memory ranges overflow a file offset"))?;
+        let file_len = memory_file.metadata().map_err(Error::SnapshotOpen)?.len();
+        if file_len < mapped_len {
+            return Err(Error::SnapshotMmap(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "snapshot memory file is shorter than the saved ranges",
+            )));
+        }
+        do_mmap_cow_saved_regions(guest_memory, &memory_file, saved_regions, thp)?;
+        Ok(Some(memory_file))
     }
 
     /// Restore guest memory using userfaultfd for lazy demand paging.
@@ -1188,19 +1413,56 @@ impl MemoryManager {
     /// The handler thread keeps the snapshot file open while lazy restore
     /// is active. The file must remain available until the VM is shut down or
     /// all faulted pages have been served.
+    ///
+    /// With `copy_on_access`, nothing is copied in the background: a page is
+    /// copied only when first accessed, the handler serves faults until the
+    /// VM is shut down, and the snapshot file stays open for that long.
     fn restore_by_uffd(
         &mut self,
         file_path: &Path,
         saved_regions: &MemoryRangeTable,
         background_fetch_pages: bool,
         exit_evt: &EventFd,
+        copy_on_access: bool,
     ) -> Result<(), Error> {
         let mut file_offset: u64 = 0;
 
         let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
-        let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(
-            snapshot_file.try_clone().map_err(Error::SnapshotOpen)?,
-        ));
+        // As copy-on-write does: a page past EOF would fail its read while
+        // the VM runs, which stops the VM, so refuse the restore now.
+        check_snapshot_file_covers_ranges(&snapshot_file, saved_regions)?;
+        // A fault on a hole of the snapshot file is resolved with zeroes
+        // rather than by reading the hole, which would cache a zero page in
+        // the host page cache for each hole page the guest touches. With
+        // `copy_on_access`, the source looks each hole up when a page is
+        // faulted, and nothing scans the file. Otherwise the holes are found
+        // below and marked served, so a fault on one is resolved as for a
+        // discarded page and never reaches the source. Without SEEK_HOLE
+        // support every page is read. The source opens the file for itself: it
+        // turns the kernel's readahead off on its open file, which a clone of
+        // `snapshot_file` would share with the snapshot writer of a
+        // copy-on-access VM. It opens it through `snapshot_file`'s fd rather
+        // than by path, so that both read the same inode even if the path is
+        // renamed over in between. If that reopen fails (as where /proc is not
+        // mounted) or opens a different inode, it reads through a clone of
+        // `snapshot_file`'s fd instead, sharing its open file description (see
+        // `open_file`).
+        let source: Box<dyn UffdMemorySource> = Box::new(
+            FileUffdMemorySource::for_snapshot(
+                FileUffdMemorySource::open_file(&snapshot_file).map_err(Error::SnapshotOpen)?,
+                file_path,
+            )
+            .map_err(Error::SnapshotOpen)?,
+        );
+        info!(
+            "UFFD restore: snapshot file holes are {} and resolved without reading the \
+             file; counts of the pages the source resolved are logged when it is dropped",
+            if copy_on_access {
+                "looked up per fault"
+            } else {
+                "found at restore"
+            }
+        );
 
         let Some(uffd) = self.prepare_uffd(
             saved_regions,
@@ -1228,6 +1490,24 @@ impl MemoryManager {
             })
             .collect();
 
+        if copy_on_access {
+            // No prefault, so holes stay unserved: a hole is then saved from
+            // the snapshot file (as a hole) rather than read through guest
+            // memory, which would fault it in.
+            self.spawn_uffd_handler(
+                uffd,
+                None,
+                served_bitmap.into(),
+                source,
+                exit_evt,
+                UffdServing::CopyOnAccess {
+                    source: snapshot_file,
+                },
+            )?;
+            info!("UFFD restore: copy-on-access restore enabled");
+            return Ok(());
+        }
+
         // For sparse files, we mark holes as served pages so we don't prefault them.
         for (range, served) in uffd.ranges().iter().zip(&served_bitmap) {
             let end = range.source_offset + range.length;
@@ -1250,10 +1530,12 @@ impl MemoryManager {
         self.spawn_uffd_handler(
             uffd,
             None,
-            served_bitmap,
+            served_bitmap.into(),
             source,
             exit_evt,
-            background_fetch_pages,
+            UffdServing::OnDemand {
+                background_fetch_pages,
+            },
         )?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
@@ -1299,10 +1581,12 @@ impl MemoryManager {
         self.spawn_uffd_handler(
             uffd,
             Some(socket_fd),
-            served_bitmap,
+            served_bitmap.into(),
             source,
             exit_evt,
-            background_fetch_pages,
+            UffdServing::OnDemand {
+                background_fetch_pages,
+            },
         )
     }
 
@@ -1401,15 +1685,32 @@ impl MemoryManager {
         &mut self,
         uffd: Uffd,
         fault_socket_fd: Option<OwnedFd>,
-        served_bitmap: Vec<AtomicBitmap>,
+        served_bitmap: Arc<[AtomicBitmap]>,
         source: Box<dyn UffdMemorySource>,
         exit_evt: &EventFd,
-        background_fetch_pages: bool,
+        serving: UffdServing,
     ) -> Result<(), Error> {
         info!(
             "UFFD: spawning handler for {} region(s)",
             uffd.ranges().len()
         );
+
+        let serve_lock = Arc::new(Mutex::new(()));
+        let (background_fetch_pages, private_zeroes, copy_on_access) = match serving {
+            UffdServing::OnDemand {
+                background_fetch_pages,
+            } => (background_fetch_pages, false, None),
+            UffdServing::CopyOnAccess { source } => (
+                false,
+                true,
+                Some(CopyOnAccessPages {
+                    source,
+                    ranges: uffd.ranges().into(),
+                    served: Arc::clone(&served_bitmap),
+                    serve_lock: Arc::clone(&serve_lock),
+                }),
+            ),
+        };
 
         let stop_event = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFdFail)?;
         let thread_stop_event = stop_event.try_clone().map_err(Error::EventFdFail)?;
@@ -1425,6 +1726,10 @@ impl MemoryManager {
             ranges,
         });
         let thread_uffd_registry = Arc::clone(&uffd_registry);
+        let prefault_failed = Arc::new(AtomicBool::new(false));
+        let thread_prefault_failed = Arc::clone(&prefault_failed);
+        let panic_uffd_registry = Arc::clone(&uffd_registry);
+        let panic_prefault_failed = Arc::clone(&prefault_failed);
         let handle = thread::Builder::new()
             .name("uffd-handler".to_string())
             .spawn(move || {
@@ -1435,8 +1740,11 @@ impl MemoryManager {
                         &thread_exit_evt,
                         source,
                         served_bitmap,
+                        &serve_lock,
                         &ready_tx,
+                        &thread_prefault_failed,
                         background_fetch_pages,
+                        private_zeroes,
                     );
 
                     if result.is_err() && thread_stop_event.read().is_ok() {
@@ -1446,6 +1754,10 @@ impl MemoryManager {
 
                     if let Err(e) = &result {
                         error!("UFFD handler exited with error: {e}");
+                        // A dead handler fills nothing more.
+                        if !thread_uffd_registry.is_done() {
+                            thread_prefault_failed.store(true, Ordering::Release);
+                        }
                         thread_exit_evt.write(1).ok();
                     }
 
@@ -1453,6 +1765,10 @@ impl MemoryManager {
                 }))
                 .map_err(|_| {
                     error!("uffd-handler thread panicked");
+                    // A dead handler fills nothing more.
+                    if !panic_uffd_registry.is_done() {
+                        panic_prefault_failed.store(true, Ordering::Release);
+                    }
                     panic_exit_evt.write(1).ok();
                 })
                 .ok();
@@ -1475,6 +1791,8 @@ impl MemoryManager {
             handle,
             fault_socket_fd,
             uffd_registry,
+            prefault_failed,
+            copy_on_access,
         });
 
         Ok(())
@@ -1497,6 +1815,8 @@ impl MemoryManager {
         features
     }
 
+    /// Stop the UFFD handler, if any, and wait for it to exit, closing the
+    /// userfaultfd and the restore source.
     fn stop_uffd_handler(&mut self) {
         if let Some(uffd_handler) = self.uffd_handler.take() {
             uffd_handler.stop_event.write(1).ok();
@@ -1521,11 +1841,46 @@ impl MemoryManager {
         Some(Arc::clone(&uffd_handler.uffd_registry))
     }
 
-    /// True while an on-demand (UFFD) restore is still faulting in guest RAM.
+    /// True while an on-demand (UFFD) restore has not filled guest RAM and
+    /// its handler still serves faults, failed fill or not, so backends added
+    /// now need the registry. A copy-on-access restore is not counted: its
+    /// snapshot writer saves the pages not faulted in from the restore source.
+    /// vm.info reports [`Self::restore_status`] instead, which turns
+    /// `restoring` false once the fill fails.
     pub fn restoring(&self) -> bool {
         self.uffd_handler
             .as_ref()
-            .is_some_and(|h| !h.uffd_registry.is_done())
+            .is_some_and(|h| h.copy_on_access.is_none() && !h.uffd_registry.is_done())
+    }
+
+    /// `(restoring, restore_failed)` of an on-demand (UFFD) restore, read once.
+    ///
+    /// `restoring` is true while the restore is still faulting in guest RAM.
+    /// A copy-on-access restore never completes and is neither: its snapshot
+    /// writer saves the pages not faulted in from the restore source.
+    /// `restore_failed` is true once the restore can no longer complete: its
+    /// background fill was abandoned after an error, its source failed, or its
+    /// handler exited with an error. Guest RAM is incomplete for good, pages
+    /// not yet faulted in exist only in the restore source, and a failed
+    /// restore is never `restoring`. Callers must use this one result rather
+    /// than reading the two states separately, or a fill that fails in
+    /// between reads as neither.
+    pub fn restore_status(&self) -> (bool, bool) {
+        self.uffd_handler.as_ref().map_or((false, false), |h| {
+            restore_status(
+                h.copy_on_access.is_some(),
+                &h.uffd_registry,
+                &h.prefault_failed,
+            )
+        })
+    }
+
+    /// True when guest RAM was restored copy-on-access: part of it may still
+    /// be only in the snapshot it was restored from, for the VM's lifetime.
+    pub fn copy_on_access(&self) -> bool {
+        self.uffd_handler
+            .as_ref()
+            .is_some_and(|h| h.copy_on_access.is_some())
     }
 
     /// Poison a page that can no longer be restored. Exits if that's not
@@ -1557,15 +1912,23 @@ impl MemoryManager {
     ///
     /// A userfaultfd received with the id of an earlier one replaces it. Once
     /// all pages are present, `uffd_registry.done` is written.
-    #[expect(clippy::needless_pass_by_value)]
+    ///
+    /// With `private_zeroes`, a page faulted again after a discard is
+    /// resolved with a zeroed private copy rather than the zero page every
+    /// process shares. `serve_lock` is held while a fault is resolved and
+    /// its served bit updated.
+    #[expect(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     fn uffd_handler_loop(
         uffd_registry: &UffdRegistry,
         stop_event: &EventFd,
         exit_evt: &EventFd,
         mut source: Box<dyn UffdMemorySource>,
-        served_bitmap: Vec<AtomicBitmap>,
+        served_bitmap: Arc<[AtomicBitmap]>,
+        serve_lock: &Mutex<()>,
         ready_tx: &SyncSender<()>,
+        prefault_failed: &AtomicBool,
         background_fetch_pages: bool,
+        private_zeroes: bool,
     ) -> Result<(), io::Error> {
         let mut uffds = uffd_registry.drain_added_uffds();
         assert!(!uffds.is_empty());
@@ -1750,6 +2113,11 @@ impl MemoryManager {
                     continue;
                 }
 
+                // Held until the page is installed and its served bit says
+                // so, so that the snapshot writer never sees a page whose bit
+                // and content disagree.
+                let _serve_guard = serve_lock.lock().unwrap();
+
                 // A missing fault on a served page is either a discard, or a
                 // fault queued on another userfaultfd while the page was
                 // being resolved. Only the latter leaves the page present.
@@ -1810,15 +2178,24 @@ impl MemoryManager {
 
                 if discarded {
                     let page_addr = range.page_addr(page_idx);
-                    match uffd::zeropage(fault_uffd.fd(), page_addr, range.page_size) {
-                        // hugetlbfs does not support UFFDIO_ZEROPAGE.
-                        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => uffd::copy(
+                    let copy_zeroes = || {
+                        uffd::copy(
                             fault_uffd.fd(),
                             page_addr,
                             zero_buf.as_ptr(),
                             range.page_size,
-                        ),
-                        result => result,
+                        )
+                    };
+                    if private_zeroes {
+                        // UFFDIO_ZEROPAGE would map the zero page every
+                        // process shares: copy, so the page is the VM's own.
+                        copy_zeroes()
+                    } else {
+                        match uffd::zeropage(fault_uffd.fd(), page_addr, range.page_size) {
+                            // hugetlbfs does not support UFFDIO_ZEROPAGE.
+                            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => copy_zeroes(),
+                            result => result,
+                        }
                     }
                     .or_else(|e| {
                         if e.raw_os_error() == Some(libc::EEXIST) {
@@ -1848,6 +2225,10 @@ impl MemoryManager {
                         "UFFD handler: source error at {:#x}, poisoning unrestored guest memory: {e}",
                         range.page_addr(page_idx)
                     );
+                    // The restore can no longer complete, with or without a
+                    // background fill. Set the flag before the exit event so
+                    // anyone woken by it already sees the failure.
+                    prefault_failed.store(true, Ordering::Release);
                     exit_evt.write(1).ok();
                     prefault_active = false;
                     source_failed = true;
@@ -1918,6 +2299,7 @@ impl MemoryManager {
                 Err(e) => {
                     // Give up prefaulting but continue serving demand faults.
                     warn!("UFFD prefault: abandoning background prefault after error: {e}");
+                    prefault_failed.store(true, Ordering::Release);
                     prefault_active = false;
                 }
             }
@@ -2528,6 +2910,9 @@ impl MemoryManager {
 
             let mem_snapshot: MemoryManagerSnapshotData =
                 snapshot.to_state().map_err(Error::Restore)?;
+            // Before anything is mapped or copied for the ranges, whichever
+            // restore mode then runs.
+            check_snapshot_memory_ranges(&mem_snapshot.memory_ranges)?;
 
             let mm = MemoryManager::new(
                 vm,
@@ -2541,9 +2926,15 @@ impl MemoryManager {
             )?;
 
             if !mem_snapshot.memory_ranges.is_empty() {
+                let memory_restore_mode = effective_restore_mode(
+                    memory_restore_mode,
+                    &mm.lock().unwrap().memory_zones,
+                    &mem_snapshot.memory_ranges,
+                );
                 match memory_restore_mode {
                     MemoryRestoreMode::OnDemand
-                    | MemoryRestoreMode::OnDemandNoBackgroundFetchPages => {
+                    | MemoryRestoreMode::OnDemandNoBackgroundFetchPages
+                    | MemoryRestoreMode::CopyOnAccess => {
                         let background_fetch_pages =
                             memory_restore_mode == MemoryRestoreMode::OnDemand;
                         mm.lock().unwrap().restore_by_uffd(
@@ -2551,6 +2942,7 @@ impl MemoryManager {
                             &mem_snapshot.memory_ranges,
                             background_fetch_pages,
                             exit_evt,
+                            memory_restore_mode == MemoryRestoreMode::CopyOnAccess,
                         )?;
                     }
                     MemoryRestoreMode::CopyOnWrite => mm
@@ -3837,41 +4229,30 @@ impl Transportable for MemoryManager {
         // write path which never writes past the growing EOF.
         let sparse_layout = memory_file.set_len(total_len).is_ok();
 
+        let copy_on_access = self
+            .uffd_handler
+            .as_ref()
+            .and_then(|h| h.copy_on_access.as_ref());
         let mut file_cursor: u64 = 0;
 
         for range in self.snapshot_memory_ranges.ranges() {
-            let mut wrote_sparse = false;
-            if sparse_layout
-                && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
-                && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
-                && let Some(file_offset) = region.file_offset()
-            {
-                let region_base = region.start_addr().raw_value();
-                let in_fd_off = file_offset.start()
-                    + range
-                        .gpa
-                        .checked_sub(region_base)
-                        .expect("range outside its region");
-                wrote_sparse = write_region_sparse(
-                    file_offset.file(),
-                    in_fd_off,
-                    &memory_file,
-                    file_cursor,
-                    range.length,
-                )
-                .context("Error writing sparse memory snapshot region")
-                .map_err(MigratableError::MigrateSend)?;
-            }
-
-            if !wrote_sparse {
-                // Dense fallback: anonymous mmap or hugetlbfs (no
-                // SEEK_HOLE).
-                write_guest_range(
+            if let Some(pages) = copy_on_access {
+                save_copy_on_access_range(
                     &guest_memory,
+                    pages,
+                    range,
                     &mut memory_file,
                     file_cursor,
+                    sparse_layout,
+                )?;
+            } else {
+                save_guest_range(
+                    &guest_memory,
                     range.gpa,
                     range.length,
+                    &mut memory_file,
+                    file_cursor,
+                    sparse_layout,
                 )?;
             }
 
@@ -3881,6 +4262,116 @@ impl Transportable for MemoryManager {
         debug_assert_eq!(file_cursor, total_len);
         Ok(())
     }
+}
+
+/// Save `len` bytes of guest memory at `gpa` to `memory_file` at
+/// `file_cursor`, reading a shared file-backed region's backing file and
+/// anything else through the guest mapping.
+fn save_guest_range(
+    guest_memory: &GuestMemory,
+    gpa: u64,
+    len: u64,
+    memory_file: &mut File,
+    file_cursor: u64,
+    sparse_layout: bool,
+) -> result::Result<(), MigratableError> {
+    let mut wrote_sparse = false;
+    if sparse_layout
+        && let Some(region) = guest_memory.find_region(GuestAddress(gpa))
+        && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
+        && let Some(file_offset) = region.file_offset()
+    {
+        let region_base = region.start_addr().raw_value();
+        let in_fd_off = file_offset.start()
+            + gpa
+                .checked_sub(region_base)
+                .expect("range outside its region");
+        wrote_sparse =
+            write_region_sparse(file_offset.file(), in_fd_off, memory_file, file_cursor, len)
+                .context("Error writing sparse memory snapshot region")
+                .map_err(MigratableError::MigrateSend)?;
+    }
+
+    if !wrote_sparse {
+        // Dense fallback: anonymous mmap or hugetlbfs (no
+        // SEEK_HOLE).
+        write_guest_range(guest_memory, memory_file, file_cursor, gpa, len)?;
+    }
+    Ok(())
+}
+
+/// Save `range` of a copy-on-access VM's memory to `memory_file` at
+/// `file_cursor`. A page the guest never accessed is copied from the restore
+/// source, not read through the guest mapping, where reading it would copy
+/// it into the VM. A shared region's backing file only holds the pages that
+/// were served, so it cannot be read on its own either.
+fn save_copy_on_access_range(
+    guest_memory: &GuestMemory,
+    pages: &CopyOnAccessPages,
+    range: &MemoryRange,
+    memory_file: &mut File,
+    file_cursor: u64,
+    sparse_layout: bool,
+) -> result::Result<(), MigratableError> {
+    // The segments are found by host address, so the range must be in one
+    // mapping.
+    guest_memory
+        .find_region(GuestAddress(range.gpa))
+        .filter(|region| range.gpa + range.length <= region.start_addr().raw_value() + region.len())
+        .ok_or_else(|| {
+            MigratableError::MigrateSend(anyhow!(
+                "Memory range {:#x}+{:#x} is not inside one guest memory region",
+                range.gpa,
+                range.length
+            ))
+        })?;
+    let host_addr = guest_memory
+        .get_host_address(GuestAddress(range.gpa))
+        .map_err(|e| MigratableError::MigrateSend(anyhow!(e)))? as u64;
+
+    // A part is copied from the source with `serve_lock` held, so that the
+    // handler cannot install any of it meanwhile. Guest memory is read with
+    // it released: reading a discarded page faults, and the handler needs
+    // the lock to resolve that fault.
+    let page_present = |addr: u64| uffd::page_present(addr).unwrap_or(true);
+    let mut done: u64 = 0;
+    while done < range.length {
+        let serve_guard = pages.serve_lock.lock().unwrap();
+        let segment = pages.next_segment(host_addr + done, range.length - done, &page_present);
+        let segment_end = segment.end();
+        match segment {
+            CopyOnAccessSegment::Source {
+                offset,
+                len,
+                source_offset,
+            } => {
+                let dst_offset = file_cursor + done + offset;
+                if sparse_layout {
+                    copy_region(&pages.source, source_offset, memory_file, dst_offset, len)
+                } else {
+                    copy_region_dense(&pages.source, source_offset, memory_file, dst_offset, len)
+                }
+                .context("Error copying unaccessed memory from the restore source")
+                .map_err(MigratableError::MigrateSend)?;
+                drop(serve_guard);
+            }
+            CopyOnAccessSegment::Guest { offset, len } => {
+                // Served or present. A page discarded since faults back in
+                // as zeroes, which is what a discarded page holds.
+                drop(serve_guard);
+                save_guest_range(
+                    guest_memory,
+                    range.gpa + done + offset,
+                    len,
+                    memory_file,
+                    file_cursor + done + offset,
+                    sparse_layout,
+                )?;
+            }
+        }
+        done += segment_end;
+    }
+    Ok(())
 }
 
 impl Migratable for MemoryManager {
@@ -4012,10 +4503,42 @@ fn write_private_pages(
     Ok(())
 }
 
+// Fails when `file` ends before the saved ranges do. The ranges sit back to
+// back in the file, so they end at the sum of their lengths.
+fn check_snapshot_file_covers_ranges(
+    file: &File,
+    saved_regions: &MemoryRangeTable,
+) -> Result<(), Error> {
+    let ranges_end = saved_regions
+        .ranges()
+        .iter()
+        .try_fold(0u64, |end, r| end.checked_add(r.length))
+        .ok_or_else(|| {
+            Error::SnapshotRead(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "saved memory ranges overflow a file offset",
+            ))
+        })?;
+    let file_len = file.metadata().map_err(Error::SnapshotOpen)?.len();
+    if file_len < ranges_end {
+        return Err(Error::SnapshotRead(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "snapshot memory file is {file_len} bytes, shorter than the saved ranges' {ranges_end}"
+            ),
+        )));
+    }
+    Ok(())
+}
+
 // Reports whether every saved range is page-aligned and lies wholly inside a
 // single plain private-anonymous guest region — the MAP_FIXED overlay
-// preconditions. File-backed regions are rejected: their stale mapping
-// metadata would misdirect a later snapshot or fd consumer.
+// preconditions — and no two overlap. File-backed regions are rejected:
+// their stale mapping metadata would misdirect a later snapshot or fd
+// consumer. Overlapping ranges, which only a malformed snapshot has, are
+// rejected because every range is mapped before any hole is remapped, so a
+// hole of one range remapped anonymous would read zero over the data
+// another range mapped there.
 fn is_restore_cow_compatible(guest_memory: &GuestMemory, saved_regions: &MemoryRangeTable) -> bool {
     let page_size = get_page_size();
     let mut file_offset: u64 = 0;
@@ -4042,7 +4565,102 @@ fn is_restore_cow_compatible(guest_memory: &GuestMemory, saved_regions: &MemoryR
         };
         file_offset = next;
     }
-    true
+    !saved_ranges_overlap_each_other(saved_regions)
+}
+
+// The most memory ranges a snapshot may list. A snapshot lists one range per
+// guest RAM region, a handful per memory zone, plus one per run of plugged
+// virtio-mem blocks (`memory_range_table` with `SkipPersisted`, adjacent
+// plugged blocks merged into one range). Blocks are 2 MiB, so the most
+// ranges a guest can produce is one per 4 MiB of virtio-mem space, with every
+// other block plugged: 2^22 ranges is 16 TiB of such space, far beyond any
+// guest we run, and the table is then 64 MiB (16 bytes a range).
+const MAX_SNAPSHOT_MEMORY_RANGES: usize = 1 << 22;
+
+fn invalid_saved_ranges(msg: &str) -> Error {
+    Error::SnapshotRead(io::Error::new(io::ErrorKind::InvalidData, msg.to_string()))
+}
+
+// Fails when a snapshot lists more memory ranges than any guest produces, or
+// ranges whose guest addresses or back-to-back file offsets do not fit.
+fn check_snapshot_memory_ranges(saved_regions: &MemoryRangeTable) -> Result<(), Error> {
+    let count = saved_regions.ranges().len();
+    if count > MAX_SNAPSHOT_MEMORY_RANGES {
+        return Err(invalid_saved_ranges(&format!(
+            "snapshot lists {count} memory ranges, more than the {MAX_SNAPSHOT_MEMORY_RANGES} a restore accepts"
+        )));
+    }
+    let mut file_end: u64 = 0;
+    for range in saved_regions.ranges() {
+        if range.gpa.checked_add(range.length).is_none() {
+            return Err(invalid_saved_ranges(
+                "a saved memory range overflows guest memory",
+            ));
+        }
+        // Offsets are passed to lseek and mmap as off_t.
+        file_end = file_end
+            .checked_add(range.length)
+            .filter(|&end| i64::try_from(end).is_ok())
+            .ok_or_else(|| invalid_saved_ranges("saved memory ranges overflow a file offset"))?;
+    }
+    Ok(())
+}
+
+// Whether two saved ranges share a guest address. Empty ranges share none.
+fn saved_ranges_overlap_each_other(saved_regions: &MemoryRangeTable) -> bool {
+    let mut spans: Vec<(u64, u64)> = saved_regions
+        .ranges()
+        .iter()
+        .filter(|r| r.length > 0)
+        .map(|r| (r.gpa, r.gpa.saturating_add(r.length)))
+        .collect();
+    spans.sort_unstable();
+    spans.windows(2).any(|w| w[1].0 < w[0].1)
+}
+
+// Whether any saved range lies in a zone's virtio-mem region. A requested
+// size of 0 does not prove the guest finished unplugging, and a private file
+// map under a virtio-mem block would make unplug's MADV_DONTNEED revert to
+// snapshot content instead of zeroing it.
+fn saved_ranges_in_virtio_mem(
+    memory_zones: &MemoryZones,
+    saved_regions: &MemoryRangeTable,
+) -> bool {
+    let windows: Vec<(u64, u64)> = memory_zones
+        .values()
+        .filter_map(|z| z.virtio_mem_zone.as_ref())
+        .map(|v| (v.region.start_addr().raw_value(), v.region.len()))
+        .collect();
+    saved_ranges_overlap(saved_regions, &windows)
+}
+
+// The mode a restore in `mode` uses. Copy-on-access falls back to the eager
+// copy when a saved range lies in a virtio-mem region, for the reason
+// copy-on-write does: a block discarded before it is touched again would
+// read back the snapshot's content instead of zeroes, as the handler does
+// not see a discard of a page that is not in memory.
+fn effective_restore_mode(
+    mode: MemoryRestoreMode,
+    memory_zones: &MemoryZones,
+    saved_regions: &MemoryRangeTable,
+) -> MemoryRestoreMode {
+    if mode == MemoryRestoreMode::CopyOnAccess
+        && saved_ranges_in_virtio_mem(memory_zones, saved_regions)
+    {
+        info!("Restore (mode=copyonaccess): plugged virtio-mem blocks, falling back to copy");
+        return MemoryRestoreMode::Copy;
+    }
+    mode
+}
+
+// Whether any saved range overlaps one of the `(start, len)` GPA windows.
+fn saved_ranges_overlap(saved_regions: &MemoryRangeTable, windows: &[(u64, u64)]) -> bool {
+    saved_regions.ranges().iter().any(|r| {
+        let end = r.gpa.saturating_add(r.length);
+        windows
+            .iter()
+            .any(|&(start, len)| r.gpa < start.saturating_add(len) && start < end)
+    })
 }
 
 // Maps each saved range over its guest RAM window, re-applying the owning
@@ -4054,7 +4672,27 @@ fn do_mmap_cow_saved_regions(
     saved_regions: &MemoryRangeTable,
     thp: bool,
 ) -> Result<(), Error> {
+    do_mmap_cow_saved_regions_with(
+        guest_memory,
+        memory_file,
+        saved_regions,
+        thp,
+        HoleRemapLimits::default(),
+    )
+    .map(|_| ())
+}
+
+// As `do_mmap_cow_saved_regions`, with the hole remap limits given. Returns
+// the hole remap report of each saved range.
+fn do_mmap_cow_saved_regions_with(
+    guest_memory: &GuestMemory,
+    memory_file: &File,
+    saved_regions: &MemoryRangeTable,
+    thp: bool,
+    limits: HoleRemapLimits,
+) -> Result<Vec<HoleRemapReport>, Error> {
     let mut file_offset: u64 = 0;
+    let mut mappings = Vec::with_capacity(saved_regions.ranges().len());
     for range in saved_regions.ranges() {
         // Zones map with their own reserve setting, so take MAP_NORESERVE
         // from the region actually backing this range rather than from the
@@ -4085,9 +4723,36 @@ fn do_mmap_cow_saved_regions(
         if ret == libc::MAP_FAILED {
             return Err(Error::SnapshotMmap(io::Error::last_os_error()));
         }
+        mappings.push(CowMapping {
+            host: ret.cast(),
+            len: length,
+            file_offset,
+            map_flags: reserve_flag,
+        });
+        file_offset = file_offset.checked_add(range.length).ok_or_else(|| {
+            Error::SnapshotMmap(io::Error::other("snapshot range file offset overflow"))
+        })?;
+    }
+
+    // Before the THP advice below, so it covers the anonymous ranges too.
+    // The holes of every range compete for one budget.
+    let reports = remap_cow_holes(&mappings, memory_file, limits, |addr, len, flags| {
+        // SAFETY: remap_cow_holes passes ranges inside the mappings just
+        // installed above, which nothing uses yet.
+        unsafe { map_anon_fixed(addr, len, flags) }
+    })?;
+
+    let mut summary = HoleRemapReport::default();
+    for ((range, mapping), report) in saved_regions.ranges().iter().zip(&mappings).zip(&reports) {
+        debug!(
+            "Restore (mode=copyonwrite): range at gpa 0x{:x} (size = 0x{:x}): {}",
+            range.gpa, range.length, report,
+        );
+        summary.add(report);
         if thp {
-            // SAFETY: ret/length name the private mapping just installed above.
-            let adv = unsafe { libc::madvise(ret, length, libc::MADV_HUGEPAGE) };
+            // SAFETY: host/len name the private mapping installed above.
+            let adv =
+                unsafe { libc::madvise(mapping.host.cast(), mapping.len, libc::MADV_HUGEPAGE) };
             if adv != 0 {
                 warn!(
                     "Restore (mode=copyonwrite): MADV_HUGEPAGE failed: {}",
@@ -4095,11 +4760,392 @@ fn do_mmap_cow_saved_regions(
                 );
             }
         }
-        file_offset = file_offset.checked_add(range.length).ok_or_else(|| {
-            Error::SnapshotMmap(io::Error::other("snapshot range file offset overflow"))
-        })?;
+    }
+    info!(
+        "Restore (mode=copyonwrite): snapshot file holes: ranges={} {}",
+        saved_regions.ranges().len(),
+        summary,
+    );
+    Ok(reports)
+}
+
+// Holes in the snapshot file shorter than this stay mapped from the file.
+// Each remapped hole costs VMAs (below), and one under 64 KiB would hold
+// little page cache. 64 KiB is a multiple of every page size Linux uses (4,
+// 16 and 64 KiB), and holes are page-aligned before this applies. A hole
+// under 2 MiB cannot hold a transparent huge page, but neither could that
+// part of the file mapping, whose private copies are never collapsed.
+const COW_HOLE_REMAP_MIN_SIZE: u64 = 64 << 10;
+// Most holes remapped in one restore: the holes of all its saved ranges
+// compete, and when there are more the largest win. Each remapped hole
+// splits the file mapping around it into two more VMAs, so the remap adds at
+// most 2 * 8192 VMAs, about a quarter of the default vm.max_map_count
+// (65530), which the assertion below holds it to. Each saved range's own file
+// mapping can add two more by splitting the guest region around it; nothing
+// here bounds the number of ranges, which comes from the snapshot, but those
+// VMAs exist with or without the remap. A golden image's memory file has a
+// few thousand data extents, so about as many holes, which this covers twice
+// over.
+const COW_HOLE_REMAP_MAX_HOLES: usize = 8192;
+const _: () = assert!(2 * COW_HOLE_REMAP_MAX_HOLES < 65530 / 3);
+
+#[derive(Clone, Copy, Debug)]
+struct HoleRemapLimits {
+    min_size: u64,
+    max_holes: usize,
+}
+
+impl Default for HoleRemapLimits {
+    fn default() -> Self {
+        HoleRemapLimits {
+            min_size: COW_HOLE_REMAP_MIN_SIZE,
+            max_holes: COW_HOLE_REMAP_MAX_HOLES,
+        }
+    }
+}
+
+// One saved range's private file mapping: `len` bytes at `host` of the
+// snapshot file from `file_offset`, mapped with `map_flags` besides
+// MAP_PRIVATE.
+#[derive(Clone, Copy, Debug)]
+struct CowMapping {
+    host: *mut u8,
+    len: usize,
+    file_offset: u64,
+    map_flags: libc::c_int,
+}
+
+// A hole of the snapshot file in the mapping `range`, at absolute file
+// offset `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CowHole {
+    range: usize,
+    off: u64,
+    len: u64,
+}
+
+// Every hole found is either remapped or counted under one of the skips:
+// found == holes + skipped_small + skipped_cap + skipped_failed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HoleRemapReport {
+    // Data extents seen in the window.
+    extents: usize,
+    // Page-aligned holes found, whatever their size.
+    found: usize,
+    // Holes kept mapped from the file as shorter than the minimum size, as
+    // over the hole budget, and as not tried or failed after an mmap failed.
+    skipped_small: usize,
+    skipped_cap: usize,
+    skipped_failed: usize,
+    // Holes, and bytes, now mapped anonymous.
+    holes: usize,
+    bytes: u64,
+    // Why some or all holes kept the file mapping, if they did.
+    fallback: Option<&'static str>,
+}
+
+impl HoleRemapReport {
+    // Adds `other`'s counts to these; the first fallback seen is kept.
+    fn add(&mut self, other: &HoleRemapReport) {
+        self.extents += other.extents;
+        self.found += other.found;
+        self.skipped_small += other.skipped_small;
+        self.skipped_cap += other.skipped_cap;
+        self.skipped_failed += other.skipped_failed;
+        self.holes += other.holes;
+        self.bytes += other.bytes;
+        self.fallback = self.fallback.or(other.fallback);
+    }
+}
+
+impl fmt::Display for HoleRemapReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "extents={} holes_found={} holes_remapped={} bytes_remapped={} \
+             skipped_small={} skipped_cap={} skipped_failed={} fallback={}",
+            self.extents,
+            self.found,
+            self.holes,
+            self.bytes,
+            self.skipped_small,
+            self.skipped_cap,
+            self.skipped_failed,
+            self.fallback.unwrap_or("none"),
+        )
+    }
+}
+
+// Calls `on_hole(offset, len)` for each page-aligned hole in `[start, start
+// + len)` of `file`, at absolute file offsets in file order, and returns the
+// number of data extents seen. Anything past EOF is a hole. Errors if
+// SEEK_HOLE is unsupported or the walk fails, possibly after some calls.
+fn cow_file_holes(
+    file: &File,
+    start: u64,
+    len: u64,
+    page_size: u64,
+    mut on_hole: impl FnMut(u64, u64),
+) -> io::Result<usize> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "range overflow"))?;
+    let mut extents = 0;
+    let mut push_hole = |lo: u64, hi: u64| {
+        let lo = lo.next_multiple_of(page_size);
+        let hi = hi - hi % page_size;
+        if hi > lo {
+            on_hole(lo, hi - lo);
+        }
+    };
+    let mut cursor = start;
+    while let Some((data_off, data_len)) = next_data_extent(file.as_fd(), cursor, end)? {
+        extents += 1;
+        push_hole(cursor, data_off);
+        cursor = data_off + data_len;
+    }
+    push_hole(cursor, end);
+    Ok(extents)
+}
+
+// The holes chosen for remapping, at most `max_holes` of them, kept as the
+// holes are walked so that memory stays bounded however many there are: the
+// largest, the earlier (by range, then offset) of equal sizes.
+struct HoleChooser {
+    max_holes: usize,
+    // A min-heap on preference: the least preferred hole is on top.
+    heap: BinaryHeap<Reverse<HolePreference>>,
+}
+
+// Orders holes by preference: the larger first, then the earlier range, then
+// the earlier offset.
+type HolePreference = (u64, Reverse<usize>, Reverse<u64>);
+
+impl HoleChooser {
+    fn new(max_holes: usize) -> Self {
+        HoleChooser {
+            max_holes,
+            heap: BinaryHeap::new(),
+        }
+    }
+
+    // Offers `hole`; returns the hole dropped over the cap, `hole` itself or
+    // one kept before, if any.
+    fn offer(&mut self, hole: CowHole) -> Option<CowHole> {
+        self.heap
+            .push(Reverse((hole.len, Reverse(hole.range), Reverse(hole.off))));
+        if self.heap.len() <= self.max_holes {
+            return None;
+        }
+        let Reverse((len, Reverse(range), Reverse(off))) = self.heap.pop()?;
+        Some(CowHole { range, off, len })
+    }
+
+    // Offers every hole `other` kept; calls `on_dropped` with each hole
+    // dropped over the cap, from either chooser.
+    fn merge(&mut self, other: HoleChooser, mut on_dropped: impl FnMut(CowHole)) {
+        for Reverse((len, Reverse(range), Reverse(off))) in other.heap {
+            if let Some(dropped) = self.offer(CowHole { range, off, len }) {
+                on_dropped(dropped);
+            }
+        }
+    }
+
+    // The holes chosen, by range then offset.
+    fn into_chosen(self) -> Vec<CowHole> {
+        let mut chosen: Vec<_> = self
+            .heap
+            .into_iter()
+            .map(|Reverse((len, Reverse(range), Reverse(off)))| CowHole { range, off, len })
+            .collect();
+        chosen.sort_unstable_by_key(|h| (h.range, h.off));
+        chosen
+    }
+}
+
+// Offers `chooser` the holes of mapping `range` that `walk` passes to its
+// callback, counting them in `reports`. They compete among themselves while
+// the walk runs, and with the holes of other ranges only once it has
+// succeeded, so a failed walk leaves `chooser` as it was; the range then
+// keeps its whole file mapping.
+fn offer_range_holes(
+    chooser: &mut HoleChooser,
+    reports: &mut [HoleRemapReport],
+    range: usize,
+    limits: HoleRemapLimits,
+    walk: impl FnOnce(&mut dyn FnMut(u64, u64)) -> io::Result<usize>,
+) {
+    let mut walked = HoleChooser::new(limits.max_holes);
+    let report = &mut reports[range];
+    let walk = walk(&mut |off, len| {
+        report.found += 1;
+        if len < limits.min_size {
+            report.skipped_small += 1;
+        } else if walked.offer(CowHole { range, off, len }).is_some() {
+            report.skipped_cap += 1;
+        }
+    });
+    match walk {
+        Ok(extents) => {
+            reports[range].extents = extents;
+            chooser.merge(walked, |dropped| reports[dropped.range].skipped_cap += 1);
+        }
+        Err(e) => {
+            debug!("Restore (mode=copyonwrite): cannot walk snapshot file holes: {e}");
+            reports[range] = HoleRemapReport {
+                fallback: Some("seek_hole_unsupported"),
+                ..Default::default()
+            };
+        }
+    }
+}
+
+// Maps `len` bytes at `addr` private anonymous, with `map_flags` besides.
+//
+// # Safety
+//
+// `addr..addr + len` must lie in a mapping the caller owns and nothing uses:
+// MAP_FIXED replaces whatever is there.
+unsafe fn map_anon_fixed(addr: *mut u8, len: usize, map_flags: libc::c_int) -> io::Result<()> {
+    // SAFETY: the caller vouches for the range; an anonymous mapping takes
+    // no fd.
+    let ret = unsafe {
+        libc::mmap(
+            addr.cast(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | map_flags,
+            -1,
+            0,
+        )
+    };
+    if ret == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+// Replaces the holes of the private file mappings of `file` in `mappings`
+// with private anonymous memory, through `map_anon` (`map_anon_fixed` but in
+// tests). Both read as zeroes and keep guest writes private, but a guest
+// touching a hole through the file mapping first faults a zero page into the
+// file's page cache and then copies it, so a mostly-empty guest fills the
+// host page cache with zeroes. The holes of all mappings compete for
+// `limits`. Keeps a mapping whole when SEEK_HOLE is unsupported, and keeps
+// the holes `limits` leaves out mapped from the file, as well as every hole
+// left once one remap has failed. The mappings must be page-aligned and not
+// yet used by anything. Returns the report of each mapping.
+fn remap_cow_holes(
+    mappings: &[CowMapping],
+    file: &File,
+    limits: HoleRemapLimits,
+    map_anon: impl FnMut(*mut u8, usize, libc::c_int) -> io::Result<()>,
+) -> Result<Vec<HoleRemapReport>, Error> {
+    remap_cow_holes_with(mappings, file, limits, map_anon, |addr, len, flags, off| {
+        // SAFETY: remap_cow_holes_with passes a hole of a mapping the caller
+        // vouches for, without MAP_FIXED; the fd stays valid for the call.
+        let ret = unsafe {
+            libc::mmap(
+                addr.cast(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags,
+                file.as_raw_fd(),
+                off,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ret.cast())
+    })
+}
+
+// `remap_cow_holes`, mapping the file back after a failed remap through
+// `map_file` (mmap(2) of the file with the given flags and offset, but in
+// tests).
+fn remap_cow_holes_with(
+    mappings: &[CowMapping],
+    file: &File,
+    limits: HoleRemapLimits,
+    mut map_anon: impl FnMut(*mut u8, usize, libc::c_int) -> io::Result<()>,
+    mut map_file: impl FnMut(*mut u8, usize, libc::c_int, libc::off_t) -> io::Result<*mut u8>,
+) -> Result<Vec<HoleRemapReport>, Error> {
+    let page_size = get_page_size();
+    let mut reports: Vec<HoleRemapReport> = mappings
+        .iter()
+        .map(|_| HoleRemapReport::default())
+        .collect();
+    // Holes too small to remap are only counted, so a sparse save with
+    // millions of one-page holes costs no memory for them.
+    let mut chooser = HoleChooser::new(limits.max_holes);
+    for (range, m) in mappings.iter().enumerate() {
+        if !m.file_offset.is_multiple_of(page_size) || !(m.host as u64).is_multiple_of(page_size) {
+            reports[range].fallback = Some("unaligned");
+            continue;
+        }
+        offer_range_holes(&mut chooser, &mut reports, range, limits, |on_hole| {
+            cow_file_holes(file, m.file_offset, m.len as u64, page_size, on_hole)
+        });
+    }
+
+    let mut failed = false;
+    for hole in chooser.into_chosen() {
+        let report = &mut reports[hole.range];
+        if failed {
+            report.skipped_failed += 1;
+            report.fallback.get_or_insert("mmap_failed");
+            continue;
+        }
+        let m = &mappings[hole.range];
+        // SAFETY: the hole lies within [file_offset, file_offset +
+        // len) of its mapping, so addr..addr + hole.len lies within
+        // the mapping at m.host.
+        let addr = unsafe { m.host.add((hole.off - m.file_offset) as usize) };
+        let Err(e) = map_anon(addr, hole.len as usize, m.map_flags) else {
+            report.holes += 1;
+            report.bytes += hole.len;
+            continue;
+        };
+        // A failed MAP_FIXED normally leaves the file mapping as it was
+        // (an older kernel may instead have unmapped the whole range), so
+        // map the file back only where nothing is mapped. EEXIST only says
+        // some page of the range is still mapped; it is read as "the file
+        // mapping survived" on the assumption that a failed MAP_FIXED
+        // never leaves the range partly unmapped (it either unmapped
+        // nothing, as at vm.max_map_count, or the whole range). MAP_FIXED
+        // would fail here as the remap did when that ran out of VMAs
+        // (ENOMEM at vm.max_map_count), since replacing part of the mapping
+        // needs the same splits.
+        match map_file(
+            addr,
+            hole.len as usize,
+            libc::MAP_PRIVATE | libc::MAP_FIXED_NOREPLACE | m.map_flags,
+            hole.off as libc::off_t,
+        ) {
+            Ok(ret) if ret != addr => {
+                // A kernel before 4.17 takes MAP_FIXED_NOREPLACE as a hint
+                // and maps elsewhere, which tells nothing about whether the
+                // range is still mapped: drop the stray copy and fail the
+                // restore rather than risk leaving the hole unmapped.
+                // SAFETY: ret..ret + len is the mapping just made, which
+                // nothing else knows of.
+                unsafe { libc::munmap(ret.cast(), hole.len as usize) };
+                return Err(Error::SnapshotMmap(io::Error::other(format!(
+                    "remapping a snapshot file hole failed ({e}) and the kernel \
+                     ignored MAP_FIXED_NOREPLACE when mapping the file back"
+                ))));
+            }
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(e) => return Err(Error::SnapshotMmap(e)),
+        }
+        warn!("Restore (mode=copyonwrite): remapping a snapshot file hole failed: {e}");
+        report.skipped_failed += 1;
+        report.fallback = Some("mmap_failed");
+        failed = true;
+    }
+    Ok(reports)
 }
 
 #[cfg(test)]
@@ -4139,6 +5185,8 @@ mod tests {
         assert_eq!(base_clear_of_reserved(&regions, 8 * GIB, 8 * GIB), 8 * GIB);
     }
 
+    use std::env;
+    use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::FileExt;
 
@@ -4396,6 +5444,414 @@ mod tests {
     }
 
     #[test]
+    fn cow_restore_detects_saved_ranges_in_virtio_mem_windows() {
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 0x1000_0000,
+        });
+        // Boot RAM only: a virtio-mem window above it does not overlap.
+        let windows = [(0x1_0000_0000u64, 0x4_0000_0000u64)];
+        assert!(!saved_ranges_overlap(&table, &windows));
+        assert!(!saved_ranges_overlap(&table, &[]));
+        // A touching-but-disjoint window does not overlap.
+        assert!(!saved_ranges_overlap(&table, &[(0x1000_0000, 0x1000)]));
+        // A plugged block inside the window does.
+        table.push(MemoryRange {
+            gpa: 0x1_0020_0000,
+            length: 0x20_0000,
+        });
+        assert!(saved_ranges_overlap(&table, &windows));
+    }
+
+    #[test]
+    fn cow_restore_overlap_edge_cases() {
+        let one = |gpa: u64, length: u64| {
+            let mut table = MemoryRangeTable::default();
+            table.push(MemoryRange { gpa, length });
+            table
+        };
+        let (start, len) = (0x1_0000_0000u64, 0x4000_0000u64);
+        let window = [(start, len)];
+        // Starts below the window and ends inside it.
+        assert!(saved_ranges_overlap(&one(start - 0x1000, 0x2000), &window));
+        // Ends exactly at the window's start.
+        assert!(!saved_ranges_overlap(&one(start - 0x1000, 0x1000), &window));
+        // Starts exactly at the window's end.
+        assert!(!saved_ranges_overlap(&one(start + len, 0x1000), &window));
+        // Last byte of the window, and first byte past it.
+        assert!(saved_ranges_overlap(
+            &one(start + len - 0x1000, 0x2000),
+            &window
+        ));
+        // A window entirely inside a larger range.
+        assert!(saved_ranges_overlap(&one(0, start + len + 0x1000), &window));
+        // Several windows: a range between them overlaps neither, a range in
+        // the second one is found.
+        let windows = [(start, len), (0x2_0000_0000, len)];
+        assert!(!saved_ranges_overlap(&one(start + len, 0x1000), &windows));
+        assert!(saved_ranges_overlap(&one(0x2_0010_0000, 0x1000), &windows));
+        // Several ranges, only the last of which overlaps.
+        let mut table = one(0, 0x1000);
+        table.push(MemoryRange {
+            gpa: 0x1_8000_0000,
+            length: 0x1000,
+        });
+        assert!(!saved_ranges_overlap(&table, &windows));
+        table.push(MemoryRange {
+            gpa: 0x2_3fff_f000,
+            length: 0x1000,
+        });
+        assert!(saved_ranges_overlap(&table, &windows));
+    }
+
+    // Boot RAM plus a virtio-mem region, laid out the way a restore lays
+    // them out: boot RAM in the zone's regions, the virtio-mem region in its
+    // virtio_mem_zone, nothing plugged. Built by hand because
+    // restore_memory_regions_and_zones() needs a hypervisor VM.
+    fn restore_zone_with_virtio_mem() -> (GuestMemory, MemoryZones) {
+        const MIB: u64 = 1 << 20;
+        let region = |gpa: u64, size: u64| {
+            Arc::new(GuestRegion::from(
+                vm_memory::GuestRegionMmap::<AtomicBitmap>::from_range(
+                    GuestAddress(gpa),
+                    size as usize,
+                    None,
+                )
+                .unwrap(),
+            ))
+        };
+        let boot = region(0, 4 * MIB);
+        let vmem = region(16 * MIB, 8 * MIB);
+        let mut zone = MemoryZone::new(false, false, get_page_size(), false);
+        zone.regions.push(Arc::clone(&boot));
+        zone.virtio_mem_zone = Some(VirtioMemZone {
+            region: Arc::clone(&vmem),
+            virtio_device: None,
+            hotplugged_size: 0,
+            hugepages: false,
+            blocks_state: Arc::new(Mutex::new(BlocksState::new(vmem.len()))),
+        });
+        let mut zones = MemoryZones::new();
+        zones.insert("mem0".to_string(), zone);
+        (
+            GuestMemory::from_arc_regions(vec![boot, vmem]).unwrap(),
+            zones,
+        )
+    }
+
+    #[test]
+    fn cow_restore_falls_back_for_saved_ranges_in_virtio_mem_zone() {
+        const MIB: u64 = 1 << 20;
+        let (_gm, zones) = restore_zone_with_virtio_mem();
+        let vmem = zones["mem0"].virtio_mem_zone.as_ref().unwrap();
+        assert_eq!(vmem.region.start_addr(), GuestAddress(16 * MIB));
+        // Nothing plugged: the saved ranges are boot RAM only, so CoW applies.
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        assert!(vmem.plugged_ranges().ranges().is_empty());
+        assert!(!saved_ranges_in_virtio_mem(&zones, &table));
+        assert!(!saved_ranges_in_virtio_mem(&MemoryZones::new(), &table));
+        // A block still plugged at snapshot time is saved: fall back to copy.
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        assert!(saved_ranges_in_virtio_mem(&zones, &table));
+    }
+
+    #[test]
+    fn copy_on_access_falls_back_for_saved_ranges_in_virtio_mem_zone() {
+        const MIB: u64 = 1 << 20;
+        let (_gm, zones) = restore_zone_with_virtio_mem();
+        // Nothing plugged: copy-on-access applies.
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        assert_eq!(
+            effective_restore_mode(MemoryRestoreMode::CopyOnAccess, &zones, &table),
+            MemoryRestoreMode::CopyOnAccess
+        );
+        // A block still plugged at snapshot time: fall back to copy. The
+        // other modes are left alone.
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        assert_eq!(
+            effective_restore_mode(MemoryRestoreMode::CopyOnAccess, &zones, &table),
+            MemoryRestoreMode::Copy
+        );
+        for mode in [
+            MemoryRestoreMode::Copy,
+            MemoryRestoreMode::OnDemand,
+            MemoryRestoreMode::CopyOnWrite,
+        ] {
+            assert_eq!(effective_restore_mode(mode, &zones, &table), mode);
+        }
+    }
+
+    // A snapshot memory file holding `chunks` of (byte, length) in order.
+    fn snapshot_file(chunks: &[(u8, u64)]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for &(byte, len) in chunks {
+            file.write_all(&vec![byte; len as usize]).unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn uffd_restore_refuses_snapshot_file_shorter_than_ranges() {
+        const MIB: u64 = 1 << 20;
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        // As long as the ranges, or longer: accepted.
+        for len in [6 * MIB, 6 * MIB + 4096] {
+            let file = snapshot_file(&[(0xab, len)]);
+            check_snapshot_file_covers_ranges(file.as_file(), &table).unwrap();
+        }
+        // One page short of the second range's end: refused.
+        let file = snapshot_file(&[(0xab, 6 * MIB - 4096)]);
+        match check_snapshot_file_covers_ranges(file.as_file(), &table) {
+            Err(Error::SnapshotRead(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            other => panic!("short file accepted: {other:?}"),
+        }
+        // Range lengths that overflow a file offset: refused, not wrapped.
+        table.push(MemoryRange {
+            gpa: 32 * MIB,
+            length: u64::MAX,
+        });
+        let file = snapshot_file(&[(0xab, 6 * MIB)]);
+        match check_snapshot_file_covers_ranges(file.as_file(), &table) {
+            Err(Error::SnapshotRead(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("overflowing ranges accepted: {other:?}"),
+        }
+    }
+
+    // Whether the host mapping containing `gpa` is backed by a file, from the
+    // inode column of /proc/self/maps.
+    fn gpa_is_file_backed(gm: &GuestMemory, gpa: u64) -> bool {
+        let host = gm.get_host_address(GuestAddress(gpa)).unwrap() as usize;
+        let maps = fs::read_to_string("/proc/self/maps").unwrap();
+        maps.lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (lo, hi) = fields.next()?.split_once('-')?;
+                let lo = usize::from_str_radix(lo, 16).ok()?;
+                let hi = usize::from_str_radix(hi, 16).ok()?;
+                // Skip perms, offset and dev to reach the inode.
+                (lo..hi).contains(&host).then(|| fields.nth(3) != Some("0"))
+            })
+            .expect("guest address not found in /proc/self/maps")
+    }
+
+    // What virtio-mem does to an unplugged block.
+    fn discard(gm: &GuestMemory, gpa: u64, len: u64) {
+        let host = gm.get_host_address(GuestAddress(gpa)).unwrap();
+        // SAFETY: host/len name guest RAM inside a single region of gm.
+        let ret = unsafe { libc::madvise(host.cast(), len as usize, libc::MADV_DONTNEED) };
+        assert_eq!(ret, 0);
+    }
+
+    #[test]
+    fn cow_restore_copies_saved_ranges_in_virtio_mem() {
+        const MIB: u64 = 1 << 20;
+        let (gm, zones) = restore_zone_with_virtio_mem();
+        // Boot RAM, then a block that was still plugged at snapshot time.
+        let file = snapshot_file(&[(0xab, 4 * MIB), (0xcd, 2 * MIB)]);
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        // The region checks accept the block: only the virtio-mem check
+        // keeps it from being mapped from the file.
+        assert!(is_restore_cow_compatible(&gm, &table));
+        MemoryManager::cow_map_saved_regions(&gm, &zones, false, file.path().to_path_buf(), &table)
+            .unwrap();
+        // The eager copy ran: nothing is file-backed and the data is in place.
+        assert!(!gpa_is_file_backed(&gm, 0));
+        assert!(!gpa_is_file_backed(&gm, 18 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(4 * MIB - 1)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(18 * MIB)).unwrap(), 0xcd);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(20 * MIB - 1)).unwrap(), 0xcd);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(16 * MIB)).unwrap(), 0);
+    }
+
+    #[test]
+    fn cow_restore_keeps_unplugged_virtio_mem_anonymous() {
+        const MIB: u64 = 1 << 20;
+        let block = 18 * MIB;
+
+        // Nothing plugged: boot RAM is mapped from the file, and a block the
+        // guest plugs, writes and unplugs after the restore reads as zero.
+        let (gm, zones) = restore_zone_with_virtio_mem();
+        let file = snapshot_file(&[(0xab, 4 * MIB)]);
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        MemoryManager::cow_map_saved_regions(&gm, &zones, false, file.path().to_path_buf(), &table)
+            .unwrap();
+        assert!(gpa_is_file_backed(&gm, 0));
+        assert!(!gpa_is_file_backed(&gm, block));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+        gm.write_obj::<u8>(0x5a, GuestAddress(block)).unwrap();
+        discard(&gm, block, 2 * MIB);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(block)).unwrap(), 0);
+
+        // A block still plugged at snapshot time: restored with its content,
+        // and once the guest unplugs it, it reads as zero rather than as the
+        // snapshot's copy.
+        let (gm, zones) = restore_zone_with_virtio_mem();
+        let file = snapshot_file(&[(0xab, 4 * MIB), (0xcd, 2 * MIB)]);
+        table.push(MemoryRange {
+            gpa: block,
+            length: 2 * MIB,
+        });
+        MemoryManager::cow_map_saved_regions(&gm, &zones, false, file.path().to_path_buf(), &table)
+            .unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(block)).unwrap(), 0xcd);
+        gm.write_obj::<u8>(0x5a, GuestAddress(block)).unwrap();
+        discard(&gm, block, 2 * MIB);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(block)).unwrap(), 0);
+    }
+
+    // Why plugged virtio-mem blocks must not be CoW-mapped: unplug discards
+    // with MADV_DONTNEED, which on a private file map drops the private copy
+    // and re-exposes the snapshot page instead of zeroing it.
+    #[test]
+    fn cow_restore_dontneed_reverts_to_file_content() {
+        let page = get_page_size();
+        let gm = GuestMemory::from_ranges(&[(GuestAddress(0), page as usize)]).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0xabu8; page as usize]).unwrap();
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: page,
+        });
+        do_mmap_cow_saved_regions(&gm, &file, &table, false).unwrap();
+        gm.write_obj::<u8>(0x5a, GuestAddress(0)).unwrap();
+        let host = gm.get_host_address(GuestAddress(0)).unwrap();
+        // SAFETY: host/page name the private mapping installed above.
+        let ret = unsafe { libc::madvise(host.cast(), page as usize, libc::MADV_DONTNEED) };
+        assert_eq!(ret, 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+    }
+
+    fn assert_invalid_ranges(res: Result<(), Error>, what: &str) {
+        match res {
+            Err(Error::SnapshotRead(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("{what} accepted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_refuses_overflowing_saved_ranges() {
+        const MIB: u64 = 1 << 20;
+        let range = |gpa, length| MemoryRange { gpa, length };
+        let table = |ranges: &[MemoryRange]| {
+            let mut t = MemoryRangeTable::default();
+            for r in ranges {
+                t.push(*r);
+            }
+            t
+        };
+
+        // File offsets that wrap, that pass off_t, and a guest end that wraps.
+        let wrapping_offset = table(&[range(0, 4 * MIB), range(32 * MIB, u64::MAX)]);
+        let past_off_t = table(&[range(0, 1 << 62), range(1 << 62, 1 << 62)]);
+        let wrapping_gpa = table(&[range(u64::MAX - MIB, 2 * MIB)]);
+        for (t, what) in [
+            (&wrapping_offset, "wrapping file offset"),
+            (&past_off_t, "file offset past off_t"),
+            (&wrapping_gpa, "wrapping guest address"),
+        ] {
+            assert_invalid_ranges(check_snapshot_memory_ranges(t), what);
+        }
+
+        // The copy and copy-on-write paths refuse them too, without the
+        // loading check, before copying anything for the bad range.
+        let (gm, zones) = restore_zone_with_virtio_mem();
+        let file = snapshot_file(&[(0xab, 4 * MIB)]);
+        for t in [&wrapping_offset, &wrapping_gpa] {
+            assert_invalid_ranges(
+                MemoryManager::copy_saved_regions(&gm, file.path().to_path_buf(), t),
+                "copy of overflowing ranges",
+            );
+            assert_invalid_ranges(
+                MemoryManager::cow_map_saved_regions(
+                    &gm,
+                    &zones,
+                    false,
+                    file.path().to_path_buf(),
+                    t,
+                )
+                .map(|_| ()),
+                "copy-on-write of overflowing ranges",
+            );
+        }
+    }
+
+    #[test]
+    fn restore_refuses_more_saved_ranges_than_the_bound() {
+        let page = get_page_size();
+        let mut table = MemoryRangeTable::default();
+        for i in 0..MAX_SNAPSHOT_MEMORY_RANGES as u64 {
+            table.push(MemoryRange {
+                gpa: i * 2 * page,
+                length: page,
+            });
+        }
+        check_snapshot_memory_ranges(&table).unwrap();
+        table.push(MemoryRange {
+            gpa: MAX_SNAPSHOT_MEMORY_RANGES as u64 * 2 * page,
+            length: page,
+        });
+        assert_invalid_ranges(check_snapshot_memory_ranges(&table), "one range too many");
+    }
+
+    #[test]
+    fn restore_copies_well_formed_saved_ranges() {
+        const MIB: u64 = 1 << 20;
+        let (gm, _zones) = restore_zone_with_virtio_mem();
+        let file = snapshot_file(&[(0xab, 4 * MIB), (0xcd, 2 * MIB)]);
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        check_snapshot_memory_ranges(&table).unwrap();
+        MemoryManager::copy_saved_regions(&gm, file.path().to_path_buf(), &table).unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(4 * MIB - 1)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(18 * MIB)).unwrap(), 0xcd);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(20 * MIB - 1)).unwrap(), 0xcd);
+    }
+
+    #[test]
     fn cow_restore_rejects_unaligned_or_out_of_region_ranges() {
         let page = get_page_size();
         let gm = GuestMemory::from_ranges(&[(GuestAddress(0), page as usize)]).unwrap();
@@ -4413,6 +5869,37 @@ mod tests {
             length: 2 * page,
         });
         assert!(!is_restore_cow_compatible(&gm, &spanning));
+    }
+
+    #[test]
+    fn cow_restore_rejects_overlapping_ranges() {
+        let page = get_page_size();
+        let gm = GuestMemory::from_ranges(&[(GuestAddress(0), (4 * page) as usize)]).unwrap();
+        let table = |ranges: &[(u64, u64)]| {
+            let mut table = MemoryRangeTable::default();
+            for &(gpa, length) in ranges {
+                table.push(MemoryRange { gpa, length });
+            }
+            table
+        };
+
+        // Adjacent ranges, in either order, and an empty one are fine.
+        for ok in [
+            table(&[(0, page), (page, 3 * page)]),
+            table(&[(2 * page, 2 * page), (0, 2 * page)]),
+            table(&[(0, 2 * page), (page, 0), (2 * page, page)]),
+        ] {
+            assert!(is_restore_cow_compatible(&gm, &ok));
+        }
+        // Ranges sharing even one page are not, whatever their order.
+        for overlapping in [
+            table(&[(0, 2 * page), (page, 2 * page)]),
+            table(&[(2 * page, 2 * page), (0, 3 * page)]),
+            table(&[(0, 4 * page), (page, page)]),
+            table(&[(page, page), (3 * page, page), (page, page)]),
+        ] {
+            assert!(!is_restore_cow_compatible(&gm, &overlapping));
+        }
     }
 
     #[test]
@@ -4471,5 +5958,1890 @@ mod tests {
             do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
             assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xcd);
         }
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    // Every page-aligned hole in the first `len` bytes of `file`, or None if
+    // SEEK_HOLE is unsupported.
+    fn all_holes(file: &File, len: u64) -> Option<Vec<(u64, u64)>> {
+        let mut holes = Vec::new();
+        cow_file_holes(file, 0, len, get_page_size(), |off, len| {
+            holes.push((off, len));
+        })
+        .ok()?;
+        Some(holes)
+    }
+
+    // A sparse file of 8 MiB: data [0, 2) MiB, a 3 MiB hole, data [5, 6),
+    // a 1 MiB hole, data [7, 8). Mapped over 10 MiB, [8, 10) lies past EOF.
+    // None unless SEEK_HOLE reports exactly those holes.
+    fn sparse_snapshot_file() -> Option<File> {
+        use std::os::unix::fs::FileExt;
+
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(8 * MIB).unwrap();
+        for (byte, off, len) in [
+            (0xab, 0, 2 * MIB),
+            (0xcd, 5 * MIB, MIB),
+            (0xef, 7 * MIB, MIB),
+        ] {
+            file.write_all_at(&vec![byte; len as usize], off).unwrap();
+        }
+        let holes = [(2 * MIB, 3 * MIB), (6 * MIB, MIB)];
+        let seen = all_holes(&file, 8 * MIB)?;
+        if seen != holes {
+            eprintln!("skipped: SEEK_HOLE reports {seen:x?}, not the holes written {holes:x?}");
+            return None;
+        }
+        Some(file)
+    }
+
+    // Whether the VMA holding `gpa` carries `flag` in its smaps VmFlags.
+    fn gpa_has_vm_flag(gm: &GuestMemory, gpa: u64, flag: &str) -> bool {
+        let host = gm.get_host_address(GuestAddress(gpa)).unwrap() as usize;
+        let smaps = fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut inside = false;
+        for line in smaps.lines() {
+            if let Some((lo, rest)) = line.split_once('-')
+                && let Some(hi) = rest.split_whitespace().next()
+                && let (Ok(lo), Ok(hi)) =
+                    (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+            {
+                inside = (lo..hi).contains(&host);
+            } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+                return flags.split_whitespace().any(|f| f == flag);
+            }
+        }
+        panic!("guest address not found in /proc/self/smaps");
+    }
+
+    #[test]
+    fn cow_restore_maps_file_holes_anonymous() {
+        use std::os::unix::fs::FileExt;
+
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        let gm = GuestMemory::from_ranges(&[(GuestAddress(0), (10 * MIB) as usize)]).unwrap();
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 10 * MIB,
+        });
+        do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
+
+        // Data reads the file's bytes, holes and past-EOF read zero.
+        for (gpa, byte) in [
+            (0, 0xab),
+            (2 * MIB - 1, 0xab),
+            (2 * MIB, 0),
+            (5 * MIB - 1, 0),
+            (5 * MIB, 0xcd),
+            (6 * MIB, 0),
+            (7 * MIB, 0xef),
+            (8 * MIB - 1, 0xef),
+            (8 * MIB, 0),
+            (10 * MIB - 1, 0),
+        ] {
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), byte);
+        }
+
+        // Every hole, the 1 MiB one too, is anonymous; data stays mapped
+        // from the file.
+        assert!(gpa_is_file_backed(&gm, 0));
+        assert!(!gpa_is_file_backed(&gm, 2 * MIB));
+        assert!(!gpa_is_file_backed(&gm, 5 * MIB - 1));
+        assert!(gpa_is_file_backed(&gm, 5 * MIB));
+        assert!(!gpa_is_file_backed(&gm, 6 * MIB));
+        assert!(gpa_is_file_backed(&gm, 7 * MIB));
+        assert!(!gpa_is_file_backed(&gm, 8 * MIB));
+
+        // The THP advice covers the anonymous ranges as well.
+        if Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+            assert!(gpa_has_vm_flag(&gm, 0, "hg"));
+            assert!(gpa_has_vm_flag(&gm, 2 * MIB, "hg"));
+            assert!(gpa_has_vm_flag(&gm, 8 * MIB, "hg"));
+        }
+
+        // A write into a remapped hole is kept and never reaches the file,
+        // which keeps its hole; a discard reads back zero.
+        gm.write_obj::<u8>(0x5a, GuestAddress(3 * MIB)).unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(3 * MIB)).unwrap(), 0x5a);
+        let mut back = [0xffu8; 1];
+        file.read_exact_at(&mut back, 3 * MIB).unwrap();
+        assert_eq!(back[0], 0);
+        assert_eq!(
+            next_data_extent(file.as_fd(), 2 * MIB, 5 * MIB).unwrap(),
+            None
+        );
+        assert_eq!(file.metadata().unwrap().len(), 8 * MIB);
+        discard(&gm, 3 * MIB, get_page_size());
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(3 * MIB)).unwrap(), 0);
+    }
+
+    // Guest RAM with `file` mapped privately over it, as the copy-on-write
+    // restore maps it, before any hole is remapped.
+    fn private_file_mapping(file: &File, len: u64) -> GuestMemory {
+        let gm = GuestMemory::from_ranges(&[(GuestAddress(0), len as usize)]).unwrap();
+        let host = gm.get_host_address(GuestAddress(0)).unwrap();
+        // SAFETY: host/len name the whole anonymous region just created.
+        let ret = unsafe {
+            libc::mmap(
+                host.cast(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(ret, libc::MAP_FAILED);
+        gm
+    }
+
+    fn whole_mapping(gm: &GuestMemory) -> CowMapping {
+        CowMapping {
+            host: gm.get_host_address(GuestAddress(0)).unwrap(),
+            len: gm.find_region(GuestAddress(0)).unwrap().len() as usize,
+            file_offset: 0,
+            map_flags: libc::MAP_NORESERVE,
+        }
+    }
+
+    fn remap_holes(gm: &GuestMemory, file: &File, limits: HoleRemapLimits) -> HoleRemapReport {
+        let mut reports =
+            remap_cow_holes(&[whole_mapping(gm)], file, limits, |addr, len, flags| {
+                // SAFETY: the range lies in gm's mapping, which the test owns.
+                unsafe { map_anon_fixed(addr, len, flags) }
+            })
+            .unwrap();
+        assert_eq!(reports.len(), 1);
+        reports.pop().unwrap()
+    }
+
+    // Every hole found is remapped or counted as skipped for one reason.
+    fn assert_holes_add_up(report: &HoleRemapReport) {
+        assert_eq!(
+            report.found,
+            report.holes + report.skipped_small + report.skipped_cap + report.skipped_failed,
+            "{report}"
+        );
+    }
+
+    // A file of `len` bytes of data with `holes` punched out. None unless
+    // SEEK_HOLE reports exactly those holes, as on a filesystem that tracks
+    // holes at a coarser grain (ZFS) it does not.
+    fn file_with_holes(len: u64, holes: &[(u64, u64)]) -> Option<File> {
+        use std::os::unix::fs::FileExt;
+
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(&vec![0x77u8; len as usize], 0).unwrap();
+        for &(off, hole_len) in holes {
+            // SAFETY: a plain syscall on an fd the test owns.
+            let ret = unsafe {
+                libc::fallocate(
+                    file.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    off as libc::off_t,
+                    hole_len as libc::off_t,
+                )
+            };
+            if ret != 0 {
+                eprintln!(
+                    "skipped: cannot punch holes: {}",
+                    io::Error::last_os_error()
+                );
+                return None;
+            }
+        }
+        let seen = all_holes(&file, len)?;
+        if seen != holes {
+            eprintln!("skipped: SEEK_HOLE reports {seen:x?}, not the holes punched {holes:x?}");
+            return None;
+        }
+        Some(file)
+    }
+
+    #[test]
+    fn cow_hole_remap_reports_and_honors_limits() {
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+
+        let gm = private_file_mapping(&file, 10 * MIB);
+        let report = remap_holes(&gm, &file, HoleRemapLimits::default());
+        assert_eq!(
+            report,
+            HoleRemapReport {
+                extents: 3,
+                found: 3,
+                skipped_small: 0,
+                skipped_cap: 0,
+                skipped_failed: 0,
+                holes: 3,
+                bytes: 6 * MIB,
+                fallback: None,
+            }
+        );
+
+        // Below the minimum size every hole stays mapped from the file.
+        let gm = private_file_mapping(&file, 8 * MIB);
+        let limits = HoleRemapLimits {
+            min_size: 4 * MIB,
+            ..Default::default()
+        };
+        let report = remap_holes(&gm, &file, limits);
+        assert_eq!(
+            (report.extents, report.found, report.skipped_small),
+            (3, 2, 2)
+        );
+        assert_eq!((report.holes, report.bytes), (0, 0));
+        assert_eq!(report.fallback, None);
+        assert_holes_add_up(&report);
+        assert!(gpa_is_file_backed(&gm, 2 * MIB));
+
+        // Over the budget, the largest holes are remapped and the rest stay
+        // mapped from the file.
+        let gm = private_file_mapping(&file, 10 * MIB);
+        let limits = HoleRemapLimits {
+            max_holes: 2,
+            ..Default::default()
+        };
+        let report = remap_holes(&gm, &file, limits);
+        assert_eq!((report.found, report.skipped_cap), (3, 1));
+        assert_eq!((report.holes, report.bytes), (2, 5 * MIB));
+        assert_eq!(report.fallback, None);
+        assert_holes_add_up(&report);
+        assert!(!gpa_is_file_backed(&gm, 2 * MIB));
+        assert!(gpa_is_file_backed(&gm, 6 * MIB));
+        assert!(!gpa_is_file_backed(&gm, 8 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(6 * MIB)).unwrap(), 0);
+
+        // With no budget, every hole stays mapped from the file.
+        let gm = private_file_mapping(&file, 10 * MIB);
+        let limits = HoleRemapLimits {
+            max_holes: 0,
+            ..Default::default()
+        };
+        let report = remap_holes(&gm, &file, limits);
+        assert_eq!((report.skipped_cap, report.holes), (3, 0));
+        assert_holes_add_up(&report);
+        assert!(gpa_is_file_backed(&gm, 2 * MIB));
+    }
+
+    #[test]
+    fn cow_hole_remap_counts_holes_left_after_a_failure() {
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        let gm = private_file_mapping(&file, 10 * MIB);
+        // The second remap fails, without touching the mapping.
+        let mut calls = 0;
+        let mut reports = remap_cow_holes(
+            &[whole_mapping(&gm)],
+            &file,
+            HoleRemapLimits::default(),
+            |addr, len, flags| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(io::Error::other("injected"));
+                }
+                // SAFETY: the range lies in gm's mapping, which the test owns.
+                unsafe { map_anon_fixed(addr, len, flags) }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        let report = reports.pop().unwrap();
+        assert_eq!(
+            report,
+            HoleRemapReport {
+                extents: 3,
+                found: 3,
+                skipped_small: 0,
+                skipped_cap: 0,
+                skipped_failed: 2,
+                holes: 1,
+                bytes: 3 * MIB,
+                fallback: Some("mmap_failed"),
+            }
+        );
+        assert_holes_add_up(&report);
+        // The hole that failed is mapped from the file again, and still
+        // reads zero; the one never tried is untouched.
+        assert!(!gpa_is_file_backed(&gm, 2 * MIB));
+        assert!(gpa_is_file_backed(&gm, 6 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(6 * MIB)).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(7 * MIB)).unwrap(), 0xef);
+        assert!(gpa_is_file_backed(&gm, 8 * MIB));
+    }
+
+    #[test]
+    fn cow_hole_remap_keeps_the_file_mapping_when_out_of_vmas() {
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        let gm = private_file_mapping(&file, 10 * MIB);
+        // As at vm.max_map_count: the anonymous remap fails with ENOMEM and
+        // leaves the file mapping, and so would any other MAP_FIXED over it.
+        let mut anon_calls = 0;
+        let mut file_calls = 0;
+        let mut reports = remap_cow_holes_with(
+            &[whole_mapping(&gm)],
+            &file,
+            HoleRemapLimits::default(),
+            |_, _, _| {
+                anon_calls += 1;
+                Err(io::Error::from_raw_os_error(libc::ENOMEM))
+            },
+            |addr, len, flags, off| {
+                file_calls += 1;
+                if flags & libc::MAP_FIXED != 0 {
+                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                }
+                // SAFETY: the range lies in gm's mapping, which the test
+                // owns, and the flags carry no MAP_FIXED.
+                let ret = unsafe {
+                    libc::mmap(
+                        addr.cast(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        flags,
+                        file.as_raw_fd(),
+                        off,
+                    )
+                };
+                if ret == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(ret.cast())
+            },
+        )
+        .unwrap();
+        assert_eq!((anon_calls, file_calls), (1, 1));
+        let report = reports.pop().unwrap();
+        assert_eq!(
+            report,
+            HoleRemapReport {
+                extents: 3,
+                found: 3,
+                skipped_failed: 3,
+                fallback: Some("mmap_failed"),
+                ..Default::default()
+            }
+        );
+        assert_holes_add_up(&report);
+        // Every hole is still mapped from the file, and the range reads the
+        // file's data (past the file's end, at 8 MiB, it would fault).
+        for gpa in [2 * MIB, 6 * MIB, 8 * MIB] {
+            assert!(gpa_is_file_backed(&gm, gpa));
+        }
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(2 * MIB)).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(6 * MIB)).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * MIB)).unwrap(), 0xcd);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(7 * MIB)).unwrap(), 0xef);
+    }
+
+    #[test]
+    fn cow_hole_remap_fails_when_the_kernel_ignores_fixed_noreplace() {
+        use std::ptr;
+
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        let gm = private_file_mapping(&file, 10 * MIB);
+        // A kernel before 4.17 takes MAP_FIXED_NOREPLACE as a hint and maps
+        // the file elsewhere; whether the hole is still mapped is then
+        // unknown, so the restore fails.
+        let mut file_calls = 0;
+        let res = remap_cow_holes_with(
+            &[whole_mapping(&gm)],
+            &file,
+            HoleRemapLimits::default(),
+            |_, _, _| Err(io::Error::from_raw_os_error(libc::ENOMEM)),
+            |_, len, flags, off| {
+                file_calls += 1;
+                // SAFETY: no address and no MAP_FIXED: the kernel picks a
+                // free range, which the code under test unmaps again.
+                let ret = unsafe {
+                    libc::mmap(
+                        ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        flags & !libc::MAP_FIXED_NOREPLACE,
+                        file.as_raw_fd(),
+                        off,
+                    )
+                };
+                if ret == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(ret.cast())
+            },
+        );
+        assert!(matches!(res, Err(Error::SnapshotMmap(_))), "{res:?}");
+        assert_eq!(file_calls, 1);
+        // The guest's file mapping was left alone.
+        assert!(gpa_is_file_backed(&gm, 2 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+    }
+
+    #[test]
+    fn cow_hole_remap_failure_skips_the_holes_of_later_ranges() {
+        let kib = 1 << 10;
+        // Range 0 ([0, 2) MiB) and range 1 ([2, 4) MiB) have two holes each;
+        // the second remap, range 0's last, fails, so range 1's are skipped.
+        let holes = [
+            (256 * kib, 64 * kib),
+            (MIB, 128 * kib),
+            (2 * MIB + 256 * kib, 64 * kib),
+            (3 * MIB, 256 * kib),
+        ];
+        let Some(file) = file_with_holes(4 * MIB, &holes) else {
+            return;
+        };
+        let gm = private_file_mapping(&file, 4 * MIB);
+        let whole = whole_mapping(&gm);
+        let mappings = [
+            CowMapping {
+                len: (2 * MIB) as usize,
+                ..whole
+            },
+            CowMapping {
+                // SAFETY: 2 MiB lies inside gm's 4 MiB mapping.
+                host: unsafe { whole.host.add((2 * MIB) as usize) },
+                len: (2 * MIB) as usize,
+                file_offset: 2 * MIB,
+                ..whole
+            },
+        ];
+        let mut calls = 0;
+        let reports = remap_cow_holes(
+            &mappings,
+            &file,
+            HoleRemapLimits::default(),
+            |addr, len, flags| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(io::Error::other("injected"));
+                }
+                // SAFETY: the range lies in gm's mapping, which the test owns.
+                unsafe { map_anon_fixed(addr, len, flags) }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            reports,
+            vec![
+                HoleRemapReport {
+                    extents: 3,
+                    found: 2,
+                    skipped_failed: 1,
+                    holes: 1,
+                    bytes: 64 * kib,
+                    fallback: Some("mmap_failed"),
+                    ..Default::default()
+                },
+                HoleRemapReport {
+                    extents: 3,
+                    found: 2,
+                    skipped_failed: 2,
+                    fallback: Some("mmap_failed"),
+                    ..Default::default()
+                },
+            ]
+        );
+        for report in &reports {
+            assert_holes_add_up(report);
+        }
+        assert!(!gpa_is_file_backed(&gm, 256 * kib));
+        for &(gpa, _) in &holes[1..] {
+            assert!(gpa_is_file_backed(&gm, gpa));
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), 0);
+        }
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(2 * MIB)).unwrap(), 0x77);
+    }
+
+    #[test]
+    fn cow_hole_remap_covers_small_holes() {
+        let page = get_page_size();
+        let kib = 1 << 10;
+        if page >= 64 * kib {
+            eprintln!("skipped: a one-page hole is not small with {page}-byte pages");
+            return;
+        }
+        // One-page and 64 KiB holes in turn, each after a data page, in a
+        // file that ends in data: only the 64 KiB holes are remapped.
+        let mut off = 0;
+        let mut small = Vec::new();
+        let mut big = Vec::new();
+        for i in 0..8 {
+            off += page;
+            if i % 2 == 0 {
+                small.push((off, page));
+                off += page;
+            } else {
+                big.push((off, 64 * kib));
+                off += 64 * kib;
+            }
+        }
+        off += page;
+        let mut holes: Vec<_> = small.iter().chain(&big).copied().collect();
+        holes.sort_unstable();
+        let Some(file) = file_with_holes(off, &holes) else {
+            return;
+        };
+        // Mapped past EOF, which adds one more hole.
+        let len = off.next_multiple_of(2 * MIB);
+
+        let gm = private_file_mapping(&file, len);
+        let report = remap_holes(&gm, &file, HoleRemapLimits::default());
+        assert_eq!(report.extents, 9);
+        assert_eq!(report.found, 9);
+        assert_eq!(report.skipped_small, 4);
+        assert_eq!(report.holes, 5);
+        assert_eq!(report.bytes, 4 * 64 * kib + (len - off));
+        assert_eq!(report.fallback, None);
+        assert_holes_add_up(&report);
+        for &(gpa, _) in &small {
+            assert!(gpa_is_file_backed(&gm, gpa));
+        }
+        for &(gpa, _) in &big {
+            assert!(!gpa_is_file_backed(&gm, gpa));
+            assert!(!gpa_is_file_backed(&gm, gpa + 64 * kib - 1));
+            assert!(gpa_is_file_backed(&gm, gpa + 64 * kib));
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), 0);
+        }
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x77);
+    }
+
+    #[test]
+    fn cow_hole_remap_prefers_largest_across_ranges() {
+        let kib = 1 << 10;
+        // Range 0 ([0, 2) MiB) has four 64 KiB holes, range 1 ([2, 4) MiB)
+        // one of 1 MiB. With a budget of four, the 1 MiB hole and the first
+        // three 64 KiB ones are remapped, though range 0 comes first.
+        let small = [128 * kib, 384 * kib, 640 * kib, 896 * kib];
+        let mut holes: Vec<_> = small.iter().map(|&off| (off, 64 * kib)).collect();
+        holes.push((2 * MIB + 512 * kib, MIB));
+        let Some(file) = file_with_holes(4 * MIB, &holes) else {
+            return;
+        };
+        let gm = GuestMemory::from_ranges(&[(GuestAddress(0), (4 * MIB) as usize)]).unwrap();
+        let mut table = MemoryRangeTable::default();
+        for gpa in [0, 2 * MIB] {
+            table.push(MemoryRange {
+                gpa,
+                length: 2 * MIB,
+            });
+        }
+        let limits = HoleRemapLimits {
+            max_holes: 4,
+            ..Default::default()
+        };
+        let reports = do_mmap_cow_saved_regions_with(&gm, &file, &table, false, limits).unwrap();
+        assert_eq!(
+            reports,
+            vec![
+                HoleRemapReport {
+                    extents: 5,
+                    found: 4,
+                    skipped_cap: 1,
+                    holes: 3,
+                    bytes: 3 * 64 * kib,
+                    ..Default::default()
+                },
+                HoleRemapReport {
+                    extents: 2,
+                    found: 1,
+                    holes: 1,
+                    bytes: MIB,
+                    ..Default::default()
+                },
+            ]
+        );
+        for report in &reports {
+            assert_holes_add_up(report);
+        }
+        for &gpa in &small[..3] {
+            assert!(!gpa_is_file_backed(&gm, gpa));
+        }
+        assert!(gpa_is_file_backed(&gm, small[3]));
+        assert!(!gpa_is_file_backed(&gm, 2 * MIB + 512 * kib));
+        assert!(gpa_is_file_backed(&gm, 3 * MIB + 512 * kib));
+        for (gpa, byte) in [
+            (0, 0x77),
+            (small[0], 0),
+            (small[3], 0),
+            (2 * MIB + 512 * kib, 0),
+            (4 * MIB - 1, 0x77),
+        ] {
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), byte);
+        }
+    }
+
+    fn hole(range: usize, off: u64, len: u64) -> CowHole {
+        CowHole { range, off, len }
+    }
+
+    // Offers `holes` in turn to a chooser of `max_holes`; returns the holes
+    // it chose and those it dropped, both by range then offset.
+    fn choose(holes: &[CowHole], max_holes: usize) -> (Vec<CowHole>, Vec<CowHole>) {
+        let mut chooser = HoleChooser::new(max_holes);
+        let mut dropped: Vec<_> = holes.iter().filter_map(|&h| chooser.offer(h)).collect();
+        dropped.sort_unstable_by_key(|h| (h.range, h.off));
+        (chooser.into_chosen(), dropped)
+    }
+
+    #[test]
+    fn cow_hole_chooser_prefers_largest() {
+        let kib = 1 << 10;
+        let holes = [
+            hole(0, 100 * kib, 64 * kib),
+            hole(0, 400 * kib, 128 * kib),
+            hole(0, 600 * kib, 64 * kib),
+            hole(0, 800 * kib, 2 * MIB),
+            hole(1, 0, 64 * kib),
+            hole(1, 100 * kib, 4 * MIB),
+        ];
+
+        // Up to the cap, exactly at it included, every hole is chosen.
+        for max_holes in [6, 7, COW_HOLE_REMAP_MAX_HOLES] {
+            assert_eq!(choose(&holes, max_holes), (holes.to_vec(), Vec::new()));
+        }
+
+        // Over the cap: the largest across ranges, the earlier (by range,
+        // then offset) of equal sizes, in whatever order they come.
+        let chosen = vec![holes[0], holes[1], holes[3], holes[5]];
+        let dropped = vec![holes[2], holes[4]];
+        assert_eq!(choose(&holes, 4), (chosen.clone(), dropped.clone()));
+        let mut reversed = holes;
+        reversed.reverse();
+        assert_eq!(choose(&reversed, 4), (chosen, dropped));
+
+        assert_eq!(choose(&holes, 0), (Vec::new(), holes.to_vec()));
+        assert_eq!(choose(&[], 4), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn cow_hole_chooser_drops_the_holes_of_a_failed_walk() {
+        let kib = 1 << 10;
+        let limits = HoleRemapLimits {
+            min_size: 64 * kib,
+            max_holes: 3,
+        };
+        let mut chooser = HoleChooser::new(limits.max_holes);
+        let mut reports: Vec<_> = (0..3).map(|_| HoleRemapReport::default()).collect();
+        let walk = |holes: Vec<CowHole>, result: io::Result<usize>| {
+            move |on_hole: &mut dyn FnMut(u64, u64)| {
+                for h in holes {
+                    on_hole(h.off, h.len);
+                }
+                result
+            }
+        };
+
+        let kept = vec![hole(0, 0, 64 * kib), hole(0, MIB, 128 * kib)];
+        offer_range_holes(
+            &mut chooser,
+            &mut reports,
+            0,
+            limits,
+            walk(kept.clone(), Ok(2)),
+        );
+
+        // Range 1's walk fails after finding holes larger than all those
+        // kept, enough to push them over the cap: none of its holes is
+        // chosen, and none of range 0's is dropped for them.
+        let failed = (0..4).map(|i| hole(1, (2 + i) * MIB, 512 * kib)).collect();
+        let err = io::Error::other("walk failed");
+        offer_range_holes(
+            &mut chooser,
+            &mut reports,
+            1,
+            limits,
+            walk(failed, Err(err)),
+        );
+
+        // Range 2's walk succeeds: its holes compete with those kept.
+        let big = hole(2, 8 * MIB, MIB);
+        let small = hole(2, 10 * MIB, 64 * kib);
+        offer_range_holes(
+            &mut chooser,
+            &mut reports,
+            2,
+            limits,
+            walk(vec![big, small], Ok(1)),
+        );
+
+        assert_eq!(chooser.into_chosen(), vec![kept[0], kept[1], big]);
+        assert_eq!(
+            reports,
+            vec![
+                HoleRemapReport {
+                    extents: 2,
+                    found: 2,
+                    ..Default::default()
+                },
+                HoleRemapReport {
+                    fallback: Some("seek_hole_unsupported"),
+                    ..Default::default()
+                },
+                HoleRemapReport {
+                    extents: 1,
+                    found: 2,
+                    skipped_cap: 1,
+                    ..Default::default()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cow_hole_chooser_covers_a_golden_image() {
+        // A memory file the size of a golden image's, about 3554 data
+        // extents with a 64 KiB to 1 MiB hole after each, is covered whole.
+        let kib = 1 << 10;
+        let holes: Vec<_> = (0..3554u64)
+            .map(|i| hole(0, i * 2 * MIB, (64 + (i % 16) * 64) * kib))
+            .collect();
+        assert_eq!(
+            choose(&holes, COW_HOLE_REMAP_MAX_HOLES),
+            (holes, Vec::new())
+        );
+    }
+
+    #[test]
+    fn cow_hole_remap_takes_exactly_max_holes() {
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        // Three holes over 10 MiB, with a budget of three.
+        let gm = private_file_mapping(&file, 10 * MIB);
+        let limits = HoleRemapLimits {
+            max_holes: 3,
+            ..Default::default()
+        };
+        let report = remap_holes(&gm, &file, limits);
+        assert_eq!((report.found, report.holes, report.skipped_cap), (3, 3, 0));
+        assert_eq!(report.bytes, 6 * MIB);
+        assert_holes_add_up(&report);
+        for gpa in [2 * MIB, 6 * MIB, 8 * MIB] {
+            assert!(!gpa_is_file_backed(&gm, gpa));
+        }
+    }
+
+    #[test]
+    fn cow_hole_remap_handles_a_range_without_holes() {
+        // Range 0 ([0, 2) MiB) is all data; range 1 ([2, 4) MiB) has a hole.
+        let Some(file) = file_with_holes(4 * MIB, &[(2 * MIB + 512 * (1 << 10), MIB)]) else {
+            return;
+        };
+        let gm = GuestMemory::from_ranges(&[(GuestAddress(0), (4 * MIB) as usize)]).unwrap();
+        let mut table = MemoryRangeTable::default();
+        for gpa in [0, 2 * MIB] {
+            table.push(MemoryRange {
+                gpa,
+                length: 2 * MIB,
+            });
+        }
+        let reports =
+            do_mmap_cow_saved_regions_with(&gm, &file, &table, false, HoleRemapLimits::default())
+                .unwrap();
+        assert_eq!(
+            reports,
+            vec![
+                HoleRemapReport {
+                    extents: 1,
+                    ..Default::default()
+                },
+                HoleRemapReport {
+                    extents: 2,
+                    found: 1,
+                    holes: 1,
+                    bytes: MIB,
+                    ..Default::default()
+                },
+            ]
+        );
+        for report in &reports {
+            assert_holes_add_up(report);
+        }
+        assert!(gpa_is_file_backed(&gm, 0));
+        assert!(gpa_is_file_backed(&gm, 2 * MIB - 1));
+        assert!(!gpa_is_file_backed(&gm, 2 * MIB + 512 * (1 << 10)));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(MIB)).unwrap(), 0x77);
+    }
+
+    #[test]
+    fn cow_hole_report_sums_ranges() {
+        let mut total = HoleRemapReport::default();
+        total.add(&HoleRemapReport {
+            extents: 2,
+            found: 3,
+            skipped_small: 1,
+            holes: 2,
+            bytes: MIB,
+            ..Default::default()
+        });
+        total.add(&HoleRemapReport {
+            extents: 1,
+            found: 4,
+            skipped_cap: 1,
+            skipped_failed: 2,
+            holes: 1,
+            bytes: 2 * MIB,
+            fallback: Some("mmap_failed"),
+            ..Default::default()
+        });
+        total.add(&HoleRemapReport {
+            fallback: Some("unaligned"),
+            ..Default::default()
+        });
+        assert_eq!(
+            total,
+            HoleRemapReport {
+                extents: 3,
+                found: 7,
+                skipped_small: 1,
+                skipped_cap: 1,
+                skipped_failed: 2,
+                holes: 3,
+                bytes: 3 * MIB,
+                fallback: Some("mmap_failed"),
+            }
+        );
+        assert_holes_add_up(&total);
+        assert_eq!(
+            total.to_string(),
+            "extents=3 holes_found=7 holes_remapped=3 bytes_remapped=3145728 \
+             skipped_small=1 skipped_cap=1 skipped_failed=2 fallback=mmap_failed"
+        );
+    }
+
+    #[test]
+    fn cow_hole_remap_keeps_mapping_without_seek_hole() {
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        let gm = private_file_mapping(&file, 8 * MIB);
+        // A pipe cannot seek, so its walk fails as on a filesystem without
+        // SEEK_HOLE.
+        let mut fds = [0; 2];
+        // SAFETY: fds has room for the two descriptors pipe writes.
+        // SAFETY: `fds` has room for the two descriptors pipe() writes.
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(ret, 0);
+        // SAFETY: pipe just returned these descriptors, owned by nothing else.
+        let (pipe_rd, _pipe_wr) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        let report = remap_holes(&gm, &pipe_rd, HoleRemapLimits::default());
+        assert_eq!(report.fallback, Some("seek_hole_unsupported"));
+        assert_eq!((report.holes, report.bytes), (0, 0));
+        assert!(gpa_is_file_backed(&gm, 2 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * MIB)).unwrap(), 0xcd);
+    }
+
+    #[test]
+    fn copy_on_access_segments_follow_served_pages() {
+        let page = get_page_size();
+        // Two UFFD ranges with a gap between them, the second one restored
+        // from further into the snapshot.
+        let ranges = [
+            UffdRange {
+                host_addr: 0x10_0000,
+                length: 4 * page,
+                source_offset: 0,
+                page_size: page,
+            },
+            UffdRange {
+                host_addr: 0x10_0000 + 6 * page,
+                length: 2 * page,
+                source_offset: 4 * page,
+                page_size: page,
+            },
+        ];
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
+        served[0].set_bit(1);
+        served[0].set_bit(2);
+        let pages = CopyOnAccessPages {
+            source: tempfile::tempfile().unwrap(),
+            ranges: Box::new(ranges),
+            served,
+            serve_lock: Arc::new(Mutex::new(())),
+        };
+        // Every segment of the window, as the snapshot writer walks it.
+        let segments = |host_addr: u64, len: u64, present: &dyn Fn(u64) -> bool| {
+            let mut out = Vec::new();
+            let mut done = 0;
+            while done < len {
+                let segment = pages.next_segment(host_addr + done, len - done, &present);
+                let end = segment.end();
+                out.push(match segment {
+                    CopyOnAccessSegment::Guest { offset, len } => CopyOnAccessSegment::Guest {
+                        offset: done + offset,
+                        len,
+                    },
+                    CopyOnAccessSegment::Source {
+                        offset,
+                        len,
+                        source_offset,
+                    } => CopyOnAccessSegment::Source {
+                        offset: done + offset,
+                        len,
+                        source_offset,
+                    },
+                });
+                done += end;
+            }
+            out
+        };
+        let absent = |_: u64| false;
+
+        // From one page before the first range to one page after the last.
+        let start = 0x10_0000 - page;
+        assert_eq!(
+            segments(start, 10 * page, &absent),
+            vec![
+                CopyOnAccessSegment::Guest {
+                    offset: 0,
+                    len: page,
+                },
+                CopyOnAccessSegment::Source {
+                    offset: page,
+                    len: page,
+                    source_offset: 0,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: 2 * page,
+                    len: 2 * page,
+                },
+                // The last page of the first range, not merged with the
+                // second range: their source offsets are not contiguous.
+                CopyOnAccessSegment::Source {
+                    offset: 4 * page,
+                    len: page,
+                    source_offset: 3 * page,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: 5 * page,
+                    len: 2 * page,
+                },
+                CopyOnAccessSegment::Source {
+                    offset: 7 * page,
+                    len: 2 * page,
+                    source_offset: 4 * page,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: 9 * page,
+                    len: page,
+                },
+            ]
+        );
+
+        // A page never served but present is in guest memory.
+        let page3 = 0x10_0000 + 3 * page;
+        assert_eq!(
+            segments(start, 10 * page, &|addr| addr == page3),
+            vec![
+                CopyOnAccessSegment::Guest {
+                    offset: 0,
+                    len: page,
+                },
+                CopyOnAccessSegment::Source {
+                    offset: page,
+                    len: page,
+                    source_offset: 0,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: 2 * page,
+                    len: 5 * page,
+                },
+                CopyOnAccessSegment::Source {
+                    offset: 7 * page,
+                    len: 2 * page,
+                    source_offset: 4 * page,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: 9 * page,
+                    len: page,
+                },
+            ]
+        );
+
+        // A window inside one range, starting mid-page.
+        assert_eq!(
+            segments(0x10_0000 + page / 2, page, &absent),
+            vec![
+                CopyOnAccessSegment::Source {
+                    offset: 0,
+                    len: page / 2,
+                    source_offset: page / 2,
+                },
+                CopyOnAccessSegment::Guest {
+                    offset: page / 2,
+                    len: page / 2,
+                },
+            ]
+        );
+    }
+
+    // Guest memory of `len` bytes at 0: private anonymous, or a shared memfd
+    // like `shared=on`.
+    fn test_guest_memory(shared: bool, len: u64) -> GuestMemory {
+        if !shared {
+            return GuestMemory::from_ranges(&[(GuestAddress(0), len as usize)]).unwrap();
+        }
+        // SAFETY: the name is a valid NUL-terminated string.
+        let fd = unsafe { libc::memfd_create(c"coa-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: memfd_create returned a new fd we own.
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(len).unwrap();
+        let region = MmapRegion::build(
+            Some(FileOffset::new(file, 0)),
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+        )
+        .unwrap();
+        GuestMemory::from_regions(vec![GuestRegion::from(
+            vm_memory::GuestRegionMmap::new(region, GuestAddress(0)).unwrap(),
+        )])
+        .unwrap()
+    }
+
+    // What the balloon does to a released page: punch a hole in a shared
+    // backing file, otherwise MADV_DONTNEED.
+    fn release(gm: &GuestMemory, gpa: u64, len: u64) {
+        let region = gm.find_region(GuestAddress(gpa)).unwrap();
+        match region.file_offset() {
+            Some(f_off) if region.flags() & libc::MAP_SHARED != 0 => {
+                // SAFETY: punches a hole in the memfd backing this region.
+                let ret = unsafe {
+                    libc::fallocate64(
+                        f_off.file().as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        (f_off.start() + gpa) as libc::off64_t,
+                        len as libc::off64_t,
+                    )
+                };
+                assert_eq!(ret, 0);
+            }
+            _ => discard(gm, gpa, len),
+        }
+    }
+
+    // A userfaultfd with all of `gm` registered for missing faults. A host
+    // that does not let the test create one fails the test, unless
+    // CH_TEST_SKIP_UFFD=1 says to skip it (None).
+    fn register_uffd(gm: &GuestMemory) -> Option<Uffd> {
+        let fd = match uffd::create(userfaultfd::UFFD_FEATURE_MISSING_SHMEM) {
+            Ok(fd) => fd,
+            Err(e) if env::var_os("CH_TEST_SKIP_UFFD").is_some_and(|v| v == "1") => {
+                eprintln!("skipping (CH_TEST_SKIP_UFFD=1): cannot create a userfaultfd: {e}");
+                return None;
+            }
+            Err(e) => panic!(
+                "cannot create a userfaultfd: {e}; run as root or with \
+                 vm.unprivileged_userfaultfd=1, or set CH_TEST_SKIP_UFFD=1 to skip"
+            ),
+        };
+        let page = get_page_size();
+        let mut ranges = Vec::new();
+        let mut source_offset = 0;
+        for region in gm.iter() {
+            let host_addr = region.as_ptr() as u64;
+            let length = region.len();
+            uffd::register(fd.as_fd(), host_addr, length, false).unwrap();
+            ranges.push(UffdRange {
+                host_addr,
+                length,
+                source_offset,
+                page_size: page,
+            });
+            source_offset += length;
+        }
+        Some(Uffd::new(fd, ranges.into(), Box::new([])).unwrap())
+    }
+
+    fn gpa_present(gm: &GuestMemory, gpa: u64) -> bool {
+        uffd::page_present(gm.get_host_address(GuestAddress(gpa)).unwrap() as u64).unwrap()
+    }
+
+    // Whether the page at `gpa` is mapped by this mapping alone
+    // (PM_MMAP_EXCLUSIVE). The zero page every process shares never is.
+    fn gpa_exclusive(gm: &GuestMemory, gpa: u64) -> bool {
+        use std::os::unix::fs::FileExt;
+
+        let addr = gm.get_host_address(GuestAddress(gpa)).unwrap() as u64;
+        let mut entry = [0u8; 8];
+        File::open("/proc/self/pagemap")
+            .unwrap()
+            .read_exact_at(&mut entry, addr / get_page_size() * 8)
+            .unwrap();
+        u64::from_ne_bytes(entry) & (1 << 56) != 0
+    }
+
+    // A UFFD handler serving `file` into `gm` without background fill, as a
+    // copy-on-access restore runs it when `private_zeroes`.
+    struct TestHandler {
+        stop: EventFd,
+        _exit: EventFd,
+        registry: Arc<UffdRegistry>,
+        prefault_failed: Arc<AtomicBool>,
+        handle: thread::JoinHandle<Result<(), io::Error>>,
+    }
+
+    impl TestHandler {
+        fn spawn(
+            uffd: Uffd,
+            file: File,
+            served: Arc<[AtomicBitmap]>,
+            private_zeroes: bool,
+        ) -> Self {
+            Self::spawn_with(
+                uffd,
+                Box::new(FileUffdMemorySource::new(file)),
+                served,
+                Arc::new(Mutex::new(())),
+                private_zeroes,
+            )
+        }
+
+        fn spawn_with(
+            uffd: Uffd,
+            source: Box<dyn UffdMemorySource>,
+            served: Arc<[AtomicBitmap]>,
+            serve_lock: Arc<Mutex<()>>,
+            private_zeroes: bool,
+        ) -> Self {
+            Self::spawn_inner(uffd, source, served, serve_lock, false, private_zeroes)
+        }
+
+        // An on-demand handler that also fills guest RAM in the background.
+        fn spawn_fill(
+            uffd: Uffd,
+            source: Box<dyn UffdMemorySource>,
+            served: Arc<[AtomicBitmap]>,
+        ) -> Self {
+            Self::spawn_inner(uffd, source, served, Arc::new(Mutex::new(())), true, false)
+        }
+
+        fn spawn_inner(
+            uffd: Uffd,
+            source: Box<dyn UffdMemorySource>,
+            served: Arc<[AtomicBitmap]>,
+            serve_lock: Arc<Mutex<()>>,
+            background_fetch_pages: bool,
+            private_zeroes: bool,
+        ) -> Self {
+            let stop = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let exit = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let registry = Arc::new(UffdRegistry {
+                ranges: uffd.ranges().into(),
+                added_uffds: Mutex::new(vec![(VMM_UFFD_ID.to_string(), uffd)]),
+                added_uffd_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                done: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            });
+            let prefault_failed = Arc::new(AtomicBool::new(false));
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let (thread_stop, thread_exit) = (stop.try_clone().unwrap(), exit.try_clone().unwrap());
+            let thread_registry = Arc::clone(&registry);
+            let thread_failed = Arc::clone(&prefault_failed);
+            let handle = thread::spawn(move || {
+                MemoryManager::uffd_handler_loop(
+                    &thread_registry,
+                    &thread_stop,
+                    &thread_exit,
+                    source,
+                    served,
+                    &serve_lock,
+                    &ready_tx,
+                    &thread_failed,
+                    background_fetch_pages,
+                    private_zeroes,
+                )
+            });
+            ready_rx.recv().unwrap();
+            Self {
+                stop,
+                _exit: exit,
+                registry,
+                prefault_failed,
+                handle,
+            }
+        }
+
+        // `(restoring, restore_failed)` as vm.info reports them.
+        fn status(&self, copy_on_access: bool) -> (bool, bool) {
+            restore_status(copy_on_access, &self.registry, &self.prefault_failed)
+        }
+
+        fn stop(self) {
+            assert!(!self.handle.is_finished(), "handler exited on its own");
+            assert!(!self.registry.is_done());
+            assert!(!self.prefault_failed.load(Ordering::Acquire));
+            self.stop.write(1).unwrap();
+            self.handle.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn copy_on_access_handler_copies_only_accessed_pages() {
+        check_copy_on_access_handler(false);
+    }
+
+    #[test]
+    fn copy_on_access_handler_copies_only_accessed_pages_shared() {
+        check_copy_on_access_handler(true);
+    }
+
+    #[test]
+    fn uffd_handler_serves_pages_through_a_clone_without_proc() {
+        use std::os::unix::fs::FileExt;
+
+        let page = get_page_size();
+        let pages = 8;
+        let len = pages * page;
+        let gm = test_guest_memory(false, len);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let ranges: Box<[UffdRange]> = uffd.ranges().into();
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
+        let file = tempfile::tempfile().unwrap();
+        for idx in 0..pages {
+            file.write_all_at(&vec![0xb0 + idx as u8; page as usize], idx * page)
+                .unwrap();
+        }
+        // As where /proc is not mounted: the reopen fails, so the source
+        // reads through a clone of `file`.
+        let no_proc = tempfile::tempdir().unwrap();
+        let source_file =
+            FileUffdMemorySource::open_file_in(&file, &no_proc.path().join("fd")).unwrap();
+        let handler = TestHandler::spawn(uffd, source_file, Arc::clone(&served), true);
+
+        // Each page the guest reads is the file's page at its offset, out of
+        // order as faults come.
+        for idx in [5, 0, 7, 2] {
+            let gpa = GuestAddress(idx * page);
+            assert_eq!(
+                gm.read_obj::<u64>(gpa).unwrap(),
+                u64::from_ne_bytes([0xb0 + idx as u8; 8])
+            );
+            let last = GuestAddress(idx * page + page - 1);
+            assert_eq!(gm.read_obj::<u8>(last).unwrap(), 0xb0 + idx as u8);
+        }
+        handler.stop();
+        for idx in 0..pages {
+            assert_eq!(
+                served[0].is_bit_set(idx as usize),
+                [5, 0, 7, 2].contains(&idx),
+                "page {idx}"
+            );
+        }
+    }
+
+    // How many of the pages of `[off, off + len)` of `file` are in the
+    // host page cache.
+    fn cached_file_pages(file: &File, off: u64, len: u64) -> usize {
+        use std::ptr;
+
+        let page = get_page_size();
+        // SAFETY: maps `len` bytes of `file` read-only; unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                off as libc::off_t,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        let mut vec = vec![0u8; len.div_ceil(page) as usize];
+        // SAFETY: `vec` holds one byte per page of the mapping.
+        let ret = unsafe { libc::mincore(addr, len as usize, vec.as_mut_ptr()) };
+        assert_eq!(ret, 0);
+        // SAFETY: unmaps the mapping made above.
+        unsafe { libc::munmap(addr, len as usize) };
+        vec.iter().filter(|&&v| v & 1 != 0).count()
+    }
+
+    // The /proc/self/pagemap entry of the page at `addr`: bit 63 present,
+    // bit 56 mapped exclusively, bits 0-54 the PFN (zero unless the caller
+    // has CAP_SYS_ADMIN).
+    fn pagemap_entry(addr: u64) -> u64 {
+        use std::os::unix::fs::FileExt;
+
+        let pagemap = File::open("/proc/self/pagemap").unwrap();
+        let mut entry = [0u8; 8];
+        pagemap
+            .read_exact_at(&mut entry, addr / get_page_size() * 8)
+            .unwrap();
+        u64::from_ne_bytes(entry)
+    }
+
+    const PAGEMAP_PRESENT: u64 = 1 << 63;
+    const PAGEMAP_EXCLUSIVE: u64 = 1 << 56;
+    const PAGEMAP_PFN: u64 = (1 << 55) - 1;
+
+    // The pagemap entry of a private anonymous page that was only read, so
+    // that the kernel mapped the zero page there.
+    fn zero_page_pagemap_entry() -> u64 {
+        use std::ptr;
+
+        let page = get_page_size() as usize;
+        // SAFETY: a fresh private anonymous mapping; unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                page,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        // SAFETY: `addr` maps one readable page.
+        assert_eq!(unsafe { ptr::read_volatile(addr.cast::<u8>()) }, 0);
+        let entry = pagemap_entry(addr as u64);
+        // SAFETY: unmaps the mapping made above.
+        unsafe { libc::munmap(addr, page) };
+        entry
+    }
+
+    #[test]
+    fn uffd_handler_resolves_file_holes_without_reading_them() {
+        check_uffd_handler_file_holes(false);
+    }
+
+    #[test]
+    fn uffd_handler_resolves_file_holes_without_reading_them_shared() {
+        check_uffd_handler_file_holes(true);
+    }
+
+    fn check_uffd_handler_file_holes(shared: bool) {
+        use std::os::unix::fs::FileExt;
+
+        let page = get_page_size();
+        // 16 pages: data in page 0 and in page 15, a hole in between.
+        let len = 16 * page;
+        let gm = test_guest_memory(shared, len);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let ranges: Box<[UffdRange]> = uffd.ranges().into();
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(len).unwrap();
+        file.write_all_at(&vec![0xa0; page as usize], 0).unwrap();
+        file.write_all_at(&vec![0xaf; page as usize], 15 * page)
+            .unwrap();
+        file.sync_all().unwrap();
+        match next_data_extent(file.as_fd(), page, len) {
+            Ok(Some((off, _))) if off == 15 * page => {}
+            other => {
+                eprintln!("skipping: SEEK_DATA reports {other:x?}, not the hole written");
+                return;
+            }
+        }
+        // SAFETY: drops the clean pages of `file` from the page cache.
+        let ret = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(ret, 0);
+        let handler = TestHandler::spawn_with(
+            uffd,
+            Box::new(FileUffdMemorySource::new(file.try_clone().unwrap())),
+            Arc::clone(&served),
+            Arc::new(Mutex::new(())),
+            true,
+        );
+
+        // A hole page reads zero, and is present and served.
+        assert_eq!(gm.read_obj::<u64>(GuestAddress(3 * page)).unwrap(), 0);
+        assert!(gpa_present(&gm, 3 * page));
+        assert_eq!(gm.read_obj::<u64>(GuestAddress(4 * page)).unwrap(), 0);
+        // Each hole page read is a page of its own, not the zero page every
+        // process shares: mapped exclusively, which the zero page never is,
+        // and, where the PFNs are visible, at its own PFN.
+        let zero_page = zero_page_pagemap_entry();
+        assert_ne!(zero_page & PAGEMAP_PRESENT, 0);
+        assert_eq!(zero_page & PAGEMAP_EXCLUSIVE, 0);
+        let hole_pages = [3, 4].map(|idx| {
+            let entry =
+                pagemap_entry(gm.get_host_address(GuestAddress(idx * page)).unwrap() as u64);
+            assert_ne!(entry & PAGEMAP_PRESENT, 0, "hole page {idx} not present");
+            assert_ne!(entry & PAGEMAP_EXCLUSIVE, 0, "hole page {idx} shared");
+            entry & PAGEMAP_PFN
+        });
+        if zero_page & PAGEMAP_PFN != 0 {
+            assert!(!hole_pages.contains(&(zero_page & PAGEMAP_PFN)));
+            assert_ne!(hole_pages[0], hole_pages[1]);
+        } else {
+            eprintln!("note: PFNs hidden from this user, checked the exclusive bit only");
+        }
+        // A data page reads the file.
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(15 * page)).unwrap(), 0xaf);
+        // A write to a hole page keeps the guest's data, and leaves its
+        // neighbours zero.
+        gm.write_obj::<u8>(0x5a, GuestAddress(5 * page + 7))
+            .unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * page + 7)).unwrap(), 0x5a);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * page)).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(6 * page)).unwrap(), 0);
+        // A hole page discarded after a write comes back as zeroes.
+        release(&gm, 5 * page, page);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * page + 7)).unwrap(), 0);
+        handler.stop();
+        for idx in [3, 4, 5, 6, 15] {
+            assert!(served[0].is_bit_set(idx), "page {idx} not served");
+        }
+
+        // None of it went through the file's page cache. Reading the hole
+        // through the file does cache it on this filesystem (unlike tmpfs,
+        // which maps the zero page), or there is nothing to tell apart.
+        assert_eq!(cached_file_pages(&file, page, 14 * page), 0);
+        file.read_exact_at(&mut [0u8; 1], 10 * page).unwrap();
+        if cached_file_pages(&file, page, 14 * page) == 0 {
+            eprintln!("note: reading a hole caches nothing here, so the page cache check is moot");
+        }
+    }
+
+    fn check_copy_on_access_handler(shared: bool) {
+        use std::os::unix::fs::FileExt;
+
+        let page = get_page_size();
+        let gm = test_guest_memory(shared, 4 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let ranges: Box<[UffdRange]> = uffd.ranges().into();
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
+        let file = snapshot_file(&[(0xa0, page), (0xa1, page), (0xa2, page), (0xa3, page)]);
+        let serve_lock = Arc::new(Mutex::new(()));
+        let handler = TestHandler::spawn_with(
+            uffd,
+            Box::new(FileUffdMemorySource::new(file.reopen().unwrap())),
+            Arc::clone(&served),
+            Arc::clone(&serve_lock),
+            true,
+        );
+
+        // Nothing is copied until it is accessed.
+        thread::sleep(time::Duration::from_millis(100));
+        for gpa in (0..4).map(|i| i * page) {
+            assert!(!gpa_present(&gm, gpa));
+        }
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0xa1);
+        assert!(gpa_present(&gm, page));
+        // A first access gets a page of the VM's own too.
+        assert!(gpa_exclusive(&gm, page));
+        // The copy wakes the reader before the handler sets the served bit;
+        // the handler holds `serve_lock` until it has, so taking it waits.
+        drop(serve_lock.lock().unwrap());
+        assert!(served[0].is_bit_set(1));
+        thread::sleep(time::Duration::from_millis(100));
+        for gpa in [0, 2 * page, 3 * page] {
+            assert!(!gpa_present(&gm, gpa));
+        }
+
+        // A discarded page comes back as zeroes, not as the snapshot's copy.
+        gm.write_obj::<u8>(0x5a, GuestAddress(page)).unwrap();
+        release(&gm, page, page);
+        assert!(!gpa_present(&gm, page));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0);
+        assert!(gpa_present(&gm, page));
+        // As a private copy, not the zero page every process shares.
+        assert!(gpa_exclusive(&gm, page));
+
+        // A written page keeps the guest's data.
+        gm.write_obj::<u8>(0x77, GuestAddress(2 * page)).unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(2 * page + 1)).unwrap(), 0xa2);
+
+        // Saving copies the untouched pages from the restore source and
+        // leaves them out of guest memory.
+        let pages = CopyOnAccessPages {
+            source: file.reopen().unwrap(),
+            ranges,
+            served: Arc::clone(&served),
+            serve_lock: Arc::clone(&serve_lock),
+        };
+        let range = MemoryRange {
+            gpa: 0,
+            length: 4 * page,
+        };
+        // Without a pre-sized destination, served pages are read through the
+        // guest mapping whatever the backing.
+        let check_saved = |sparse_layout: bool| {
+            let mut saved = tempfile::tempfile().unwrap();
+            if sparse_layout {
+                saved.set_len(4 * page).unwrap();
+            }
+            save_copy_on_access_range(&gm, &pages, &range, &mut saved, 0, sparse_layout).unwrap();
+            let mut content = vec![0u8; (4 * page) as usize];
+            saved.read_exact_at(&mut content, 0).unwrap();
+            let byte = |gpa: u64| content[gpa as usize];
+            assert_eq!(byte(0), 0xa0);
+            assert_eq!(byte(page - 1), 0xa0);
+            assert_eq!(byte(page), 0);
+            assert_eq!(byte(2 * page), 0x77);
+            assert_eq!(byte(2 * page + 1), 0xa2);
+            assert_eq!(byte(3 * page), 0xa3);
+            assert_eq!(byte(4 * page - 1), 0xa3);
+            assert!(!gpa_present(&gm, 0));
+            assert!(!gpa_present(&gm, 3 * page));
+        };
+        check_saved(true);
+        check_saved(false);
+
+        // A page released again and not touched since is saved as zeroes.
+        // A shared backing file has the hole; private memory faults it back.
+        release(&gm, page, page);
+        check_saved(true);
+        assert_eq!(gpa_present(&gm, page), !shared);
+        check_saved(false);
+
+        // A page written to the backing file without a fault is present, so
+        // it is saved from guest memory even though it was never served.
+        if shared {
+            let region = gm.find_region(GuestAddress(0)).unwrap();
+            let backing = region.file_offset().unwrap().file();
+            backing.write_all_at(&[0x99], 3 * page).unwrap();
+            assert!(!served[0].is_bit_set(3));
+            let mut saved = tempfile::tempfile().unwrap();
+            saved.set_len(4 * page).unwrap();
+            save_copy_on_access_range(&gm, &pages, &range, &mut saved, 0, true).unwrap();
+            let mut byte = [0u8; 2];
+            saved.read_exact_at(&mut byte, 3 * page).unwrap();
+            assert_eq!(byte, [0x99, 0]);
+        }
+
+        handler.stop();
+    }
+
+    // A source that waits for the test's go before resolving each page.
+    struct GatedSource {
+        inner: FileUffdMemorySource,
+        entered: mpsc::Sender<()>,
+        go: mpsc::Receiver<()>,
+    }
+
+    impl UffdMemorySource for GatedSource {
+        fn resolve(
+            &mut self,
+            uffd_fd: BorrowedFd<'_>,
+            range: &UffdRange,
+            page_idx: u64,
+        ) -> Result<(), io::Error> {
+            self.entered.send(()).unwrap();
+            self.go.recv().unwrap();
+            self.inner.resolve(uffd_fd, range, page_idx)
+        }
+
+        fn requires_uffd_minor_mode(&self) -> bool {
+            false
+        }
+    }
+
+    // The snapshot writer must not decide where a page's content is while
+    // the handler is resolving it: before the served bit is set, the page
+    // would look untouched and be saved from the restore source.
+    #[test]
+    fn copy_on_access_save_waits_for_page_being_served() {
+        use std::os::unix::fs::FileExt;
+
+        let page = get_page_size();
+        let gm = Arc::new(test_guest_memory(false, 2 * page));
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let ranges: Box<[UffdRange]> = uffd.ranges().into();
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(&ranges).into();
+        let serve_lock = Arc::new(Mutex::new(()));
+        // The handler serves 0xc0/0xc1. The writer's restore source holds
+        // 0xee, so a page saved from it is told apart.
+        let served_file = snapshot_file(&[(0xc0, page), (0xc1, page)]);
+        let restore_source = snapshot_file(&[(0xee, 2 * page)]);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let handler = TestHandler::spawn_with(
+            uffd,
+            Box::new(GatedSource {
+                inner: FileUffdMemorySource::new(served_file.reopen().unwrap()),
+                entered: entered_tx,
+                go: go_rx,
+            }),
+            Arc::clone(&served),
+            Arc::clone(&serve_lock),
+            true,
+        );
+
+        // A vCPU faults on page 1 and the handler starts resolving it.
+        let vcpu_gm = Arc::clone(&gm);
+        let vcpu = thread::spawn(move || vcpu_gm.read_obj::<u8>(GuestAddress(page)).unwrap());
+        entered_rx.recv().unwrap();
+
+        // The writer starts meanwhile, and must wait.
+        let pages = CopyOnAccessPages {
+            source: restore_source.reopen().unwrap(),
+            ranges,
+            served: Arc::clone(&served),
+            serve_lock,
+        };
+        let writer_gm = Arc::clone(&gm);
+        let (saved_tx, saved_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let mut saved = tempfile::tempfile().unwrap();
+            saved.set_len(2 * page).unwrap();
+            let range = MemoryRange {
+                gpa: 0,
+                length: 2 * page,
+            };
+            save_copy_on_access_range(&writer_gm, &pages, &range, &mut saved, 0, true).unwrap();
+            saved_tx.send(()).unwrap();
+            saved
+        });
+        thread::sleep(time::Duration::from_millis(100));
+        assert!(saved_rx.try_recv().is_err(), "writer did not wait");
+
+        go_tx.send(()).unwrap();
+        assert_eq!(vcpu.join().unwrap(), 0xc1);
+        let saved = writer.join().unwrap();
+        let mut content = vec![0u8; (2 * page) as usize];
+        saved.read_exact_at(&mut content, 0).unwrap();
+        // Page 0 was never touched; page 1 is what the handler installed.
+        assert_eq!(content[0], 0xee);
+        assert_eq!(content[page as usize], 0xc1);
+        assert!(!gpa_present(&gm, 0));
+
+        handler.stop();
+    }
+
+    // Without `private_zeroes` (ondemand), a discarded page is resolved with
+    // the zero page every process shares, which copy-on-access avoids.
+    #[test]
+    fn on_demand_handler_serves_discarded_pages_as_zero_page() {
+        let page = get_page_size();
+        let gm = GuestMemory::from_ranges(&[(GuestAddress(0), (2 * page) as usize)]).unwrap();
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        let file = snapshot_file(&[(0xb0, page), (0xb1, page)]);
+        let handler = TestHandler::spawn(uffd, file.reopen().unwrap(), served, false);
+
+        gm.write_obj::<u8>(0x5a, GuestAddress(0)).unwrap();
+        discard(&gm, 0, page);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0);
+        assert!(!gpa_exclusive(&gm, 0));
+
+        handler.stop();
+    }
+
+    // A first access to a page that is a hole in the snapshot file, or holds
+    // zeroes, gets a zeroed page of the VM's own, not the zero page every
+    // process shares. restore_by_uffd leaves holes unserved for copy-on-access,
+    // as here, so the source resolves a hole page with a copied page of zeroes
+    // without reading the file, and reads zeroes written as data from the file
+    // like any other page.
+    #[test]
+    fn copy_on_access_handler_serves_zero_pages_privately() {
+        check_copy_on_access_zero_pages(false);
+    }
+
+    #[test]
+    fn copy_on_access_handler_serves_zero_pages_privately_shared() {
+        check_copy_on_access_zero_pages(true);
+    }
+
+    fn check_copy_on_access_zero_pages(shared: bool) {
+        let page = get_page_size();
+        let gm = test_guest_memory(shared, 4 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        // Data, a hole, zeroes written as data, and a hole up to the end.
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0xd0u8; page as usize]).unwrap();
+        file.seek(SeekFrom::Start(2 * page)).unwrap();
+        file.write_all(&vec![0u8; page as usize]).unwrap();
+        file.set_len(4 * page).unwrap();
+        let handler = TestHandler::spawn(uffd, file, served, true);
+
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xd0);
+        for gpa in [page, 2 * page, 3 * page] {
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(gpa)).unwrap(), 0);
+            assert!(gpa_present(&gm, gpa));
+            assert!(gpa_exclusive(&gm, gpa), "page at {gpa:#x} is shared");
+        }
+
+        handler.stop();
+    }
+    // A source whose every read fails, as a vanished snapshot file would.
+    struct FailingSource;
+
+    impl UffdMemorySource for FailingSource {
+        fn resolve(&mut self, _: BorrowedFd<'_>, _: &UffdRange, _: u64) -> Result<(), io::Error> {
+            Err(io::Error::other("source gone"))
+        }
+
+        fn requires_uffd_minor_mode(&self) -> bool {
+            false
+        }
+    }
+
+    fn wait_for(cond: impl Fn() -> bool) {
+        let deadline = time::Instant::now() + time::Duration::from_secs(10);
+        while !cond() {
+            assert!(time::Instant::now() < deadline, "condition never met");
+            thread::sleep(time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn restore_status_after_fill_completes() {
+        let page = get_page_size();
+        let gm = test_guest_memory(false, 2 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        let file = snapshot_file(&[(0xd0, page), (0xd1, page)]);
+        let handler = TestHandler::spawn_fill(
+            uffd,
+            Box::new(FileUffdMemorySource::new(file.reopen().unwrap())),
+            served,
+        );
+
+        wait_for(|| handler.registry.is_done());
+        assert_eq!(handler.status(false), (false, false));
+        handler.handle.join().unwrap().unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0xd1);
+    }
+
+    #[test]
+    fn restore_status_while_fill_runs() {
+        let page = get_page_size();
+        let gm = test_guest_memory(false, 2 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        let file = snapshot_file(&[(0xe0, page), (0xe1, page)]);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let handler = TestHandler::spawn_fill(
+            uffd,
+            Box::new(GatedSource {
+                inner: FileUffdMemorySource::new(file.reopen().unwrap()),
+                entered: entered_tx,
+                go: go_rx,
+            }),
+            served,
+        );
+
+        // The fill is held on its first page.
+        entered_rx.recv().unwrap();
+        assert_eq!(handler.status(false), (true, false));
+        go_tx.send(()).unwrap();
+        entered_rx.recv().unwrap();
+        assert_eq!(handler.status(false), (true, false));
+        go_tx.send(()).unwrap();
+
+        handler.handle.join().unwrap().unwrap();
+        let (registry, failed) = (&handler.registry, &handler.prefault_failed);
+        assert_eq!(restore_status(false, registry, failed), (false, false));
+    }
+
+    #[test]
+    fn restore_status_after_fill_fails() {
+        let page = get_page_size();
+        let gm = test_guest_memory(false, 2 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        let handler = TestHandler::spawn_fill(uffd, Box::new(FailingSource), served);
+
+        wait_for(|| handler.prefault_failed.load(Ordering::Acquire));
+        assert_eq!(handler.status(false), (false, true));
+        // The handler goes on serving demand faults after abandoning the fill.
+        assert!(!handler.handle.is_finished());
+        assert!(!handler.registry.is_done());
+        handler.stop.write(1).unwrap();
+        handler.handle.join().unwrap().unwrap();
+        let (registry, failed) = (&handler.registry, &handler.prefault_failed);
+        assert_eq!(restore_status(false, registry, failed), (false, true));
+    }
+
+    #[test]
+    fn restore_status_after_demand_fault_fails() {
+        let page = get_page_size();
+        let gm = test_guest_memory(false, 2 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        // No background fill: only a guest fault reaches the failing source.
+        let handler = TestHandler::spawn_with(
+            uffd,
+            Box::new(FailingSource),
+            served,
+            Arc::new(Mutex::new(())),
+            false,
+        );
+        assert_eq!(handler.status(false), (true, false));
+
+        // Fault the page in the kernel rather than with a load: the page is
+        // poisoned on failure, so a load would deliver SIGBUS to the test
+        // process while a write(2) from it just returns EFAULT.
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe() writes.
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(ret, 0);
+        let addr = gm.get_host_address(GuestAddress(0)).unwrap();
+        // SAFETY: `addr` is a mapped guest page; a failed read of it is the point.
+        let ret = unsafe { libc::write(fds[1], addr as *const libc::c_void, 1) };
+        assert_eq!(ret, -1, "write from a poisoned page must fail");
+        // SAFETY: both descriptors were opened above and are closed once.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        wait_for(|| handler.prefault_failed.load(Ordering::Acquire));
+        assert_eq!(handler.status(false), (false, true));
+        assert!(!handler.registry.is_done());
+        handler.stop.write(1).unwrap();
+        handler.handle.join().unwrap().ok();
+    }
+
+    #[test]
+    fn restore_status_copy_on_access_is_not_restoring() {
+        let page = get_page_size();
+        let gm = test_guest_memory(false, 2 * page);
+        let Some(uffd) = register_uffd(&gm) else {
+            return;
+        };
+        let served: Arc<[AtomicBitmap]> = new_served_bitmap(uffd.ranges()).into();
+        let file = snapshot_file(&[(0xf0, page), (0xf1, page)]);
+        let handler = TestHandler::spawn(uffd, file.reopen().unwrap(), served, true);
+
+        assert_eq!(handler.status(true), (false, false));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xf0);
+        assert_eq!(handler.status(true), (false, false));
+        // Even a failed copy-on-access handler reports neither.
+        assert_eq!(
+            restore_status(true, &handler.registry, &AtomicBool::new(true)),
+            (false, false)
+        );
+        handler.stop();
     }
 }

@@ -337,6 +337,9 @@ pub enum ValidationError {
     /// Disk guest_block_size is not a power of 2 within the supported range
     #[error("Disk guest_block_size must be a power of 2 between 512 and 65536: {0}")]
     InvalidGuestBlockSize(u32),
+    /// Disk iouring_max_workers has a limit outside 1..=i32::MAX
+    #[error("Disk iouring_max_workers limits must be between 1 and 2147483647: {0}:{1}")]
+    InvalidIoUringMaxWorkers(u32 /* bounded */, u32 /* unbounded */),
     /// Need shared memory for vfio-user
     #[error("Using user devices requires using shared memory or huge pages")]
     UserDevicesRequireSharedMemory,
@@ -458,6 +461,9 @@ pub enum ValidationError {
     /// The vhost-user backend provides the virtio config space
     #[error("guest_block_size is not supported with vhost-user")]
     VhostUserGuestBlockSizeNotSupported,
+    /// The vhost-user backend owns the disk's I/O threads
+    #[error("iouring_max_workers is not supported with vhost-user")]
+    VhostUserIoUringMaxWorkersNotSupported,
     /// The specified I/O port was invalid. It should be provided in hex, such as `0xe9`.
     #[cfg(target_arch = "x86_64")]
     #[error("The IO port was not properly provided in hex or a `0x` prefix is missing: {0}")]
@@ -498,6 +504,9 @@ pub enum ValidationError {
     /// Prefault requires the eager-copy restore mode
     #[error("'prefault' requires 'memory_restore_mode=copy'")]
     InvalidRestorePrefaultWithOnDemand,
+    /// Copy-on-access restore cannot keep pages private with KSM merging them
+    #[error("'memory_restore_mode=copyonaccess' is not supported with 'mergeable=on' memory")]
+    InvalidRestoreCopyOnAccessWithMergeable,
     /// Postcopy and on-demand restore are not supported with some devices
     #[error("Postcopy and on-demand restore are not supported with {0} devices")]
     PostcopyIncompatibleDevice(String),
@@ -1640,7 +1649,8 @@ impl DiskConfig {
         queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
         serial=<serial_number>,backing_files=on|off,sparse=on|off,\
         image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
-        guest_block_size=<size_in_bytes>\"";
+        guest_block_size=<size_in_bytes>,\
+        iouring_max_workers=<bounded>:<unbounded>\"";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1663,6 +1673,7 @@ impl DiskConfig {
             .add("image_type")
             .add("lock_granularity")
             .add("guest_block_size")
+            .add("iouring_max_workers")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
 
         parser.parse(disk).map_err(Error::ParseDisk)?;
@@ -1741,6 +1752,10 @@ impl DiskConfig {
             .convert::<u32>("guest_block_size")
             .map_err(Error::ParseDisk)?;
 
+        let iouring_max_workers = parser
+            .convert::<IoWorkerLimits>("iouring_max_workers")
+            .map_err(Error::ParseDisk)?;
+
         let rate_limiter_config = (rate_limiter_config.bandwidth.is_some()
             || rate_limiter_config.ops.is_some())
         .then_some(rate_limiter_config);
@@ -1772,6 +1787,7 @@ impl DiskConfig {
             image_type,
             lock_granularity,
             guest_block_size,
+            iouring_max_workers,
         })
     }
 
@@ -1818,6 +1834,23 @@ impl DiskConfig {
 
         if self.vhost_user && self.guest_block_size.is_some() {
             return Err(ValidationError::VhostUserGuestBlockSizeNotSupported);
+        }
+
+        if self.vhost_user && self.iouring_max_workers.is_some() {
+            return Err(ValidationError::VhostUserIoUringMaxWorkersNotSupported);
+        }
+
+        // The kernel reads a zero as "leave unchanged" and refuses a value
+        // above INT_MAX.
+        if let Some(limits) = self.iouring_max_workers
+            && [limits.bounded, limits.unbounded]
+                .iter()
+                .any(|&n| n == 0 || n > i32::MAX as u32)
+        {
+            return Err(ValidationError::InvalidIoUringMaxWorkers(
+                limits.bounded,
+                limits.unbounded,
+            ));
         }
 
         if self.rate_limiter_config.is_some() && self.rate_limit_group.is_some() {
@@ -3068,6 +3101,21 @@ pub enum MemoryRestoreMode {
     /// Restore by mapping the snapshot memory file copy-on-write, sharing the
     /// page cache across VMs restored from the same snapshot.
     CopyOnWrite,
+    /// Restore lazily like `OnDemand`, but never copy the rest of the
+    /// snapshot in the background: each page is copied into the VM's own
+    /// memory only when it is first accessed, for the VM's whole lifetime.
+    /// VMs restored from the same snapshot share no guest memory page.
+    CopyOnAccess,
+}
+
+impl MemoryRestoreMode {
+    /// Whether this mode restores guest memory over userfaultfd.
+    pub fn uses_userfaultfd(self) -> bool {
+        matches!(
+            self,
+            Self::OnDemand | Self::OnDemandNoBackgroundFetchPages | Self::CopyOnAccess
+        )
+    }
 }
 
 #[derive(Debug, Error)]
@@ -3085,6 +3133,7 @@ impl FromStr for MemoryRestoreMode {
             "ondemand" => Ok(Self::OnDemand),
             "ondemand_no_background_fetch_pages" => Ok(Self::OnDemandNoBackgroundFetchPages),
             "copyonwrite" => Ok(Self::CopyOnWrite),
+            "copyonaccess" => Ok(Self::CopyOnAccess),
             _ => Err(MemoryRestoreModeParseError::InvalidValue(s.to_owned())),
         }
     }
@@ -3141,7 +3190,7 @@ pub struct RestoreConfig {
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot.\
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,\
-        memory_restore_mode=copy|ondemand|ondemand_no_background_fetch_pages|copyonwrite,\
+        memory_restore_mode=copy|ondemand|ondemand_no_background_fetch_pages|copyonwrite|copyonaccess,\
         external_fds=[net(<id>)@[<fd>,...],vfio(<id>)@[<fd>],iommu@[<fd>]],resume=true|false,\
         zone_updates=<list_of_updates>,\
         serial_file=<path>|serial_socket=<path>|serial_tcp=<ip>:<port>,\
@@ -3152,8 +3201,12 @@ impl RestoreConfig {
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, \
         `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd \
         support is unavailable, `memory_restore_mode=ondemand_no_background_fetch_pages` does the \
-        same without prefaulting pages in the background, and `memory_restore_mode=copyonwrite` \
-        maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise)\
+        same without prefaulting pages in the background, `memory_restore_mode=copyonwrite` \
+        maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise), \
+        and `memory_restore_mode=copyonaccess` demand-pages like `ondemand_no_background_fetch_pages` \
+        but never shares a page with another VM restored from the same snapshot; the snapshot \
+        must stay in place for the VM's lifetime, vhost-user backends keep the `ondemand` limits \
+        for it (PAGEFAULT, no reconnect) and vfio-user devices are refused\
         \n`external_fds` provides replacement file descriptors. `net(<id>)` entries replace \
         the FDs of network devices, `vfio(<id>)` entries replace VFIO cdev FDs, and `iommu` \
         provides the iommufd FD. \
@@ -3303,11 +3356,17 @@ impl RestoreConfig {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
         }
 
-        if matches!(
-            self.memory_restore_mode,
-            MemoryRestoreMode::OnDemand | MemoryRestoreMode::OnDemandNoBackgroundFetchPages
-        ) {
+        if self.memory_restore_mode.uses_userfaultfd() {
             vm_config.check_postcopy_incompatible_device()?;
+        }
+
+        // KSM merges identical pages across VMs, which is exactly the sharing
+        // copy-on-access restores exist to prevent.
+        if self.memory_restore_mode == MemoryRestoreMode::CopyOnAccess
+            && (vm_config.memory.mergeable
+                || vm_config.memory.zones.iter().flatten().any(|z| z.mergeable))
+        {
+            return Err(ValidationError::InvalidRestoreCopyOnAccessWithMergeable);
         }
 
         vm_config.validate_fds(&self.external_fds)?;
@@ -5619,6 +5678,7 @@ pub(crate) mod tests {
             image_type: ImageType::Unknown,
             lock_granularity: LockGranularityChoice::default(),
             guest_block_size: None,
+            iouring_max_workers: None,
         }
     }
 
@@ -5627,6 +5687,60 @@ pub(crate) mod tests {
             image_type: ImageType::Raw,
             ..disk_fixture()
         }
+    }
+
+    #[test]
+    fn test_disk_iouring_max_workers_parsing() -> Result<()> {
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,iouring_max_workers=16:4")?,
+            DiskConfig {
+                iouring_max_workers: Some(IoWorkerLimits {
+                    bounded: 16,
+                    unbounded: 4,
+                }),
+                ..disk_fixture()
+            }
+        );
+        // Unset unless given.
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file")?.iouring_max_workers,
+            None
+        );
+        for bad in ["16", "16:", "a:4", "16:-1", "16:4:1"] {
+            DiskConfig::parse(&format!("path=/path/to_file,iouring_max_workers={bad}"))
+                .unwrap_err();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_iouring_max_workers_serde() {
+        // A config saved before the field existed (a snapshot, or a client
+        // that does not know it) still loads, with the field unset.
+        let old: DiskConfig =
+            serde_json::from_str(r#"{"path":"/path/to_file","num_queues":2,"queue_size":256}"#)
+                .unwrap();
+        assert_eq!(old.iouring_max_workers, None);
+        // An unset field is left out, as before.
+        assert!(
+            !serde_json::to_string(&old)
+                .unwrap()
+                .contains("iouring_max_workers")
+        );
+
+        let capped = DiskConfig {
+            iouring_max_workers: Some(IoWorkerLimits {
+                bounded: 16,
+                unbounded: 4,
+            }),
+            ..disk_fixture()
+        };
+        let json = serde_json::to_value(&capped).unwrap();
+        assert_eq!(
+            json["iouring_max_workers"],
+            serde_json::json!({"bounded": 16, "unbounded": 4})
+        );
+        assert_eq!(serde_json::from_value::<DiskConfig>(json).unwrap(), capped);
     }
 
     #[test]
@@ -7022,6 +7136,19 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             // SAFETY: This input contains no inherited descriptors.
             unsafe {
+                RestoreConfig::parse(
+                    "source_url=/path/to/snapshot,memory_restore_mode=copyonaccess",
+                )
+            }?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                memory_restore_mode: MemoryRestoreMode::CopyOnAccess,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
                 RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")
             }?,
             RestoreConfig {
@@ -7127,6 +7254,19 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
     }
 
     #[test]
+    fn test_memory_restore_mode_uses_userfaultfd() {
+        assert!(!MemoryRestoreMode::Copy.uses_userfaultfd());
+        assert!(MemoryRestoreMode::OnDemand.uses_userfaultfd());
+        assert!(MemoryRestoreMode::OnDemandNoBackgroundFetchPages.uses_userfaultfd());
+        assert!(!MemoryRestoreMode::CopyOnWrite.uses_userfaultfd());
+        assert!(MemoryRestoreMode::CopyOnAccess.uses_userfaultfd());
+        assert_eq!(
+            "CopyOnAccess".parse::<MemoryRestoreMode>().unwrap(),
+            MemoryRestoreMode::CopyOnAccess
+        );
+    }
+
+    #[test]
     fn test_restore_config_serde() {
         assert_eq!(
             serde_json::from_str::<RestoreConfig>(r#"{"source_url":"/path/to/snapshot"}"#)
@@ -7149,6 +7289,18 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             .unwrap()
             .memory_restore_mode,
             MemoryRestoreMode::OnDemandNoBackgroundFetchPages
+        );
+        assert_eq!(
+            serde_json::from_str::<RestoreConfig>(
+                r#"{"source_url":"/path/to/snapshot","memory_restore_mode":"CopyOnAccess"}"#
+            )
+            .unwrap()
+            .memory_restore_mode,
+            MemoryRestoreMode::CopyOnAccess
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryRestoreMode::CopyOnAccess).unwrap(),
+            serde_json::json!("CopyOnAccess")
         );
         assert_eq!(
             serde_json::from_str::<RestoreConfig>(
@@ -7409,6 +7561,74 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_cow_prefault.validate(&snapshot_vm_config),
             Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
         );
+
+        let invalid_coa_prefault = RestoreConfig {
+            prefault: true,
+            memory_restore_mode: MemoryRestoreMode::CopyOnAccess,
+            ..invalid_cow_prefault.clone()
+        };
+        assert_eq!(
+            invalid_coa_prefault.validate(&snapshot_vm_config),
+            Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
+        );
+
+        // Copy-on-access refuses the devices on-demand restore refuses.
+        let coa_config = RestoreConfig {
+            memory_restore_mode: MemoryRestoreMode::CopyOnAccess,
+            ..another_valid_config.clone()
+        };
+        coa_config.validate(&snapshot_vm_config).unwrap();
+        let mut vfio_vm_config = snapshot_vm_config.clone();
+        vfio_vm_config.devices = Some(vec![device_fixture()]);
+        for mode in [MemoryRestoreMode::OnDemand, MemoryRestoreMode::CopyOnAccess] {
+            let config = RestoreConfig {
+                memory_restore_mode: mode,
+                ..another_valid_config.clone()
+            };
+            assert_eq!(
+                config.validate(&vfio_vm_config),
+                Err(ValidationError::PostcopyIncompatibleDevice(
+                    "VFIO".to_owned()
+                ))
+            );
+        }
+        // A vfio-user server maps guest memory without the handler.
+        let mut user_device_vm_config = snapshot_vm_config.clone();
+        user_device_vm_config.user_devices = Some(vec![UserDeviceConfig {
+            pci_common: PciDeviceCommonConfig::default(),
+            socket: PathBuf::from("/path/to/socket"),
+        }]);
+        assert_eq!(
+            coa_config.validate(&user_device_vm_config),
+            Err(ValidationError::PostcopyIncompatibleDevice(
+                "vfio-user".to_owned()
+            ))
+        );
+
+        // KSM would merge the pages copy-on-access keeps private, globally
+        // or in any zone; on-demand restore does not care.
+        let mut mergeable_vm_config = snapshot_vm_config.clone();
+        mergeable_vm_config.memory.mergeable = true;
+        assert_eq!(
+            coa_config.validate(&mergeable_vm_config),
+            Err(ValidationError::InvalidRestoreCopyOnAccessWithMergeable)
+        );
+        let mut mergeable_zone_vm_config = snapshot_vm_config.clone();
+        mergeable_zone_vm_config.memory.zones = Some(vec![MemoryZoneConfig {
+            id: "mem0".to_string(),
+            size: 1 << 30,
+            mergeable: true,
+            ..Default::default()
+        }]);
+        assert_eq!(
+            coa_config.validate(&mergeable_zone_vm_config),
+            Err(ValidationError::InvalidRestoreCopyOnAccessWithMergeable)
+        );
+        let ondemand_config = RestoreConfig {
+            memory_restore_mode: MemoryRestoreMode::OnDemand,
+            ..another_valid_config.clone()
+        };
+        ondemand_config.validate(&mergeable_vm_config).unwrap();
     }
 
     #[test]
@@ -8136,6 +8356,47 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ..raw_disk_fixture()
         }]);
         still_valid_config.validate().unwrap();
+
+        // A zero would leave that limit unchanged in the kernel, and the
+        // kernel refuses one above INT_MAX.
+        for (bounded, unbounded) in [(0, 4), (16, 0), (16, 1 << 31)] {
+            let mut invalid_config = valid_config.clone();
+            invalid_config.disks = Some(vec![DiskConfig {
+                iouring_max_workers: Some(IoWorkerLimits { bounded, unbounded }),
+                ..raw_disk_fixture()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::InvalidIoUringMaxWorkers(
+                    bounded, unbounded
+                ))
+            );
+        }
+
+        let mut still_valid_config = valid_config.clone();
+        still_valid_config.disks = Some(vec![DiskConfig {
+            iouring_max_workers: Some(IoWorkerLimits {
+                bounded: 1,
+                unbounded: i32::MAX as u32,
+            }),
+            ..raw_disk_fixture()
+        }]);
+        still_valid_config.validate().unwrap();
+
+        // The vhost-user backend, not Cloud Hypervisor, runs that disk's I/O.
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.disks = Some(vec![DiskConfig {
+            path: None,
+            vhost_user: true,
+            vhost_socket: Some("/path/to/sock".to_owned()),
+            iouring_max_workers: Some(IoWorkerLimits::DEFAULT),
+            ..disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::VhostUserIoUringMaxWorkersNotSupported)
+        );
 
         // The override is backend agnostic and accepted for non raw images.
         let mut still_valid_config = valid_config.clone();

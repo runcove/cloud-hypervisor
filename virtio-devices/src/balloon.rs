@@ -688,6 +688,24 @@ impl BalloonEpollHandler {
             self.process_stats_queue()
                 .map_err(|e| EpollHelperError::HandleEvent(anyhow!(e)))?;
         }
+
+        // The same holds for the inflate, deflate and reporting queues: a chain
+        // the guest made available before the snapshot has no kick after the
+        // restore, and a guest that waits for it (Linux's free page reporting
+        // worker waits for the used buffer without a timeout) never continues.
+        // Drain them like their queue events would, once the device is not
+        // paused, as the epoll loop does not process anything while paused
+        // either. An empty queue is left alone and signals nothing.
+        pause_common.wait_if_paused();
+        self.process_queue(INFLATE_QUEUE)
+            .map_err(|e| EpollHelperError::HandleEvent(anyhow!(e)))?;
+        self.process_queue(DEFLATE_QUEUE)
+            .map_err(|e| EpollHelperError::HandleEvent(anyhow!(e)))?;
+        if let Some(reporting_queue_index) = self.reporting_queue_index {
+            self.process_reporting_queue(reporting_queue_index)
+                .map_err(|e| EpollHelperError::HandleEvent(anyhow!(e)))?;
+        }
+
         helper.run(pause_common, self)?;
 
         Ok(())
@@ -1126,6 +1144,13 @@ impl Migratable for Balloon {}
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::AtomicU8;
+    use std::thread;
+    use std::time::Duration;
+
     use vm_virtio::queue::testing::VirtQueue;
 
     use super::*;
@@ -1711,5 +1736,259 @@ mod tests {
                 .unwrap(),
             Some(cached)
         );
+    }
+
+    /// Records which queues the device signalled.
+    #[derive(Default)]
+    struct RecordingInterrupt {
+        queues: Mutex<Vec<u16>>,
+    }
+
+    impl VirtioInterrupt for RecordingInterrupt {
+        fn trigger(&self, int_type: VirtioInterruptType) -> io::Result<()> {
+            if let VirtioInterruptType::Queue(index) = int_type {
+                self.queues.lock().unwrap().push(index);
+            }
+            Ok(())
+        }
+
+        fn set_notifier(
+            &self,
+            _int_type: u32,
+            _notifier: Option<EventFd>,
+            _vm: &dyn hypervisor::Vm,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const START_REGION_SIZE: usize = 0x4_0000;
+    const START_REPORT_ADDRESS: GuestAddress = GuestAddress(0x1_0000);
+    const START_INFLATE_ADDRESS: GuestAddress = GuestAddress(0x2_0000);
+    const START_PFN_ADDRESS: GuestAddress = GuestAddress(0x8000);
+
+    /// A balloon handler on guest memory backed by a MAP_SHARED memfd, with
+    /// the inflate, deflate and reporting queues (indexes 0, 1 and 2) laid
+    /// out in that memory the way a guest leaves them: the chains in
+    /// `pending` are in the available ring and no event was ever delivered.
+    struct StartFixture {
+        memory: TestMemory,
+        file: File,
+        guest_queues: Vec<VirtQueue<'static, TestMemory>>,
+        handler: BalloonEpollHandler,
+        interrupt: Arc<RecordingInterrupt>,
+        page_size: usize,
+    }
+
+    fn start_fixture(pending: [bool; 3]) -> StartFixture {
+        use vm_memory::{FileOffset, MmapRegion};
+
+        // SAFETY: memfd_create has no memory-safety preconditions here.
+        let fd = unsafe { libc::memfd_create(c"balloon-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create: {}", io::Error::last_os_error());
+        // SAFETY: fd was just created and nothing else owns it.
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(START_REGION_SIZE as u64).unwrap();
+        let mmap = MmapRegion::build(
+            Some(FileOffset::new(file.try_clone().unwrap(), 0)),
+            START_REGION_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+        )
+        .unwrap();
+        let region = vm_memory::GuestRegionMmap::new(mmap, GuestAddress(0))
+            .unwrap()
+            .into();
+        let memory = TestMemory::from_regions(vec![region]).unwrap();
+        // Leak the memory handle the queue layout borrows: a test process
+        // exits right after, and it keeps the layout 'static.
+        let layout_memory: &'static TestMemory = Box::leak(Box::new(memory.clone()));
+
+        let page_size = get_page_size() as usize;
+        let pfns_per_page = page_size / VIRTIO_BALLOON_PAGE_SIZE;
+        let mut guest_queues = Vec::new();
+        let mut queues = Vec::new();
+        for (index, has_chain) in pending.into_iter().enumerate() {
+            let guest_queue =
+                VirtQueue::new(GuestAddress(0x1000 * (index as u64 + 1)), layout_memory, 16);
+            if has_chain {
+                let (addr, len) = match index {
+                    0 => (START_PFN_ADDRESS.0, pfns_per_page * size_of::<u32>()),
+                    // Deflate's content is not interpreted.
+                    1 => (START_PFN_ADDRESS.0 + 0x800, size_of::<u32>()),
+                    _ => (START_REPORT_ADDRESS.0, page_size),
+                };
+                guest_queue.dtable[0].set(addr, len as u32, 0, 0);
+                guest_queue.avail.ring[0].set(0);
+                guest_queue.avail.idx.set(1);
+            }
+            queues.push(guest_queue.create_queue());
+            guest_queues.push(guest_queue);
+        }
+        for index in 0..pfns_per_page {
+            let pfn = (START_INFLATE_ADDRESS.0 >> VIRTIO_BALLOON_PFN_SHIFT) as u32 + index as u32;
+            memory
+                .write_obj(
+                    pfn,
+                    START_PFN_ADDRESS.unchecked_add((index * size_of::<u32>()) as u64),
+                )
+                .unwrap();
+        }
+        // The pages the report and the inflate request name hold data, so
+        // that releasing them is visible.
+        for address in [START_REPORT_ADDRESS, START_INFLATE_ADDRESS] {
+            memory.write_slice(&vec![0xa5; page_size], address).unwrap();
+        }
+
+        let interrupt = Arc::new(RecordingInterrupt::default());
+        let handler = BalloonEpollHandler {
+            mem: GuestMemoryAtomic::new(memory.clone()),
+            queues,
+            interrupt_cb: Arc::clone(&interrupt) as Arc<dyn VirtioInterrupt>,
+            inflate_queue_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            deflate_queue_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            stats_handler: None,
+            reporting_queue_evt: Some(EventFd::new(EFD_NONBLOCK).unwrap()),
+            reporting_queue_index: Some(2),
+            kill_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            pause_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            pbp: None,
+            access_platform: None,
+        };
+        StartFixture {
+            memory,
+            file,
+            guest_queues,
+            handler,
+            interrupt,
+            page_size,
+        }
+    }
+
+    impl StartFixture {
+        fn read(&self, address: GuestAddress) -> Vec<u8> {
+            let mut data = vec![0xff; self.page_size];
+            self.memory.read_slice(&mut data, address).unwrap();
+            data
+        }
+
+        fn allocated_bytes(&self) -> u64 {
+            self.file.metadata().unwrap().blocks() * 512
+        }
+    }
+
+    // No event is delivered in any of these tests: the kill event is already
+    // set, so `run` returns as soon as it has done its start-up work and
+    // reached its loop.
+    #[test]
+    fn run_drains_queues_already_available_at_start() {
+        for pending in [
+            [true, true, true],
+            [true, false, false],
+            [false, true, false],
+            [false, false, true],
+        ] {
+            let mut fixture = start_fixture(pending);
+            let page_size = fixture.page_size;
+            let before = fixture.allocated_bytes();
+            assert!(before >= 2 * page_size as u64);
+            fixture.handler.kill_evt.write(1).unwrap();
+
+            fixture
+                .handler
+                .run(&PauseCommon::new(false).unwrap())
+                .unwrap();
+
+            for (index, has_chain) in pending.into_iter().enumerate() {
+                assert_eq!(
+                    fixture.guest_queues[index].used.idx.get(),
+                    u16::from(has_chain),
+                    "used ring of queue {index}, pending {pending:?}"
+                );
+            }
+            // Each queue is signalled once, and only if it had a chain.
+            let signalled = fixture.interrupt.queues.lock().unwrap().clone();
+            let expected: Vec<u16> = (0..3u16).filter(|i| pending[usize::from(*i)]).collect();
+            assert_eq!(signalled, expected, "pending {pending:?}");
+            // The reported range and the inflated page are released: the
+            // memfd gives their blocks back (measured before they are read,
+            // as reading a hole in a shared mapping allocates a page) and
+            // they read back as zero.
+            let freed_pages = u64::from(pending[0]) + u64::from(pending[2]);
+            assert_eq!(
+                before - fixture.allocated_bytes(),
+                freed_pages * page_size as u64,
+                "pending {pending:?}"
+            );
+            let released = |address| fixture.read(address).iter().all(|byte| *byte == 0);
+            assert_eq!(released(START_REPORT_ADDRESS), pending[2]);
+            assert_eq!(released(START_INFLATE_ADDRESS), pending[0]);
+        }
+    }
+
+    #[test]
+    fn run_signals_nothing_when_no_queue_has_a_chain_at_start() {
+        let mut fixture = start_fixture([false, false, false]);
+        let before = fixture.allocated_bytes();
+        fixture.handler.kill_evt.write(1).unwrap();
+
+        fixture
+            .handler
+            .run(&PauseCommon::new(false).unwrap())
+            .unwrap();
+
+        for guest_queue in &fixture.guest_queues {
+            assert_eq!(guest_queue.used.idx.get(), 0);
+        }
+        assert!(fixture.interrupt.queues.lock().unwrap().is_empty());
+        assert_eq!(fixture.allocated_bytes(), before);
+    }
+
+    #[test]
+    fn run_waits_for_resume_before_draining_at_start() {
+        let StartFixture {
+            handler,
+            guest_queues,
+            interrupt,
+            ..
+        } = start_fixture([true, true, true]);
+        let mut handler = handler;
+        handler.kill_evt.write(1).unwrap();
+
+        // A device restored paused: its worker is spawned the way activate()
+        // spawns it, while a pause is requested.
+        let mut common = VirtioCommon::new(true).unwrap();
+        common
+            .activate(&[], Arc::clone(&interrupt) as Arc<dyn VirtioInterrupt>)
+            .unwrap();
+        let exit_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        common
+            .spawn_worker(
+                "balloon_start_test",
+                &SeccompAction::Allow,
+                Thread::VirtioBalloon,
+                &exit_evt,
+                Arc::new(AtomicU8::new(0)),
+                Arc::clone(&interrupt) as Arc<dyn VirtioInterrupt>,
+                move |pause_common| handler.run(pause_common),
+            )
+            .unwrap();
+
+        // A device restored paused must not touch guest memory or signal
+        // until it is resumed.
+        thread::sleep(Duration::from_millis(200));
+        for guest_queue in &guest_queues {
+            assert_eq!(guest_queue.used.idx.get(), 0);
+        }
+        assert!(interrupt.queues.lock().unwrap().is_empty());
+
+        common.resume().unwrap();
+        common.wait_for_epoll_threads();
+
+        for guest_queue in &guest_queues {
+            assert_eq!(guest_queue.used.idx.get(), 1);
+        }
+        assert_eq!(*interrupt.queues.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(exit_evt.read().ok(), None);
     }
 }

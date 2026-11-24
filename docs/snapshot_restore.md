@@ -139,8 +139,48 @@ the background. If you don't want prefaulting to happen, use
 that the guest, the VMM or vhost-user backends access are populated. Be aware
 that the VM will stay in a "restoring" state indefinitely.
 
+`ondemand`, `ondemand_no_background_fetch_pages` and `copyonaccess` read the
+snapshot memory file without the kernel's readahead, which would read past the
+snapshot's data into the holes beside it and cache a zero page for each hole
+page. A page in a hole is resolved with zeroes without reading the file, in
+one of two ways. `ondemand` and `ondemand_no_background_fetch_pages` find the
+holes once, at restore, and resolve a first touch of a page wholly inside one
+as they do a page the guest discarded, with `UFFDIO_ZEROPAGE`: in private
+memory that maps the zero page every process shares, in `shared=on` memory it
+allocates a zeroed page, and on hugetlbfs, which does not support it, a page of
+zeroes is copied instead. `copyonaccess` looks the hole up when the page is
+first touched and always copies a page of zeroes, so the page is the VM's own.
+When pages are read in order (as the background copy of `ondemand` reads them),
+Cloud Hypervisor reads ahead itself, in windows of at most 512 KiB that stop at
+the end of the data they start in, so the host page cache holds no hole page. If
+the filesystem cannot report holes (`lseek` with `SEEK_DATA` or `SEEK_HOLE`
+fails), every page from then on is read from the file and the kernel's readahead
+is turned back on, so the page cache can then hold hole pages too.
+
 If the page source fails during the restore, the guest memory that was not
 restored yet is poisoned so that the guest cannot use it.
+
+`GET /api/v1/vm.info` reports the restore state in two booleans (both `false`
+when absent, as from an older Cloud Hypervisor):
+
+- `restoring` is `true` while an on-demand restore has not yet filled guest
+  memory, and turns `false` once the fill completes or fails. With
+  `ondemand_no_background_fetch_pages` nothing fills the rest of guest
+  memory, so it stays `true` unless the restore fails.
+- `restore_failed` is `true` once the restore can no longer complete: the
+  background fill was abandoned after an error, the page source failed to
+  serve a fault, or the fault handler exited with an error. Guest
+  memory is then incomplete for good: pages not yet restored exist only in
+  the snapshot.
+
+Both are always `false` for the other restore modes, including
+`copyonaccess`. While `restoring` is `true`, `vm.snapshot` and
+`vm.send-migration` return 409 Conflict and can be retried once the fill
+completes. Once `restore_failed` is `true` they keep returning 409 Conflict,
+with their own message so that a caller stops retrying: `vm.snapshot` with
+"VM on-demand memory restore failed: guest memory is incomplete", and
+`vm.send-migration` with "An on-demand memory restore failed: guest memory is
+incomplete".
 
 Current constraints for `memory_restore_mode=ondemand` and
 `memory_restore_mode=ondemand_no_background_fetch_pages`:
@@ -180,12 +220,29 @@ Current constraints for `memory_restore_mode=copyonwrite`:
 
 - Plain private guest RAM only. Anything else falls back to the eager copy
   (logged): `shared=on` or hugepages (global or per-zone), zones with
-  `host_numa_node`, `reserve`, `mergeable` or hotplug fields (a purely static
-  `id`+`size` zone is fine), resizable RAM (`hotplug_size`, virtio-mem), KSM
-  (`mergeable=on`), `--pvmemcontrol`, device passthrough
+  `host_numa_node`, `reserve` or `mergeable` (a purely static `id`+`size`
+  zone is fine), ACPI memory hotplug (`hotplug_size` or `hotplugged_size`,
+  global or per-zone, with `hotplug_method=acpi`), plugged virtio-mem memory
+  (see below), KSM (`mergeable=on`), `--pvmemcontrol`, device passthrough
   (`--device`/`--user-device`/`--vdpa`), and snapshot ranges that are not
-  page-aligned single-region extents. Each region's `reserve` policy and the
-  THP policy are re-applied to the mapped region.
+  page-aligned single-region extents or that overlap each other (only a
+  malformed snapshot has them). Each region's `reserve` policy and the THP
+  policy are re-applied to the mapped region.
+- Holes in the snapshot memory file are remapped as private anonymous memory,
+  so a guest touching memory the snapshot never used does not fill the host
+  page cache with zeroes. Only holes of at least 64 KiB (after page-aligning
+  them inward) are remapped, at most 8192 per restore: the holes of all saved
+  ranges compete, and the largest win. Smaller holes and those over the
+  budget stay mapped from the file, as does a whole range when the
+  filesystem cannot report holes (`SEEK_HOLE`). If remapping a hole fails
+  (for example at `vm.max_map_count`), it and every hole not yet remapped
+  stay mapped from the file and the restore continues. The restore logs a
+  summary of the holes found, remapped and skipped.
+- virtio-mem hotplug (`hotplug_method=virtio-mem`, global or per-zone) is
+  supported while nothing is plugged: `hotplugged_size` unset or 0 in the
+  global config and in every zone. A non-zero `hotplugged_size` falls back to
+  the eager copy. Memory can be plugged and unplugged normally after the
+  restore.
 - A snapshot memory file shorter than the saved ranges is rejected up front (it
   would otherwise fault `SIGBUS` at run time).
 - `prefault` is rejected.
@@ -203,6 +260,26 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   content in a page that returns from the balloon, so this is correct.
   (`pvmemcontrol` differs: it issues operations that are only valid on
   anonymous memory, which is why it is on the fallback list above.)
+- Free page reporting (`free_page_reporting=on`) also releases reported pages
+  with `MADV_DONTNEED`, so a reported page reads back the snapshot's content
+  rather than zeroes. Only a guest that expects freed pages to keep a known
+  value (zeroes with `init_on_free=1`, a poison pattern with page poisoning)
+  could notice. Cloud Hypervisor does not offer
+  `VIRTIO_BALLOON_F_PAGE_POISON`, and without it Linux does not negotiate
+  `VIRTIO_BALLOON_F_REPORTING` when either option is enabled
+  (`virtballoon_validate()` in `drivers/virtio/virtio_balloon.c`, since Linux
+  5.8 and 5.7.5). Every other guest makes no assumption about the content of
+  free pages, so reporting stays correct.
+- virtio-mem also discards unplugged blocks with `MADV_DONTNEED`, but there
+  the private file mapping is not acceptable: a block that is unplugged and
+  later plugged again would read back the snapshot's old content instead of
+  zeroes, unlike after an eager-copy restore. The virtio-mem region is
+  therefore never mapped from the snapshot file. With nothing plugged it has
+  no saved ranges, so it stays anonymous memory. A `hotplugged_size` of 0 only
+  records the size that was requested, not that the guest had finished
+  unplugging when the snapshot was taken, so restore also checks the saved
+  ranges themselves: if any of them lies inside a virtio-mem region, the whole
+  restore falls back to the eager copy (logged).
 - A snapshot of a VM restored this way copies the restore source with a
   reflink and then writes only the pages that changed since the restore.
   For this, the snapshot and the restore source must be on the same
@@ -214,6 +291,77 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   is created. Every page becomes a private copy: the VM stays correct, but the
   page-cache sharing is lost for that VM and host memory use grows to the
   eager-copy level. The same applies to `ondemand` restores.
+
+### Copy-on-access restore
+
+With `memory_restore_mode=copyonaccess`, restore uses `userfaultfd` exactly as
+`ondemand` does, but never copies the rest of the snapshot in the background:
+a page is copied into the VM's own memory only when the guest (or a device, or
+KVM on its behalf) first accesses it, for the VM's whole lifetime. VMs restored
+from the same snapshot therefore share no guest memory page, unlike
+`copyonwrite`, while each VM uses host memory only for the pages it touched.
+This works with `shared=on` memory as well as private memory. The one
+exception is a memory zone with `file=` that the restored VMs reuse: each VM
+maps that same backing file, so with `shared=on` the zone's memory is shared
+between them, and a write by one VM is visible to the others.
+
+`ondemand_no_background_fetch_pages` also skips the background copy. The
+differences are the ones below that keep pages private (a discarded page gets
+a zeroed copy of its own, not the zero page every process shares; KSM is
+refused), and that a copy-on-access VM is not left "restoring": it can be
+snapshotted.
+
+It has every constraint of `ondemand`, and:
+
+- The snapshot memory file must remain on disk **and unchanged** for the
+  entire lifetime of the VM: the handler keeps it open and reads a page from it
+  whenever the guest first touches that page, however late. A read error is a
+  controlled VM exit, with the unrestored memory poisoned.
+- `mergeable=on` (KSM), globally or in any zone, is rejected: KSM would merge
+  the pages this mode keeps private. Only that option is checked: keeping KSM
+  off for a Cloud Hypervisor process that inherits
+  `prctl(PR_SET_MEMORY_MERGE)` from whatever started it is the operator's
+  responsibility.
+- Only the saved memory ranges are handled by `userfaultfd`. Guest RAM outside
+  them (memory the snapshot did not save, or memory hot-plugged later) is
+  ordinary memory: in private RAM, a page there that the guest reads before
+  writing maps the kernel's shared zero page. That page holds no data of any
+  VM, so sharing it is accepted.
+- If any saved memory range lies inside a virtio-mem region (a block still
+  plugged when the snapshot was taken), the whole restore falls back to the
+  eager copy (logged), as `copyonwrite` does: a block unplugged before it was
+  touched and later plugged again would otherwise read back the snapshot's old
+  content instead of zeroes. With nothing plugged, the virtio-mem region has no
+  saved ranges and copy-on-access applies; memory can be plugged and unplugged
+  normally after the restore.
+- A page the guest discards after touching it (balloon inflation, free page
+  reporting, virtio-mem unplug) reads back as zeroes when touched again, as
+  after an eager-copy restore.
+- A page outside virtio-mem that the guest discards before ever touching it
+  (balloon inflation, free page reporting) is not zeroed: Cloud Hypervisor does
+  not see a discard of a page that is not in memory. It reads back the
+  snapshot's content when first touched, as with `ondemand` before its
+  background copy reaches it, and a later snapshot of the VM saves that
+  content too.
+- Snapshotting the VM is supported and does not copy the pages the guest never
+  touched into it: those are copied from the snapshot it was restored from. The
+  new snapshot is complete and can be restored in any mode. Pages that were
+  touched and then discarded are faulted back in as zeroes while the snapshot is
+  written, unless guest memory is `shared=on` without hugepages.
+- Live and local migration are rejected: they do not read the restore source.
+- vhost-user backends are served by the same handler for the VM's whole
+  lifetime, as during an `ondemand` restore, so the limits `ondemand` has only
+  until its background copy completes last as long as the VM: every
+  vhost-user backend, including one hot-plugged later, must support
+  `VHOST_USER_PROTOCOL_F_PAGEFAULT`; a backend that disconnects cannot
+  reconnect (the device stays disconnected); and adding a memory region (ACPI
+  memory hot-plug) is refused while the VM has a vhost-user device.
+- vfio-user devices are rejected, at restore and on hot-plug: the vfio-user
+  server maps guest memory in its own process, where the handler does not
+  serve it, so a page the guest never touched would read as zeroes there.
+- A device that is hot-plugged after the restore and pins guest memory (VFIO,
+  vDPA) accesses every page, so the VM ends up using as much memory as an
+  eager copy.
 
 ## Restore a VM with new external FDs
 

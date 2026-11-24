@@ -22,6 +22,8 @@ mod refcount;
 mod test_util;
 mod util;
 mod vec_cache;
+#[cfg(test)]
+mod zero_tests;
 
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
@@ -428,6 +430,22 @@ mod tests {
         let file = make_qcow_file();
         let disk = QcowDisk::new(file, false, false, true, true).unwrap();
         assert_async_io(&disk, true);
+    }
+
+    #[cfg(feature = "io_uring")]
+    #[test]
+    fn io_uring_backend_caps_its_workers() {
+        use crate::async_io::IoWorkerLimits;
+
+        let disk = QcowDisk::new(make_qcow_file(), false, false, true, true).unwrap();
+        let io = &mut *disk.create_async_io(128).unwrap();
+        io.set_io_worker_limits(IoWorkerLimits::DEFAULT).unwrap();
+        // The limits reach the ring: one the kernel refuses is an error.
+        io.set_io_worker_limits(IoWorkerLimits {
+            bounded: 16,
+            unbounded: u32::MAX,
+        })
+        .unwrap_err();
     }
 
     #[test]

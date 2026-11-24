@@ -237,6 +237,22 @@ mod tests {
         assert_io_uring_backend(&disk);
     }
 
+    #[cfg(feature = "io_uring")]
+    #[test]
+    fn io_uring_backend_caps_its_workers() {
+        use crate::async_io::IoWorkerLimits;
+
+        let disk = RawDisk::new(make_raw_file(), RawBackend::IoUring, false);
+        let io = &mut *disk.create_async_io(128).unwrap();
+        io.set_io_worker_limits(IoWorkerLimits::DEFAULT).unwrap();
+        // The limits reach the ring: one the kernel refuses is an error.
+        io.set_io_worker_limits(IoWorkerLimits {
+            bounded: 16,
+            unbounded: u32::MAX,
+        })
+        .unwrap_err();
+    }
+
     fn assert_try_clone(disk: &RawDisk, expect_backend: RawBackend) {
         let cloned = disk.try_clone().unwrap();
         assert_async_io_from_dyn(cloned.as_ref(), expect_backend);
