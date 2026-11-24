@@ -142,6 +142,28 @@ that the VM will stay in a "restoring" state indefinitely.
 If the page source fails during the restore, the guest memory that was not
 restored yet is poisoned so that the guest cannot use it.
 
+`GET /api/v1/vm.info` reports the restore state in two booleans (both `false`
+when absent, as from an older Cloud Hypervisor):
+
+- `restoring` is `true` while an on-demand restore has not yet filled guest
+  memory, and turns `false` once the fill completes or fails. With
+  `ondemand_no_background_fetch_pages` nothing fills the rest of guest
+  memory, so it stays `true` unless the restore fails.
+- `restore_failed` is `true` once the restore can no longer complete: the
+  background fill was abandoned after an error, the page source failed to
+  serve a fault, or the fault handler exited with an error. Guest
+  memory is then incomplete for good: pages not yet restored exist only in
+  the snapshot.
+
+Both are always `false` for the other restore modes, including
+`copyonaccess`. While `restoring` is `true`, `vm.snapshot` and
+`vm.send-migration` return 409 Conflict and can be retried once the fill
+completes. Once `restore_failed` is `true` they keep returning 409 Conflict,
+with their own message so that a caller stops retrying: `vm.snapshot` with
+"VM on-demand memory restore failed: guest memory is incomplete", and
+`vm.send-migration` with "An on-demand memory restore failed: guest memory is
+incomplete".
+
 Current constraints for `memory_restore_mode=ondemand` and
 `memory_restore_mode=ondemand_no_background_fetch_pages`:
 
