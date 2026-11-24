@@ -1063,10 +1063,19 @@ fn vcpu_thread_rules(
         (libc::SYS_munmap, vec![]),
         (libc::SYS_nanosleep, vec![]),
         (libc::SYS_newfstatat, vec![]),
+        // A vCPU thread opens nothing after start. open is read-only, as the
+        // default openat rule is (see get_seccomp_rules); openat2 is not
+        // allowed, as its flags are in memory seccomp cannot see.
         #[cfg(target_arch = "x86_64")]
-        (libc::SYS_open, vec![]),
-        (libc::SYS_openat, vec![]),
-        (libc::SYS_openat2, vec![]),
+        (
+            libc::SYS_open,
+            or![and![Cond::new(
+                1, // open() flags argument
+                ArgLen::Dword,
+                MaskedEq(READ_ONLY_OPEN_MASK),
+                libc::O_RDONLY as u64,
+            )?]],
+        ),
         (libc::SYS_pread64, vec![]),
         (libc::SYS_pwrite64, vec![]),
         (libc::SYS_pwritev2, vec![]),
@@ -1476,6 +1485,43 @@ mod tests {
         .unwrap()
     }
 
+    /// Like `openat_under_filter`, with the legacy open, which only x86_64
+    /// has.
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    fn open_under_filter(
+        thread_type: Thread,
+        hypervisor_type: Option<HypervisorType>,
+        cases: Vec<OpenCase>,
+    ) -> Vec<(&'static str, bool, Option<i32>)> {
+        let filter = get_seccomp_filter(
+            &SeccompAction::Errno(libc::EPERM as u32),
+            thread_type,
+            hypervisor_type,
+        )
+        .unwrap();
+        thread::spawn(move || {
+            // Allocated before the filter: not every thread's filter allows
+            // brk.
+            let mut results = Vec::with_capacity(cases.len());
+            apply_filter(&filter).unwrap();
+            for (name, path, flags) in &cases {
+                // SAFETY: path is a NUL-terminated string that outlives the
+                // call, and the mode is only read with O_CREAT or O_TMPFILE.
+                let fd =
+                    unsafe { libc::syscall(libc::SYS_open, path.as_ptr(), *flags, 0o600) } as i32;
+                let errno = io::Error::last_os_error().raw_os_error();
+                if fd >= 0 {
+                    // SAFETY: fd was just opened here.
+                    unsafe { libc::close(fd) };
+                }
+                results.push((*name, fd >= 0, errno));
+            }
+            results
+        })
+        .join()
+        .unwrap()
+    }
+
     fn c_path(path: &Path) -> CString {
         CString::new(path.as_os_str().as_bytes()).unwrap()
     }
@@ -1501,6 +1547,9 @@ mod tests {
         let missing = dir.path().join("missing");
 
         let threads = vec![
+            // The vCPU thread has no openat rule of its own either.
+            #[cfg(feature = "kvm")]
+            ("vcpu", Thread::Vcpu),
             // With heap profiling, main has an openat rule of its own.
             #[cfg(not(feature = "dhat-heap"))]
             ("main", Thread::Main),
@@ -1515,7 +1564,12 @@ mod tests {
 
         let mut wrong = Vec::new();
         for (thread_name, thread_type) in threads {
-            let rules = get_seccomp_rules(thread_type, None).unwrap();
+            #[cfg(feature = "kvm")]
+            let hypervisor_type =
+                matches!(thread_type, Thread::Vcpu).then_some(HypervisorType::Kvm);
+            #[cfg(not(feature = "kvm"))]
+            let hypervisor_type = None;
+            let rules = get_seccomp_rules(thread_type, hypervisor_type).unwrap();
             assert!(rules.iter().any(|(nr, _)| *nr == libc::SYS_exit));
             let cases = vec![
                 (
@@ -1548,7 +1602,7 @@ mod tests {
                     libc::O_RDONLY | libc::O_TMPFILE,
                 ),
             ];
-            for (name, opened, errno) in openat_under_filter(thread_type, None, cases) {
+            for (name, opened, errno) in openat_under_filter(thread_type, hypervisor_type, cases) {
                 let ok = match name {
                     "overcommit sysctl" | "musl read-only" | "directory" => opened,
                     _ => !opened && errno == Some(libc::EPERM),
@@ -1603,6 +1657,97 @@ mod tests {
             }
             assert!(created.exists(), "{thread_name}: create_new made no file");
         }
+    }
+
+    /// The vCPU thread has no openat2 rule (its flags are in memory, out of
+    /// seccomp's sight) and its legacy open rule checks the flags.
+    #[cfg(feature = "kvm")]
+    #[test]
+    fn test_vcpu_has_no_openat2_and_open_is_conditional() {
+        let rules = get_seccomp_rules(Thread::Vcpu, Some(HypervisorType::Kvm)).unwrap();
+        assert!(!rules.iter().any(|(nr, _)| *nr == libc::SYS_openat2));
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            rules
+                .iter()
+                .any(|(nr, r)| *nr == libc::SYS_open && !r.is_empty())
+        );
+    }
+
+    /// A raw legacy open from a vCPU-filtered thread succeeds only read-only
+    /// without O_CREAT, O_TRUNC, O_APPEND or O_TMPFILE; every other open is
+    /// refused with EPERM, and the file the refused ones would change is left
+    /// as it was.
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    #[test]
+    fn test_vcpu_legacy_open_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        fs::write(&existing, b"contents").unwrap();
+        let missing = dir.path().join("missing");
+
+        let cases = vec![
+            ("read-only", c_path(&existing), libc::O_RDONLY),
+            (
+                "read-only cloexec",
+                c_path(&existing),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            ),
+            ("write-only", c_path(&existing), libc::O_WRONLY),
+            ("read-write", c_path(&existing), libc::O_RDWR),
+            ("create", c_path(&missing), libc::O_RDONLY | libc::O_CREAT),
+            (
+                "write-only create",
+                c_path(&missing),
+                libc::O_WRONLY | libc::O_CREAT,
+            ),
+            (
+                "truncate",
+                c_path(&existing),
+                libc::O_RDONLY | libc::O_TRUNC,
+            ),
+            (
+                "write-only truncate",
+                c_path(&existing),
+                libc::O_WRONLY | libc::O_TRUNC,
+            ),
+            ("append", c_path(&existing), libc::O_RDONLY | libc::O_APPEND),
+            (
+                "write-only append",
+                c_path(&existing),
+                libc::O_WRONLY | libc::O_APPEND,
+            ),
+            (
+                "create truncate append",
+                c_path(&missing),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND,
+            ),
+            (
+                "tmpfile",
+                c_path(dir.path()),
+                libc::O_RDONLY | libc::O_TMPFILE,
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (name, opened, errno) in
+            open_under_filter(Thread::Vcpu, Some(HypervisorType::Kvm), cases)
+        {
+            let ok = match name {
+                "read-only" | "read-only cloexec" => opened,
+                _ => !opened && errno == Some(libc::EPERM),
+            };
+            if !ok {
+                wrong.push(format!("vcpu {name}: opened {opened}, {errno:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert!(!missing.exists(), "O_CREAT created the file");
+        assert_eq!(
+            fs::read(&existing).unwrap(),
+            b"contents",
+            "O_TRUNC or O_APPEND changed the file"
+        );
     }
 
     #[test]
