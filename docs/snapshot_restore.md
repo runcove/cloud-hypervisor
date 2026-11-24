@@ -180,12 +180,18 @@ Current constraints for `memory_restore_mode=copyonwrite`:
 
 - Plain private guest RAM only. Anything else falls back to the eager copy
   (logged): `shared=on` or hugepages (global or per-zone), zones with
-  `host_numa_node`, `reserve`, `mergeable` or hotplug fields (a purely static
-  `id`+`size` zone is fine), resizable RAM (`hotplug_size`, virtio-mem), KSM
-  (`mergeable=on`), `--pvmemcontrol`, device passthrough
+  `host_numa_node`, `reserve` or `mergeable` (a purely static `id`+`size`
+  zone is fine), ACPI memory hotplug (`hotplug_size` or `hotplugged_size`,
+  global or per-zone, with `hotplug_method=acpi`), plugged virtio-mem memory
+  (see below), KSM (`mergeable=on`), `--pvmemcontrol`, device passthrough
   (`--device`/`--user-device`/`--vdpa`), and snapshot ranges that are not
   page-aligned single-region extents. Each region's `reserve` policy and the
   THP policy are re-applied to the mapped region.
+- virtio-mem hotplug (`hotplug_method=virtio-mem`, global or per-zone) is
+  supported while nothing is plugged: `hotplugged_size` unset or 0 in the
+  global config and in every zone. A non-zero `hotplugged_size` falls back to
+  the eager copy. Memory can be plugged and unplugged normally after the
+  restore.
 - A snapshot memory file shorter than the saved ranges is rejected up front (it
   would otherwise fault `SIGBUS` at run time).
 - `prefault` is rejected.
@@ -203,6 +209,26 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   content in a page that returns from the balloon, so this is correct.
   (`pvmemcontrol` differs: it issues operations that are only valid on
   anonymous memory, which is why it is on the fallback list above.)
+- Free page reporting (`free_page_reporting=on`) also releases reported pages
+  with `MADV_DONTNEED`, so a reported page reads back the snapshot's content
+  rather than zeroes. Only a guest that expects freed pages to keep a known
+  value (zeroes with `init_on_free=1`, a poison pattern with page poisoning)
+  could notice. Cloud Hypervisor does not offer
+  `VIRTIO_BALLOON_F_PAGE_POISON`, and without it Linux does not negotiate
+  `VIRTIO_BALLOON_F_REPORTING` when either option is enabled
+  (`virtballoon_validate()` in `drivers/virtio/virtio_balloon.c`, since Linux
+  5.8 and 5.7.5). Every other guest makes no assumption about the content of
+  free pages, so reporting stays correct.
+- virtio-mem also discards unplugged blocks with `MADV_DONTNEED`, but there
+  the private file mapping is not acceptable: a block that is unplugged and
+  later plugged again would read back the snapshot's old content instead of
+  zeroes, unlike after an eager-copy restore. The virtio-mem region is
+  therefore never mapped from the snapshot file. With nothing plugged it has
+  no saved ranges, so it stays anonymous memory. A `hotplugged_size` of 0 only
+  records the size that was requested, not that the guest had finished
+  unplugging when the snapshot was taken, so restore also checks the saved
+  ranges themselves: if any of them lies inside a virtio-mem region, the whole
+  restore falls back to the eager copy (logged).
 - A snapshot of a VM restored this way copies the restore source with a
   reflink and then writes only the pages that changed since the restore.
   For this, the snapshot and the restore source must be on the same
