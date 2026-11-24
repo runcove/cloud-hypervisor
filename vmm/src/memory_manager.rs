@@ -1397,9 +1397,16 @@ impl MemoryManager {
         let mut file_offset: u64 = 0;
 
         let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
-        let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(
-            snapshot_file.try_clone().map_err(Error::SnapshotOpen)?,
-        ));
+        // As copy-on-write does: a page past EOF would fail its read while
+        // the VM runs, which stops the VM, so refuse the restore now.
+        check_snapshot_file_covers_ranges(&snapshot_file, saved_regions)?;
+        let source: Box<dyn UffdMemorySource> = Box::new(
+            FileUffdMemorySource::for_snapshot(
+                snapshot_file.try_clone().map_err(Error::SnapshotOpen)?,
+                file_path,
+            )
+            .map_err(Error::SnapshotOpen)?,
+        );
 
         let Some(uffd) = self.prepare_uffd(
             saved_regions,
@@ -4392,6 +4399,34 @@ fn write_private_pages(
     Ok(())
 }
 
+// Fails when `file` ends before the saved ranges do. The ranges sit back to
+// back in the file, so they end at the sum of their lengths.
+fn check_snapshot_file_covers_ranges(
+    file: &File,
+    saved_regions: &MemoryRangeTable,
+) -> Result<(), Error> {
+    let ranges_end = saved_regions
+        .ranges()
+        .iter()
+        .try_fold(0u64, |end, r| end.checked_add(r.length))
+        .ok_or_else(|| {
+            Error::SnapshotRead(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "saved memory ranges overflow a file offset",
+            ))
+        })?;
+    let file_len = file.metadata().map_err(Error::SnapshotOpen)?.len();
+    if file_len < ranges_end {
+        return Err(Error::SnapshotRead(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "snapshot memory file is {file_len} bytes, shorter than the saved ranges' {ranges_end}"
+            ),
+        )));
+    }
+    Ok(())
+}
+
 // Reports whether every saved range is page-aligned and lies wholly inside a
 // single plain private-anonymous guest region — the MAP_FIXED overlay
 // preconditions — and no two overlap. File-backed regions are rejected:
@@ -5426,6 +5461,41 @@ mod tests {
             file.write_all(&vec![byte; len as usize]).unwrap();
         }
         file
+    }
+
+    #[test]
+    fn uffd_restore_refuses_snapshot_file_shorter_than_ranges() {
+        const MIB: u64 = 1 << 20;
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        // As long as the ranges, or longer: accepted.
+        for len in [6 * MIB, 6 * MIB + 4096] {
+            let file = snapshot_file(&[(0xab, len)]);
+            check_snapshot_file_covers_ranges(file.as_file(), &table).unwrap();
+        }
+        // One page short of the second range's end: refused.
+        let file = snapshot_file(&[(0xab, 6 * MIB - 4096)]);
+        match check_snapshot_file_covers_ranges(file.as_file(), &table) {
+            Err(Error::SnapshotRead(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            other => panic!("short file accepted: {other:?}"),
+        }
+        // Range lengths that overflow a file offset: refused, not wrapped.
+        table.push(MemoryRange {
+            gpa: 32 * MIB,
+            length: u64::MAX,
+        });
+        let file = snapshot_file(&[(0xab, 6 * MIB)]);
+        match check_snapshot_file_covers_ranges(file.as_file(), &table) {
+            Err(Error::SnapshotRead(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("overflowing ranges accepted: {other:?}"),
+        }
     }
 
     // Whether the host mapping containing `gpa` is backed by a file, from the

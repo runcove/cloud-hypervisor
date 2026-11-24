@@ -13,10 +13,11 @@
 //! original memory mapping, so it remains compatible with VFIO device
 //! passthrough and shared-memory-backed guest RAM.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Error, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
+use std::path::{Path, PathBuf};
 use std::{fmt, thread};
 
 use vm_allocator::page_size::get_page_size;
@@ -400,10 +401,62 @@ pub(crate) trait UffdMemorySource: Send {
     fn requires_uffd_minor_mode(&self) -> bool;
 }
 
+/// What a snapshot file looked like when it was opened: compared again
+/// after a read error, to tell whether the file changed under the VM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileIdentity {
+    pub(crate) fn of(metadata: &Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+        }
+    }
+
+    /// Names what differs in `now`, as "field old -> new"; empty when
+    /// nothing does.
+    pub(crate) fn changes(&self, now: &Self) -> Vec<String> {
+        let mut changes = Vec::new();
+        if (self.dev, self.ino) != (now.dev, now.ino) {
+            changes.push(format!(
+                "device/inode {}/{} -> {}/{}",
+                self.dev, self.ino, now.dev, now.ino
+            ));
+        }
+        if self.size != now.size {
+            changes.push(format!("size {} -> {}", self.size, now.size));
+        }
+        if (self.mtime, self.mtime_nsec) != (now.mtime, now.mtime_nsec) {
+            changes.push(format!(
+                "mtime {}.{:09} -> {}.{:09}",
+                self.mtime, self.mtime_nsec, now.mtime, now.mtime_nsec
+            ));
+        }
+        changes
+    }
+}
+
+/// The snapshot file's path and its identity when opened.
+struct SnapshotOrigin {
+    path: PathBuf,
+    opened: FileIdentity,
+}
+
 /// Source that reads pages from a local snapshot file.
 pub(crate) struct FileUffdMemorySource {
     file: File,
     buf: Vec<u8>,
+    origin: Option<SnapshotOrigin>,
 }
 
 impl FileUffdMemorySource {
@@ -411,6 +464,58 @@ impl FileUffdMemorySource {
         Self {
             file,
             buf: Vec::new(),
+            origin: None,
+        }
+    }
+
+    /// A source for the snapshot file at `path`, which records the file's
+    /// identity now so a later read error can say whether it changed.
+    pub(crate) fn for_snapshot(file: File, path: &Path) -> io::Result<Self> {
+        let opened = FileIdentity::of(&file.metadata()?);
+        Ok(Self {
+            origin: Some(SnapshotOrigin {
+                path: path.to_path_buf(),
+                opened,
+            }),
+            ..Self::new(file)
+        })
+    }
+
+    /// What changed in the snapshot file since it was opened. The path is
+    /// stated again to see a replaced file, and the open file to see one
+    /// truncated or rewritten in place.
+    fn changes_since_open(&self) -> Vec<String> {
+        let Some(origin) = &self.origin else {
+            return Vec::new();
+        };
+        let mut changes = Vec::new();
+        match fs::metadata(&origin.path) {
+            Ok(m) => changes.extend(origin.opened.changes(&FileIdentity::of(&m))),
+            Err(e) => changes.push(format!("path no longer stats ({e})")),
+        }
+        match self.file.metadata() {
+            Ok(m) => {
+                for change in origin.opened.changes(&FileIdentity::of(&m)) {
+                    if !changes.contains(&change) {
+                        changes.push(change);
+                    }
+                }
+            }
+            Err(e) => changes.push(format!("open file no longer stats ({e})")),
+        }
+        changes
+    }
+
+    /// After a read error, logs what changed in the snapshot file, if
+    /// anything did.
+    fn report_changed_file(&self) {
+        let changes = self.changes_since_open();
+        if let (Some(origin), false) = (&self.origin, changes.is_empty()) {
+            log::error!(
+                "snapshot file changed under a running VM: {}: {}",
+                origin.path.display(),
+                changes.join(", ")
+            );
         }
     }
 }
@@ -429,8 +534,13 @@ impl UffdMemorySource for FileUffdMemorySource {
         if self.buf.len() < page_size {
             self.buf.resize(page_size, 0);
         }
-        self.file
-            .read_exact_at(&mut self.buf[..page_size], file_pos)?;
+        if let Err(e) = self
+            .file
+            .read_exact_at(&mut self.buf[..page_size], file_pos)
+        {
+            self.report_changed_file();
+            return Err(e);
+        }
 
         match copy(uffd_fd, page_addr, self.buf.as_ptr(), range.page_size) {
             Ok(()) => Ok(()),
@@ -645,4 +755,90 @@ pub(crate) fn page_present(addr: u64) -> Result<bool, Error> {
         return Err(Error::last_os_error());
     }
     Ok(vec & 1 != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    #[test]
+    fn file_identity_names_each_change() {
+        let opened = FileIdentity {
+            dev: 1,
+            ino: 2,
+            size: 4096,
+            mtime: 100,
+            mtime_nsec: 5,
+        };
+        assert!(opened.changes(&opened).is_empty());
+        let now = FileIdentity {
+            ino: 3,
+            size: 0,
+            mtime_nsec: 6,
+            ..opened
+        };
+        assert_eq!(
+            opened.changes(&now),
+            [
+                "device/inode 1/2 -> 1/3",
+                "size 4096 -> 0",
+                "mtime 100.000000005 -> 100.000000006",
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_source_sees_truncated_replaced_and_removed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory-ranges");
+        File::create(&path)
+            .unwrap()
+            .write_all(&[0xab; 8192])
+            .unwrap();
+        let source = FileUffdMemorySource::for_snapshot(File::open(&path).unwrap(), &path).unwrap();
+        assert!(source.changes_since_open().is_empty());
+
+        // Truncated in place: the same file, shorter.
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+        let changes = source.changes_since_open();
+        assert!(
+            changes.contains(&"size 8192 -> 4096".to_string()),
+            "{changes:?}"
+        );
+        assert!(
+            !changes.iter().any(|c| c.starts_with("device/inode")),
+            "{changes:?}"
+        );
+
+        // Replaced: the path names another file.
+        let other = dir.path().join("other");
+        File::create(&other).unwrap().write_all(&[0; 8192]).unwrap();
+        fs::rename(&other, &path).unwrap();
+        let changes = source.changes_since_open();
+        assert!(
+            changes.iter().any(|c| c.starts_with("device/inode")),
+            "{changes:?}"
+        );
+
+        // Removed: the path no longer stats.
+        fs::remove_file(&path).unwrap();
+        let changes = source.changes_since_open();
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.starts_with("path no longer stats")),
+            "{changes:?}"
+        );
+
+        // A source opened without a path reports nothing.
+        let unnamed = FileUffdMemorySource::new(tempfile::tempfile().unwrap());
+        assert!(unnamed.changes_since_open().is_empty());
+    }
 }
