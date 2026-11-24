@@ -3,8 +3,7 @@
 > on the `cove-patches-*` branches. Most changes belong upstream, at
 > [cloud-hypervisor/cloud-hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor).
 > Changes to our patches are welcome as pull requests here. Anything we take is
-> re-applied on our own forge as our commit, crediting you as the author. We
-> answer pull requests within a day.
+> re-applied on our own forge as our commit, crediting you as the author.
 
 # 1. What is Cloud Hypervisor?
 
