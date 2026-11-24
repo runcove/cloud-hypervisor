@@ -2311,8 +2311,10 @@ impl Migratable for Block {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
     use std::io::{self, Error as IoError, Result as IoResult};
     use std::ops::Range;
+    use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
     use std::process::Command;
     use std::sync::Mutex;
@@ -2335,6 +2337,7 @@ mod tests {
     use vm_virtio::AccessType;
     use vm_virtio::queue::testing::VirtQueue as GuestQ;
     use vmm_sys_util::eventfd::EFD_NONBLOCK;
+    use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -4945,10 +4948,10 @@ mod tests {
     /// backend apply it. A syscall the filter does not allow raises SIGSYS.
     ///
     /// This runs in a process of its own, so that SIGSYS fails this test
-    /// rather than killing the test binary, and without RUST_BACKTRACE: the
-    /// panic hook then prints the backtrace, which needs getcwd and readlink,
-    /// and the filter allows neither. --nocapture has the hook write to stderr
-    /// as it does in the VMM.
+    /// rather than killing the test binary, and without RUST_BACKTRACE, so
+    /// the panic hook prints no backtrace (virtio_block_filter_allows_backtrace
+    /// covers that case). --nocapture has the hook write to stderr as it does
+    /// in the VMM.
     #[test]
     fn virtio_block_filter_allows_offload_worker() {
         const IN_CHILD: &str = "VIRTIO_BLOCK_FILTER_TEST_CHILD";
@@ -5052,39 +5055,101 @@ mod tests {
         .unwrap();
     }
 
-    /// The legacy open that the x86_64 musl backtrace printer calls is allowed
-    /// read-only, with the flags it passes, and a writable open is still refused.
-    #[cfg(target_arch = "x86_64")]
+    /// Only read-only opens pass the virtio-block seccomp filter, through
+    /// openat on every architecture and the legacy open on x86_64: the flags
+    /// the musl backtrace printer passes, O_RDONLY | O_LARGEFILE | O_CLOEXEC,
+    /// and a read-only O_DIRECTORY open are allowed; a writable open and a
+    /// read-only one with O_CREAT, O_TRUNC, O_APPEND or O_TMPFILE are refused,
+    /// and the file that O_CREAT or O_TRUNC would change is left as it was.
     #[test]
     fn virtio_block_filter_refuses_writable_open() {
+        // libc's O_LARGEFILE is 0 for x86_64 glibc; musl passes the kernel's.
+        #[cfg(target_arch = "x86_64")]
+        const O_LARGEFILE: libc::c_int = 0o100000;
+        #[cfg(not(target_arch = "x86_64"))]
+        const O_LARGEFILE: libc::c_int = libc::O_LARGEFILE;
+
+        let dir = TempDir::new().unwrap();
+        let existing = dir.as_path().join("existing");
+        fs::write(&existing, b"contents").unwrap();
+        let missing = dir.as_path().join("missing");
+        let c_path = |path: &Path| CString::new(path.as_os_str().as_bytes()).unwrap();
+        let (existing_c, missing_c, dir_c) =
+            (c_path(&existing), c_path(&missing), c_path(dir.as_path()));
+
         let filter = get_seccomp_filter(
             &SeccompAction::Errno(libc::EPERM as u32),
             Thread::VirtioBlock,
         )
         .unwrap();
-        let (read_only, writable) = thread::spawn(move || {
+        let results = thread::spawn(move || {
             apply_filter(&filter).unwrap();
-            let open = |flags: libc::c_int| {
-                // SAFETY: the path is a NUL-terminated string.
-                let fd = unsafe {
-                    libc::syscall(libc::SYS_open, c"/proc/self/maps".as_ptr(), flags) as i32
-                };
-                let errno = IoError::last_os_error().raw_os_error();
-                if fd >= 0 {
-                    // SAFETY: fd was just opened here.
-                    unsafe { libc::close(fd) };
+            let cases = [
+                (
+                    "musl read-only",
+                    &existing_c,
+                    libc::O_RDONLY | O_LARGEFILE | libc::O_CLOEXEC,
+                ),
+                (
+                    "directory",
+                    &dir_c,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                ),
+                ("write-only", &existing_c, libc::O_WRONLY),
+                ("create", &missing_c, libc::O_RDONLY | libc::O_CREAT),
+                ("truncate", &existing_c, libc::O_RDONLY | libc::O_TRUNC),
+                ("append", &existing_c, libc::O_RDONLY | libc::O_APPEND),
+                ("tmpfile", &dir_c, libc::O_RDONLY | libc::O_TMPFILE),
+            ];
+            let mut results = Vec::new();
+            for (name, path, flags) in cases {
+                let mut calls = vec![("openat", libc::SYS_openat)];
+                #[cfg(target_arch = "x86_64")]
+                calls.push(("open", libc::SYS_open));
+                for (call, nr) in calls {
+                    // SAFETY: path is a NUL-terminated string that outlives
+                    // the call, and the mode is only read with O_CREAT.
+                    let fd = unsafe {
+                        if nr == libc::SYS_openat {
+                            libc::syscall(nr, libc::AT_FDCWD, path.as_ptr(), flags, 0o600)
+                        } else {
+                            libc::syscall(nr, path.as_ptr(), flags, 0o600)
+                        }
+                    } as i32;
+                    let errno = IoError::last_os_error().raw_os_error();
+                    if fd >= 0 {
+                        // SAFETY: fd was just opened here.
+                        unsafe { libc::close(fd) };
+                    }
+                    results.push((name, call, fd >= 0, errno));
                 }
-                (fd, errno)
-            };
-            (
-                open(libc::O_RDONLY | libc::O_LARGEFILE | libc::O_CLOEXEC),
-                open(libc::O_WRONLY),
-            )
+            }
+            results
         })
         .join()
         .unwrap();
-        assert!(read_only.0 >= 0, "read-only open refused: {read_only:?}");
-        assert_eq!(writable, (-1, Some(libc::EPERM)));
+
+        let wrong: Vec<_> = results
+            .into_iter()
+            .filter(|&(name, _, opened, errno)| match name {
+                "musl read-only" | "directory" => !opened,
+                _ => opened || errno != Some(libc::EPERM),
+            })
+            .map(|(name, call, opened, errno)| {
+                if opened {
+                    format!("{call} {name}: opened")
+                } else {
+                    format!("{call} {name}: refused with {errno:?}")
+                }
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert!(!missing.exists(), "O_CREAT created the file");
+        assert_eq!(
+            fs::read(&existing).unwrap(),
+            b"contents",
+            "O_TRUNC truncated"
+        );
     }
 
     /// A raw disk whose queue backends record the io_uring worker limits
