@@ -3066,6 +3066,7 @@ impl DeviceManager {
                 disk_cfg.sparse,
                 disk_cfg.lock_granularity,
                 disk_cfg.guest_block_size,
+                disk_cfg.iouring_max_workers,
             )
             .map_err(DeviceManagerError::CreateVirtioBlock)?;
 

@@ -14,7 +14,7 @@ use log::{Level, error, log, warn};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::common::{duplicate_user_data_error, validate_batch};
-use super::{AsyncIoCompletion, AsyncIoOperation, CompletionCommon};
+use super::{AsyncIoCompletion, AsyncIoOperation, CompletionCommon, IoWorkerLimits};
 
 // Linux UAPI constant for enabling a ring created with IORING_SETUP_R_DISABLED
 const IORING_REGISTER_ENABLE_RINGS: u8 = 12;
@@ -58,17 +58,38 @@ pub struct UringDataIo {
     // `needs_submit_retry` is set when SQEs have been published to the ring,
     // but the submit syscall failed before confirming kernel ownership.
     needs_submit_retry: bool,
+    // Set once anything has been submitted to the ring. The ring is then
+    // driven by some thread, whose worker pool a later cap would not reach.
+    submitted: bool,
 }
 
 impl UringDataIo {
     /// Creates an io_uring queue and registers its completion eventfd.
     pub fn new(ring_depth: u32) -> io::Result<Self> {
-        let io_uring = IoUring::builder().setup_r_disabled().build(ring_depth)?;
         let completions = CompletionCommon::new();
-        io_uring
-            .submitter()
-            .register_eventfd(completions.notifier().as_raw_fd())?;
+        let io_uring = Self::build_ring(ring_depth, completions.notifier(), None)?;
 
+        Ok(Self {
+            io_uring,
+            in_flight: HashMap::new(),
+            completions,
+            needs_submit_retry: false,
+            submitted: false,
+        })
+    }
+
+    /// Creates a ring disabled, registers its completion eventfd, the worker
+    /// limits `max_workers` if given and the restrictions, then enables it.
+    ///
+    /// The worker limits are registered before the ring is enabled: once it
+    /// is, the restrictions refuse every register op but enabling, so a ring
+    /// cannot be capped later.
+    fn build_ring(
+        ring_depth: u32,
+        notifier: &EventFd,
+        max_workers: Option<[u32; 2]>,
+    ) -> io::Result<IoUring> {
+        let io_uring = Self::build_disabled_ring(ring_depth, notifier, max_workers)?;
         io_uring.submitter().register_restrictions(&mut [
             Restriction::register_op(IORING_REGISTER_ENABLE_RINGS),
             Restriction::sqe_op(opcode::Nop::CODE),
@@ -81,12 +102,75 @@ impl UringDataIo {
         ])?;
         io_uring.submitter().register_enable_rings()?;
 
-        Ok(Self {
-            io_uring,
-            in_flight: HashMap::new(),
-            completions,
-            needs_submit_retry: false,
-        })
+        Ok(io_uring)
+    }
+
+    /// The part of `build_ring` before the restrictions: a disabled ring,
+    /// which accepts no submission, with its completion eventfd and the
+    /// worker limits `max_workers` if given registered. Only `build_ring`
+    /// enables one outside tests, after restricting it.
+    fn build_disabled_ring(
+        ring_depth: u32,
+        notifier: &EventFd,
+        max_workers: Option<[u32; 2]>,
+    ) -> io::Result<IoUring> {
+        let io_uring = IoUring::builder().setup_r_disabled().build(ring_depth)?;
+        io_uring
+            .submitter()
+            .register_eventfd(notifier.as_raw_fd())?;
+
+        if let Some(mut max) = max_workers {
+            io_uring.submitter().register_iowq_max_workers(&mut max)?;
+        }
+
+        Ok(io_uring)
+    }
+
+    /// Caps the io_uring worker threads the kernel may start for the thread
+    /// that drives this ring (`IORING_REGISTER_IOWQ_MAX_WORKERS`).
+    ///
+    /// The kernel keeps io_uring workers per thread, not per ring: a thread
+    /// has one worker pool, shared by every ring it submits to. The limits
+    /// are stored on the ring, and the kernel applies them to a thread's pool
+    /// when that thread first uses io_uring, if it does so on this ring. It
+    /// does not apply them to a thread that used another ring first, and
+    /// called from a thread that has already used io_uring, this also caps
+    /// that thread's own pool.
+    ///
+    /// So the cap holds as configured only for a thread that has not used
+    /// io_uring before this ring and drives no other ring. That is true today
+    /// because each virtio-block queue gets a new thread that drives just its
+    /// own ring. This must be called before that thread submits anything.
+    ///
+    /// The bounded limit is never set above the ring's size: a ring never has
+    /// more requests in flight than it has entries.
+    ///
+    /// The ring's restrictions refuse this registration once the ring is
+    /// enabled, so the ring is replaced by a new one, with the same size and
+    /// completion eventfd, that is capped before it is enabled. It is refused
+    /// once anything has been submitted to the ring: a replaced ring would
+    /// lose requests in flight, and a cap set after the driving thread has
+    /// used io_uring would not reach that thread's workers. If the kernel
+    /// refuses the limits, the ring in use is kept, uncapped.
+    pub fn set_max_workers(&mut self, limits: IoWorkerLimits) -> io::Result<()> {
+        // A zero leaves that limit unchanged in the kernel: refuse it rather
+        // than silently run uncapped.
+        if limits.bounded == 0 || limits.unbounded == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("io_uring worker limits must not be zero: {limits:?}"),
+            ));
+        }
+        if self.submitted || !self.in_flight.is_empty() || self.needs_submit_retry {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "io_uring worker limits must be set before the ring is used",
+            ));
+        }
+        let ring_depth = self.io_uring.params().sq_entries();
+        let max = [limits.bounded.min(ring_depth), limits.unbounded];
+        self.io_uring = Self::build_ring(ring_depth, self.completions.notifier(), Some(max))?;
+        Ok(())
     }
 
     /// Returns the eventfd signaled when completions are available.
@@ -109,6 +193,7 @@ impl UringDataIo {
     }
 
     fn submit_kernel_entry(&mut self, user_data: u64, entry: &squeue::Entry) -> io::Result<()> {
+        self.submitted = true;
         self.reserve_user_data(user_data)?;
 
         let (submitter, mut sq, _) = self.io_uring.split();
@@ -141,6 +226,7 @@ impl UringDataIo {
         if batch.is_empty() {
             return Ok(());
         }
+        self.submitted = true;
 
         validate_batch(|user_data| self.in_flight.contains_key(&user_data), &batch)?;
 
@@ -456,16 +542,22 @@ impl Drop for UringDataIo {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+    use std::fs::{self, OpenOptions};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-    use std::thread::sleep;
+    use std::os::unix::ffi::OsStringExt;
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::thread::{self, sleep};
     use std::time::Duration;
-    use std::{io, ptr};
+    use std::{env, io, ptr};
 
-    use io_uring::{opcode, squeue, types};
+    use io_uring::{IoUring, opcode, squeue, types};
+    use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::{MAX_RESUBMISSIONS, RetainedOperation, UringDataIo};
-    use crate::async_io::{AsyncIoCompletion, AsyncIoOperation, OwnedIoBuffer};
+    use crate::async_io::{AsyncIoCompletion, AsyncIoOperation, IoWorkerLimits, OwnedIoBuffer};
 
     fn wait_for_completion(data_io: &mut UringDataIo) -> AsyncIoCompletion {
         for _ in 0..1000 {
@@ -490,6 +582,413 @@ mod tests {
                 resubmissions: 0,
             }),
         );
+    }
+
+    // Reads the limits now in force for the calling thread's io_uring
+    // workers: a zero for both changes nothing and returns the current ones.
+    // A data ring's restrictions refuse the registration, so it is made on a
+    // ring of its own: the limits are the thread's, whichever ring asks.
+    fn worker_limits_in_force() -> [u32; 2] {
+        let mut max = [0, 0];
+        IoUring::new(1)
+            .unwrap()
+            .submitter()
+            .register_iowq_max_workers(&mut max)
+            .unwrap();
+        max
+    }
+
+    // A ring capped at `limits` if given, without the restrictions, which
+    // refuse the opens and tees the worker cap tests block in a worker.
+    fn unrestricted_ring(ring_depth: u32, limits: Option<IoWorkerLimits>) -> UringDataIo {
+        let mut data_io = UringDataIo::new(ring_depth).unwrap();
+        let max = limits.map(|l| [l.bounded, l.unbounded]);
+        let io_uring =
+            UringDataIo::build_disabled_ring(ring_depth, data_io.completions.notifier(), max)
+                .unwrap();
+        io_uring.submitter().register_enable_rings().unwrap();
+        data_io.io_uring = io_uring;
+        data_io
+    }
+
+    // Counts every io_uring worker in this process. The kernel names a worker
+    // `iou-wrk-<pid>` after its owner's pid in the initial PID namespace, so
+    // inside a PID namespace (a container) the suffix matches no tid this
+    // process can see: the count cannot tell whose workers they are. It is
+    // only meaningful in a process where one measurement alone starts
+    // workers, which is what `peak_workers_in_child` runs it in.
+    fn worker_count() -> usize {
+        fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|task| fs::read_to_string(task.ok()?.path().join("comm")).ok())
+            .filter(|comm| comm.starts_with("iou-wrk-"))
+            .count()
+    }
+
+    // Creates a ring of `count` entries on the calling thread, caps it at
+    // `limits` if given, and drives it from a new thread, as a disk's queue
+    // is: submits `count` copies of `entry`, each forced to a kernel worker,
+    // where it must block. Then calls `unblock`, keeps what it returns until
+    // every request has completed, and returns the most workers seen at once.
+    fn peak_workers_on_blocked_requests<G>(
+        limits: Option<IoWorkerLimits>,
+        count: u32,
+        entry: impl Fn() -> squeue::Entry + Sync,
+        unblock: impl FnOnce() -> G + Send,
+    ) -> usize {
+        let data_io = unrestricted_ring(count, limits);
+
+        thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut data_io = data_io;
+                    for user_data in 0..u64::from(count) {
+                        let entry = entry().flags(squeue::Flags::ASYNC).user_data(user_data);
+                        data_io.submit_kernel_entry(user_data, &entry).unwrap();
+                    }
+
+                    let mut peak = 0;
+                    for _ in 0..25 {
+                        peak = peak.max(worker_count());
+                        if peak >= count as usize {
+                            break;
+                        }
+                        sleep(Duration::from_millis(20));
+                    }
+
+                    let guard = unblock();
+                    for _ in 0..count {
+                        let completion = wait_for_completion(&mut data_io);
+                        assert!(
+                            completion.result >= 0,
+                            "request failed: {}",
+                            completion.result
+                        );
+                        if completion.result > 0 {
+                            // SAFETY: only an open completes with a positive
+                            // result here, a file descriptor nothing else owns.
+                            unsafe { libc::close(completion.result) };
+                        }
+                    }
+                    drop(guard);
+                    peak
+                })
+                .join()
+                .unwrap()
+        })
+    }
+
+    // Opens of a FIFO that has no writer block in the worker, and count as
+    // bounded work.
+    fn peak_workers_on_blocked_opens(limits: Option<IoWorkerLimits>, count: u32) -> usize {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("fifo");
+        let fifo = CString::new(path.clone().into_os_string().into_vec()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        peak_workers_on_blocked_requests(
+            limits,
+            count,
+            || {
+                opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), fifo.as_ptr())
+                    .flags(libc::O_RDONLY | libc::O_CLOEXEC)
+                    .build()
+            },
+            // A writer lets every open complete, blocked or still queued.
+            || OpenOptions::new().write(true).open(&path).unwrap(),
+        )
+    }
+
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe2 writes.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: pipe2 succeeded, so both are open descriptors nothing else owns.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    // A tee from an empty pipe blocks in the worker, and counts as unbounded
+    // work (a pipe is not a regular file or block device).
+    fn peak_workers_on_blocked_tees(limits: Option<IoWorkerLimits>, count: u32) -> usize {
+        let (input, input_writer) = pipe();
+        let (_output, output_writer) = pipe();
+        let input_writer = Mutex::new(Some(input_writer));
+
+        peak_workers_on_blocked_requests(
+            limits,
+            count,
+            || {
+                opcode::Tee::new(
+                    types::Fd(input.as_raw_fd()),
+                    types::Fd(output_writer.as_raw_fd()),
+                    1,
+                )
+                .build()
+            },
+            // Closing the input's only writer ends every tee with 0 bytes.
+            || drop(input_writer.lock().unwrap().take()),
+        )
+    }
+
+    // The measurement `measure_peak_workers` makes when this is set, as
+    // `<opens|tees> <count> [<bounded>:<unbounded>]`.
+    const MEASUREMENT_ENV: &str = "BLOCK_TEST_IOWQ_MEASUREMENT";
+    const PEAK_PREFIX: &str = "IOWQ_PEAK=";
+
+    // Runs one measurement of `peak_workers_on_blocked_opens` ("opens") or
+    // `peak_workers_on_blocked_tees` ("tees") in a new process of this test
+    // executable, where no other test starts io_uring workers, and returns
+    // its peak.
+    fn peak_workers_in_child(kind: &str, limits: Option<IoWorkerLimits>, count: u32) -> usize {
+        let measurement = match limits {
+            Some(l) => format!("{kind} {count} {}:{}", l.bounded, l.unbounded),
+            None => format!("{kind} {count}"),
+        };
+        // The test's name as libtest knows it: its path without the crate.
+        let helper = format!(
+            "{}::measure_peak_workers",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = Command::new(env::current_exe().unwrap())
+            .args(["--exact", &helper, "--ignored", "--nocapture"])
+            .arg("--test-threads=1")
+            .env(MEASUREMENT_ENV, &measurement)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "measuring {measurement} failed ({}):\n{stdout}\n{stderr}",
+            output.status
+        );
+        // libtest may print the test's name on the same line, before it.
+        stdout
+            .lines()
+            .find_map(|line| line.split_once(PEAK_PREFIX))
+            .unwrap_or_else(|| {
+                panic!("measuring {measurement} printed no peak:\n{stdout}\n{stderr}")
+            })
+            .1
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    // Not a test of its own: the measurement `peak_workers_in_child` runs in
+    // a child process. Without MEASUREMENT_ENV it does nothing.
+    #[test]
+    #[ignore = "a measurement run by the worker cap tests in a process of its own"]
+    fn measure_peak_workers() {
+        let Ok(measurement) = env::var(MEASUREMENT_ENV) else {
+            return;
+        };
+        let fields: Vec<&str> = measurement.split_whitespace().collect();
+        let (kind, count, limits) = match fields[..] {
+            [kind, count] => (kind, count, None),
+            [kind, count, limits] => (kind, count, Some(limits.parse().unwrap())),
+            _ => panic!("not a measurement: {measurement}"),
+        };
+        let count = count.parse().unwrap();
+        let peak = match kind {
+            "opens" => peak_workers_on_blocked_opens(limits, count),
+            "tees" => peak_workers_on_blocked_tees(limits, count),
+            _ => panic!("not a measurement: {measurement}"),
+        };
+        println!("{PEAK_PREFIX}{peak}");
+    }
+
+    #[test]
+    fn uring_caps_bounded_workers() {
+        let limits = IoWorkerLimits {
+            bounded: 2,
+            unbounded: 64,
+        };
+        let peak = peak_workers_in_child("opens", Some(limits), 32);
+        assert!(peak > 0, "the test started no worker");
+        assert!(peak <= 2, "{peak} bounded workers under a cap of 2");
+
+        // Without the cap the same requests start more workers than that, so
+        // the check above can see a missing cap.
+        assert!(peak_workers_in_child("opens", None, 32) > 2);
+    }
+
+    #[test]
+    fn uring_caps_unbounded_workers() {
+        let limits = IoWorkerLimits {
+            bounded: 64,
+            unbounded: 2,
+        };
+        let peak = peak_workers_in_child("tees", Some(limits), 32);
+        assert!(peak > 0, "the test started no worker");
+        assert!(peak <= 2, "{peak} unbounded workers under a cap of 2");
+
+        assert!(peak_workers_in_child("tees", None, 32) > 2);
+    }
+
+    #[test]
+    fn uring_applies_limits_to_the_thread_that_drives_the_ring() {
+        // Capped on this thread, as at device activation; the bounded limit
+        // is clamped to the ring's 8 entries.
+        let mut data_io = UringDataIo::new(8).unwrap();
+        data_io.set_max_workers(IoWorkerLimits::DEFAULT).unwrap();
+
+        let in_force = thread::spawn(move || {
+            // The kernel applies the limits when this thread first submits.
+            data_io.submit_nop(1).unwrap();
+            wait_for_completion(&mut data_io);
+            worker_limits_in_force()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(in_force, [8, 4]);
+    }
+
+    #[test]
+    fn uring_caps_a_restricted_ring_larger_than_the_bounded_limit() {
+        // The production path: `set_max_workers` on a restricted ring with
+        // more entries than the bounded limit, so the limit itself, not the
+        // ring's size, is what must reach the kernel.
+        let mut data_io = UringDataIo::new(64).unwrap();
+        data_io
+            .set_max_workers(IoWorkerLimits {
+                bounded: 3,
+                unbounded: 4,
+            })
+            .unwrap();
+
+        let in_force = thread::spawn(move || {
+            data_io.submit_nop(1).unwrap();
+            wait_for_completion(&mut data_io);
+            assert_restricted(&mut data_io);
+            worker_limits_in_force()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(in_force, [3, 4]);
+    }
+
+    #[test]
+    fn uring_refuses_zero_limits() {
+        let mut data_io = UringDataIo::new(8).unwrap();
+        for limits in [
+            IoWorkerLimits {
+                bounded: 0,
+                unbounded: 4,
+            },
+            IoWorkerLimits {
+                bounded: 16,
+                unbounded: 0,
+            },
+        ] {
+            let e = data_io.set_max_workers(limits).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn uring_reports_limits_the_kernel_refuses() {
+        // The kernel refuses a limit above INT_MAX with EINVAL, as a kernel
+        // without IORING_REGISTER_IOWQ_MAX_WORKERS refuses every call.
+        let mut data_io = UringDataIo::new(8).unwrap();
+        let e = data_io
+            .set_max_workers(IoWorkerLimits {
+                bounded: 16,
+                unbounded: u32::MAX,
+            })
+            .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+
+        // The ring in use is kept: it still works, and is still restricted.
+        data_io.submit_nop(1).unwrap();
+        assert_eq!(wait_for_completion(&mut data_io).result, 0);
+        assert_restricted(&mut data_io);
+    }
+
+    // The ring refuses a registration change, a worker cap and a socket
+    // operation, as the restrictions `UringDataIo::new` registers make it.
+    // The refused worker cap is why `build_ring` registers the cap before it
+    // restricts and enables the ring.
+    fn assert_restricted(data_io: &mut UringDataIo) {
+        assert_eq!(
+            data_io
+                .io_uring
+                .submitter()
+                .register_eventfd(data_io.notifier().as_raw_fd())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let mut max = [1, 1];
+        assert_eq!(
+            data_io
+                .io_uring
+                .submitter()
+                .register_iowq_max_workers(&mut max)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let socket = opcode::Socket::new(libc::AF_UNIX, libc::SOCK_STREAM, 0)
+            .build()
+            .user_data(u64::MAX);
+        data_io.submit_kernel_entry(u64::MAX, &socket).unwrap();
+        let completion = wait_for_completion(data_io);
+        if completion.result >= 0 {
+            // SAFETY: IORING_OP_SOCKET returned a new owned descriptor.
+            drop(unsafe { OwnedFd::from_raw_fd(completion.result) });
+        }
+        assert_eq!(completion.result, -libc::EACCES);
+    }
+
+    #[test]
+    fn uring_capped_ring_is_restricted_and_signals_the_same_eventfd() {
+        // The cap replaces the ring with one capped before it is enabled
+        // (v55 restricts every ring, and the restrictions refuse the cap's
+        // registration once the ring is enabled). The new ring keeps the
+        // restrictions and the completion eventfd callers already wait on.
+        let mut data_io = UringDataIo::new(8).unwrap();
+        let notifier = data_io.notifier().as_raw_fd();
+        data_io.set_max_workers(IoWorkerLimits::DEFAULT).unwrap();
+        assert_eq!(data_io.notifier().as_raw_fd(), notifier);
+
+        data_io.submit_nop(1).unwrap();
+        for _ in 0..1000 {
+            let mut fds = [libc::pollfd {
+                fd: notifier,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            // SAFETY: `fds` is one valid pollfd.
+            if unsafe { libc::poll(fds.as_mut_ptr(), 1, 1) } == 1 {
+                break;
+            }
+        }
+        assert!(data_io.notifier().read().unwrap() > 0);
+        assert_eq!(wait_for_completion(&mut data_io).result, 0);
+        assert_restricted(&mut data_io);
+    }
+
+    #[test]
+    fn uring_refuses_limits_once_the_ring_is_in_use() {
+        // Replacing a ring with requests in flight would lose them.
+        let mut data_io = UringDataIo::new(8).unwrap();
+        data_io.submit_nop(1).unwrap();
+        let e = data_io
+            .set_max_workers(IoWorkerLimits::DEFAULT)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
+        assert_eq!(wait_for_completion(&mut data_io).result, 0);
+
+        // Drained, the ring has still been used: its driving thread's
+        // workers would not take a cap set now.
+        assert!(data_io.in_flight.is_empty());
+        let e = data_io
+            .set_max_workers(IoWorkerLimits::DEFAULT)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
     }
 
     #[test]

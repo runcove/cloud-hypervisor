@@ -8,13 +8,15 @@
 //
 
 use std::fs::File;
+use std::io;
 use std::os::unix::io::AsRawFd;
 
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::async_io::{
     AioDataIo, AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult,
-    BlockingOffload, BlockingOp, BlockingOpFn, WorkerThreadInit, offload_fn, spawn_offload,
+    BlockingOffload, BlockingOp, BlockingOpFn, IoWorkerLimits, WorkerThreadInit, offload_fn,
+    spawn_offload,
 };
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::sparse::{punch_hole, write_zeroes};
@@ -107,6 +109,11 @@ impl AsyncIo for RawAio {
         if let Some(offload) = &mut self.offload {
             offload.set_thread_init(init);
         }
+    }
+
+    fn set_io_worker_limits(&mut self, _limits: IoWorkerLimits) -> io::Result<()> {
+        // Linux AIO, not io_uring: the kernel starts no io_uring workers here.
+        Ok(())
     }
 
     fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {

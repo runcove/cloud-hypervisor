@@ -4,6 +4,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use std::io;
 use std::sync::Arc;
 
 use vmm_sys_util::eventfd::EventFd;
@@ -14,6 +15,7 @@ use super::metadata::{BackingRead, QcowMetadata};
 use super::qcow_raw_file::QcowRawFile;
 use crate::async_io::{
     AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, CompletionCommon,
+    IoWorkerLimits,
 };
 
 pub(super) struct QcowSync {
@@ -98,6 +100,11 @@ impl AsyncIo for QcowSync {
             self.completions
                 .complete(AsyncIoCompletion::new(user_data, 0, None));
         }
+        Ok(())
+    }
+
+    fn set_io_worker_limits(&mut self, _limits: IoWorkerLimits) -> io::Result<()> {
+        // No io_uring ring: the kernel starts no io_uring workers here.
         Ok(())
     }
 
