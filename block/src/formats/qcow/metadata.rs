@@ -2541,6 +2541,271 @@ mod tests {
         }
     }
 
+    /// A cluster with 0xEE written to it and then deallocated without sparse,
+    /// so its entry is a zero entry that keeps the host cluster. Returns the
+    /// host address of that cluster.
+    fn state_with_preallocated_zero_entry(image: &TestImage) -> (super::QcowState, u64) {
+        use std::os::unix::fs::FileExt;
+
+        let mut inner = open_state(image);
+        let super::ClusterWriteMapping::Allocated { offset } =
+            inner.map_write(0, None).expect("initial write");
+        let cluster_size = inner.raw_file.cluster_size() as usize;
+        image
+            .as_file()
+            .write_all_at(&vec![0xEE; cluster_size], offset)
+            .unwrap();
+        assert_eq!(inner.deallocate_cluster(0, false, false).unwrap(), None);
+        assert_eq!(
+            inner.l2_cache.get(0).unwrap()[0],
+            super::l2_entry_make_zero(offset)
+        );
+        (inner, offset)
+    }
+
+    // A write to a zero entry that is the only holder of its host cluster
+    // takes that cluster back, clears it and grows nothing. (From 820d36990.)
+    #[test]
+    fn write_reuses_preallocated_zero_cluster_and_clears_it() {
+        use std::os::unix::fs::FileExt;
+
+        let image = TestImage::new(1 << 18);
+        let (mut inner, preallocated) = state_with_preallocated_zero_entry(&image);
+        let cluster_size = inner.raw_file.cluster_size() as usize;
+        let file_len = inner.raw_file.physical_size().unwrap();
+
+        let super::ClusterWriteMapping::Allocated { offset } = inner.map_write(0, None).unwrap();
+
+        assert_eq!(offset, preallocated);
+        assert_eq!(inner.raw_file.physical_size().unwrap(), file_len);
+        assert_eq!(inner.cluster_refcount(preallocated).unwrap(), 1);
+        assert_eq!(
+            inner.l2_cache.get(0).unwrap()[0],
+            super::l2_entry_make_std(preallocated)
+        );
+        let mut data = vec![0xFF; cluster_size];
+        image
+            .as_file()
+            .read_exact_at(&mut data, preallocated)
+            .unwrap();
+        assert_eq!(data, vec![0; cluster_size]);
+    }
+
+    // A cluster with another reference, such as from an internal snapshot,
+    // keeps its data: the write gets a cluster of its own and only this
+    // entry's reference goes. (From 820d36990.)
+    #[test]
+    fn write_leaves_shared_preallocated_zero_cluster_alone() {
+        use std::os::unix::fs::FileExt;
+
+        let image = TestImage::new(1 << 18);
+        let (mut inner, shared) = state_with_preallocated_zero_entry(&image);
+        let cluster_size = inner.raw_file.cluster_size() as usize;
+        inner.set_cluster_refcount_track_freed(shared, 2).unwrap();
+
+        let super::ClusterWriteMapping::Allocated { offset } = inner.map_write(0, None).unwrap();
+
+        assert_ne!(offset, shared);
+        assert_eq!(inner.cluster_refcount(offset).unwrap(), 1);
+        assert_eq!(inner.cluster_refcount(shared).unwrap(), 1);
+        let mut data = vec![0; cluster_size];
+        image.as_file().read_exact_at(&mut data, shared).unwrap();
+        assert_eq!(data, vec![0xEE; cluster_size]);
+    }
+
+    // Taking back the host cluster of a zero entry needs no new cluster, so a
+    // write still succeeds with the allocator exhausted, and the cluster the
+    // entry holds never reaches the free lists. The refcount block is dirtied
+    // first: changing a refcount in a clean block needs a new cluster, which
+    // would fail here and make a wrongful release of the cluster a silent
+    // no-op. (From 820d36990 and 07fc427d2, whose version expected the write
+    // to fail relocating the L2 table; v55 takes the cluster back without
+    // relocating the table.)
+    #[test]
+    fn write_to_preallocated_zero_cluster_with_exhausted_allocator_keeps_it_off_free_lists() {
+        let image = TestImage::new(1 << 18);
+        let (mut inner, preallocated) = state_with_preallocated_zero_entry(&image);
+        inner.sync_caches().expect("flush");
+        limit_growth(&mut inner, 0);
+        let refblock = match inner.refcounts.set_cluster_refcount(
+            &mut inner.raw_file,
+            preallocated,
+            1,
+            None,
+            super::MetadataLayout::new(&inner.header, &inner.l2_offsets),
+        ) {
+            Err(super::refcount::Error::NeedCluster(addr)) => addr,
+            other => panic!("unexpected {other:?}"),
+        };
+        let contents = inner.raw_file.read_refcount_block(refblock).unwrap();
+        inner
+            .refcounts
+            .set_cluster_refcount(
+                &mut inner.raw_file,
+                preallocated,
+                1,
+                Some((refblock, super::VecCache::from_vec(contents))),
+                super::MetadataLayout::new(&inner.header, &inner.l2_offsets),
+            )
+            .expect_err("cached clean block");
+        inner
+            .refcounts
+            .set_cluster_refcount(
+                &mut inner.raw_file,
+                preallocated,
+                1,
+                Some((refblock, super::VecCache::new(1))),
+                super::MetadataLayout::new(&inner.header, &inner.l2_offsets),
+            )
+            .unwrap();
+        inner.avail_clusters.clear();
+        inner.unref_clusters.clear();
+
+        let super::ClusterWriteMapping::Allocated { offset } = inner
+            .map_write(0, None)
+            .expect("taking the cluster back needs no allocation");
+
+        assert_eq!(offset, preallocated);
+        assert_eq!(
+            inner.l2_cache.get(0).unwrap()[0],
+            super::l2_entry_make_std(preallocated)
+        );
+        assert_eq!(inner.cluster_refcount(preallocated).unwrap(), 1);
+        assert!(
+            !inner.unref_clusters.contains(&preallocated)
+                && !inner.avail_clusters.contains(&preallocated),
+            "a cluster the entry still holds must never enter the free lists"
+        );
+    }
+
+    /// Returns 0xAB for every byte.
+    struct PatternBacking;
+
+    impl super::BackingRead for PatternBacking {
+        fn read_at(&self, _address: u64, buf: &mut [u8]) -> super::io::Result<()> {
+            buf.fill(0xAB);
+            Ok(())
+        }
+    }
+
+    /// An open version 2 image with one data cluster, cached and with its
+    /// metadata flushed, at guest address 0. Returns its host address too.
+    fn v2_state_with_data_cluster(image: &TestImage) -> (super::QcowState, u64) {
+        let mut inner = open_state(image);
+        let super::ClusterWriteMapping::Allocated { offset } =
+            inner.map_write(0, None).expect("initial write");
+        inner.sync_caches().expect("flush");
+        (inner, offset)
+    }
+
+    fn v2_image() -> TestImage {
+        let header = super::QcowHeader::create_for_size_and_path(2, 4 << 16, None).unwrap();
+        TestImage::from_header(&header)
+    }
+
+    // A write zeroes over a backing file of a compressed cluster on an image
+    // without the zero flag: the compressed data goes, the entry holds a data
+    // cluster of its own, which the caller is told to zero, and no zero flag
+    // is set. (From c80b0f174, which called deallocate_cluster directly; v55
+    // keeps version 2 images away from the zero flag in deallocate_bytes.)
+    #[test]
+    fn v2_zero_marker_replaces_compressed_cluster_with_zeroed_cluster() {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+
+        use flate2::Compression;
+        use flate2::write::DeflateEncoder;
+
+        for sparse in [true, false] {
+            let image = v2_image();
+            let (mut inner, _data_cluster) = v2_state_with_data_cluster(&image);
+            let cluster_size = inner.raw_file.cluster_size() as usize;
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&vec![0xEE; cluster_size]).unwrap();
+            let compressed = encoder.finish().unwrap();
+            let compressed_cluster = inner.append_data_cluster(None).unwrap();
+            image
+                .as_file()
+                .write_all_at(&compressed, compressed_cluster)
+                .unwrap();
+            inner.l2_cache.get_mut(0).unwrap()[0] = compressed_l2_entry(
+                compressed_cluster,
+                compressed.len(),
+                inner.header.cluster_bits,
+            );
+            let metadata = super::QcowMetadata::new(inner);
+
+            let actions = metadata
+                .deallocate_bytes(0, cluster_size, sparse, true, Some(&PatternBacking))
+                .unwrap();
+
+            let mut inner = metadata.inner.write().unwrap();
+            let l2_entry = inner.l2_cache.get(0).unwrap()[0];
+            assert_eq!(
+                l2_entry & super::super::util::ZERO_FLAG,
+                0,
+                "sparse={sparse}"
+            );
+            assert_eq!(l2_entry & super::super::util::COMPRESSED_FLAG, 0);
+            let new_cluster = super::l2_entry_std_cluster_addr(l2_entry);
+            assert_ne!(new_cluster, 0);
+            assert_eq!(inner.cluster_refcount(new_cluster).unwrap(), 1);
+            assert_eq!(inner.cluster_refcount(compressed_cluster).unwrap(), 0);
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [super::DeallocAction::WriteZeroes { host_offset, length }]
+                        if *host_offset == new_cluster && *length == cluster_size
+                ),
+                "sparse={sparse}: {actions:?}"
+            );
+        }
+    }
+
+    // A cluster with another reference, such as from an internal snapshot,
+    // cannot be zeroed in place. Our c80b0f174 moved the entry to a cluster of
+    // its own; v55 rejects writes to shared data clusters on purpose
+    // (b22a5b7ca, and writable images with internal snapshots do not open), so
+    // the write zeroes fails and leaves the cluster, its data and its
+    // reference alone, with no zero flag set.
+    #[test]
+    fn v2_zero_marker_leaves_shared_cluster_data_alone() {
+        use std::os::unix::fs::FileExt;
+
+        for sparse in [true, false] {
+            let image = v2_image();
+            let (mut inner, shared_cluster) = v2_state_with_data_cluster(&image);
+            let cluster_size = inner.raw_file.cluster_size() as usize;
+            image
+                .as_file()
+                .write_all_at(&vec![0xEE; cluster_size], shared_cluster)
+                .unwrap();
+            inner
+                .set_cluster_refcount_track_freed(shared_cluster, 2)
+                .unwrap();
+            let metadata = super::QcowMetadata::new(inner);
+
+            let err = metadata
+                .deallocate_bytes(0, cluster_size, sparse, true, Some(&PatternBacking))
+                .expect_err("a shared data cluster is not written");
+            assert_eq!(err.kind(), super::io::ErrorKind::Unsupported);
+
+            let mut inner = metadata.inner.write().unwrap();
+            assert_eq!(
+                inner.l2_cache.get(0).unwrap()[0],
+                super::l2_entry_make_std(shared_cluster),
+                "sparse={sparse}"
+            );
+            assert_eq!(inner.cluster_refcount(shared_cluster).unwrap(), 2);
+            let mut data = vec![0; cluster_size];
+            image
+                .as_file()
+                .read_exact_at(&mut data, shared_cluster)
+                .unwrap();
+            assert_eq!(data, vec![0xEE; cluster_size]);
+        }
+    }
+
     // Allocate past the refcount limit of the virtual size, then reopen after
     // a clean and an unclean close.
     #[test]

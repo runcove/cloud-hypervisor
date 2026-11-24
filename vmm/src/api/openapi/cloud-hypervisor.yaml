@@ -1367,6 +1367,28 @@ components:
           $ref: "#/components/schemas/LockGranularity"
         guest_block_size:
           type: integer
+        iouring_max_workers:
+          $ref: "#/components/schemas/IoUringMaxWorkers"
+
+    IoUringMaxWorkers:
+      required:
+        - bounded
+        - unbounded
+      type: object
+      description: >-
+        The most io_uring kernel worker threads each queue of the disk may
+        start. Set, the disk fails to activate unless the kernel applies the
+        limits; unset, a default of 16 bounded and 4 unbounded applies when the
+        kernel accepts it.
+      properties:
+        bounded:
+          type: integer
+          format: int32
+          minimum: 1
+        unbounded:
+          type: integer
+          format: int32
+          minimum: 1
 
     NetConfig:
       type: object

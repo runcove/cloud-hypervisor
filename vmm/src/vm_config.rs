@@ -15,6 +15,7 @@ use arch::CpuProfileConfig;
 #[cfg(target_arch = "x86_64")]
 use arch::CpuidOverride;
 use block::ImageType;
+pub use block::async_io::IoWorkerLimits;
 pub use block::fcntl::LockGranularityChoice;
 #[cfg(target_arch = "x86_64")]
 use devices::debug_console;
@@ -488,6 +489,11 @@ pub struct DiskConfig {
     pub lock_granularity: LockGranularityChoice,
     #[serde(default)]
     pub guest_block_size: Option<u32>,
+    // Caps each queue's io_uring workers. When unset, the default limits
+    // apply if the kernel accepts them; when set, the disk fails to activate
+    // unless they apply.
+    #[serde(default)]
+    pub iouring_max_workers: Option<IoWorkerLimits>,
 }
 
 impl ApplyLandlock for DiskConfig {

@@ -337,6 +337,9 @@ pub enum ValidationError {
     /// Disk guest_block_size is not a power of 2 within the supported range
     #[error("Disk guest_block_size must be a power of 2 between 512 and 65536: {0}")]
     InvalidGuestBlockSize(u32),
+    /// Disk iouring_max_workers has a limit outside 1..=i32::MAX
+    #[error("Disk iouring_max_workers limits must be between 1 and 2147483647: {0}:{1}")]
+    InvalidIoUringMaxWorkers(u32 /* bounded */, u32 /* unbounded */),
     /// Need shared memory for vfio-user
     #[error("Using user devices requires using shared memory or huge pages")]
     UserDevicesRequireSharedMemory,
@@ -458,6 +461,9 @@ pub enum ValidationError {
     /// The vhost-user backend provides the virtio config space
     #[error("guest_block_size is not supported with vhost-user")]
     VhostUserGuestBlockSizeNotSupported,
+    /// The vhost-user backend owns the disk's I/O threads
+    #[error("iouring_max_workers is not supported with vhost-user")]
+    VhostUserIoUringMaxWorkersNotSupported,
     /// The specified I/O port was invalid. It should be provided in hex, such as `0xe9`.
     #[cfg(target_arch = "x86_64")]
     #[error("The IO port was not properly provided in hex or a `0x` prefix is missing: {0}")]
@@ -1643,7 +1649,8 @@ impl DiskConfig {
         queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
         serial=<serial_number>,backing_files=on|off,sparse=on|off,\
         image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
-        guest_block_size=<size_in_bytes>\"";
+        guest_block_size=<size_in_bytes>,\
+        iouring_max_workers=<bounded>:<unbounded>\"";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1666,6 +1673,7 @@ impl DiskConfig {
             .add("image_type")
             .add("lock_granularity")
             .add("guest_block_size")
+            .add("iouring_max_workers")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
 
         parser.parse(disk).map_err(Error::ParseDisk)?;
@@ -1744,6 +1752,10 @@ impl DiskConfig {
             .convert::<u32>("guest_block_size")
             .map_err(Error::ParseDisk)?;
 
+        let iouring_max_workers = parser
+            .convert::<IoWorkerLimits>("iouring_max_workers")
+            .map_err(Error::ParseDisk)?;
+
         let rate_limiter_config = (rate_limiter_config.bandwidth.is_some()
             || rate_limiter_config.ops.is_some())
         .then_some(rate_limiter_config);
@@ -1775,6 +1787,7 @@ impl DiskConfig {
             image_type,
             lock_granularity,
             guest_block_size,
+            iouring_max_workers,
         })
     }
 
@@ -1821,6 +1834,23 @@ impl DiskConfig {
 
         if self.vhost_user && self.guest_block_size.is_some() {
             return Err(ValidationError::VhostUserGuestBlockSizeNotSupported);
+        }
+
+        if self.vhost_user && self.iouring_max_workers.is_some() {
+            return Err(ValidationError::VhostUserIoUringMaxWorkersNotSupported);
+        }
+
+        // The kernel reads a zero as "leave unchanged" and refuses a value
+        // above INT_MAX.
+        if let Some(limits) = self.iouring_max_workers
+            && [limits.bounded, limits.unbounded]
+                .iter()
+                .any(|&n| n == 0 || n > i32::MAX as u32)
+        {
+            return Err(ValidationError::InvalidIoUringMaxWorkers(
+                limits.bounded,
+                limits.unbounded,
+            ));
         }
 
         if self.rate_limiter_config.is_some() && self.rate_limit_group.is_some() {
@@ -5648,6 +5678,7 @@ pub(crate) mod tests {
             image_type: ImageType::Unknown,
             lock_granularity: LockGranularityChoice::default(),
             guest_block_size: None,
+            iouring_max_workers: None,
         }
     }
 
@@ -5656,6 +5687,60 @@ pub(crate) mod tests {
             image_type: ImageType::Raw,
             ..disk_fixture()
         }
+    }
+
+    #[test]
+    fn test_disk_iouring_max_workers_parsing() -> Result<()> {
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,iouring_max_workers=16:4")?,
+            DiskConfig {
+                iouring_max_workers: Some(IoWorkerLimits {
+                    bounded: 16,
+                    unbounded: 4,
+                }),
+                ..disk_fixture()
+            }
+        );
+        // Unset unless given.
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file")?.iouring_max_workers,
+            None
+        );
+        for bad in ["16", "16:", "a:4", "16:-1", "16:4:1"] {
+            DiskConfig::parse(&format!("path=/path/to_file,iouring_max_workers={bad}"))
+                .unwrap_err();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_iouring_max_workers_serde() {
+        // A config saved before the field existed (a snapshot, or a client
+        // that does not know it) still loads, with the field unset.
+        let old: DiskConfig =
+            serde_json::from_str(r#"{"path":"/path/to_file","num_queues":2,"queue_size":256}"#)
+                .unwrap();
+        assert_eq!(old.iouring_max_workers, None);
+        // An unset field is left out, as before.
+        assert!(
+            !serde_json::to_string(&old)
+                .unwrap()
+                .contains("iouring_max_workers")
+        );
+
+        let capped = DiskConfig {
+            iouring_max_workers: Some(IoWorkerLimits {
+                bounded: 16,
+                unbounded: 4,
+            }),
+            ..disk_fixture()
+        };
+        let json = serde_json::to_value(&capped).unwrap();
+        assert_eq!(
+            json["iouring_max_workers"],
+            serde_json::json!({"bounded": 16, "unbounded": 4})
+        );
+        assert_eq!(serde_json::from_value::<DiskConfig>(json).unwrap(), capped);
     }
 
     #[test]
@@ -8271,6 +8356,47 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ..raw_disk_fixture()
         }]);
         still_valid_config.validate().unwrap();
+
+        // A zero would leave that limit unchanged in the kernel, and the
+        // kernel refuses one above INT_MAX.
+        for (bounded, unbounded) in [(0, 4), (16, 0), (16, 1 << 31)] {
+            let mut invalid_config = valid_config.clone();
+            invalid_config.disks = Some(vec![DiskConfig {
+                iouring_max_workers: Some(IoWorkerLimits { bounded, unbounded }),
+                ..raw_disk_fixture()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::InvalidIoUringMaxWorkers(
+                    bounded, unbounded
+                ))
+            );
+        }
+
+        let mut still_valid_config = valid_config.clone();
+        still_valid_config.disks = Some(vec![DiskConfig {
+            iouring_max_workers: Some(IoWorkerLimits {
+                bounded: 1,
+                unbounded: i32::MAX as u32,
+            }),
+            ..raw_disk_fixture()
+        }]);
+        still_valid_config.validate().unwrap();
+
+        // The vhost-user backend, not Cloud Hypervisor, runs that disk's I/O.
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.disks = Some(vec![DiskConfig {
+            path: None,
+            vhost_user: true,
+            vhost_socket: Some("/path/to/sock".to_owned()),
+            iouring_max_workers: Some(IoWorkerLimits::DEFAULT),
+            ..disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::VhostUserIoUringMaxWorkersNotSupported)
+        );
 
         // The override is backend agnostic and accepted for non raw images.
         let mut still_valid_config = valid_config.clone();

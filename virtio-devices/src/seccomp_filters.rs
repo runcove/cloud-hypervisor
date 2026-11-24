@@ -16,6 +16,18 @@ use seccompiler::{
     SeccompFilter, SeccompRule,
 };
 
+/// The open and openat flags that must all be clear for an open to be
+/// allowed, with the access mode, which must be O_RDONLY (0): an open that
+/// writes, creates, truncates, appends or makes an unnamed temporary file is
+/// refused. O_TMPFILE is __O_TMPFILE | O_DIRECTORY, so only its own bit is in
+/// the mask and a read-only O_DIRECTORY open still passes. Other flags, such
+/// as O_CLOEXEC, O_LARGEFILE and O_DIRECTORY, are not checked.
+const READ_ONLY_OPEN_MASK: u64 = (libc::O_ACCMODE
+    | libc::O_CREAT
+    | libc::O_TRUNC
+    | libc::O_APPEND
+    | (libc::O_TMPFILE & !libc::O_DIRECTORY)) as u64;
+
 #[derive(Clone, Copy)]
 pub enum Thread {
     VirtioBalloon,
@@ -130,6 +142,13 @@ fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_fstat, vec![]),
         (libc::SYS_fsync, vec![]),
         (libc::SYS_ftruncate, vec![]),
+        // The panic hook prints a backtrace when RUST_BACKTRACE is set, which
+        // needs getcwd, readlink and, to read /proc/self/maps, open and stat.
+        // Without them the panic is a SIGSYS. The x86_64 musl libc calls the
+        // legacy open, stat and readlink; the other architectures only have
+        // the *at forms. open is allowed only as openat is in the common
+        // rules, as a read-only open (see READ_ONLY_OPEN_MASK).
+        (libc::SYS_getcwd, vec![]),
         (libc::SYS_getrandom, vec![]),
         (libc::SYS_ioctl, create_virtio_block_ioctl_seccomp_rule()),
         (libc::SYS_io_destroy, vec![]),
@@ -138,14 +157,33 @@ fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_io_uring_enter, vec![]),
         (libc::SYS_lseek, vec![]),
         (libc::SYS_newfstatat, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (
+            libc::SYS_open,
+            or![and![
+                Cond::new(
+                    1, // open() flags argument
+                    ArgLen::Dword,
+                    MaskedEq(READ_ONLY_OPEN_MASK),
+                    libc::O_RDONLY as u64,
+                )
+                .unwrap()
+            ]],
+        ),
         (libc::SYS_pread64, vec![]),
         (libc::SYS_preadv, vec![]),
         (libc::SYS_pwritev, vec![]),
         (libc::SYS_pwritev2, vec![]),
         (libc::SYS_pwrite64, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_readlink, vec![]),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        (libc::SYS_readlinkat, vec![]),
         (libc::SYS_sched_getaffinity, vec![]),
         (libc::SYS_sched_setaffinity, vec![]),
         (libc::SYS_set_robust_list, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_stat, vec![]),
         (libc::SYS_statx, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
     ]
@@ -396,13 +434,14 @@ fn virtio_thread_common() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_mprotect, vec![]),
         (libc::SYS_mremap, vec![]),
         (libc::SYS_munmap, vec![]),
+        // Read-only opens only (see READ_ONLY_OPEN_MASK).
         (
             libc::SYS_openat,
             or![and![
                 Cond::new(
                     2, // openat() flags argument
                     ArgLen::Dword,
-                    MaskedEq(libc::O_ACCMODE as u64),
+                    MaskedEq(READ_ONLY_OPEN_MASK),
                     libc::O_RDONLY as u64,
                 )
                 .unwrap()

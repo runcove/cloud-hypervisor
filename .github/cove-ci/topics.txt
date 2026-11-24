@@ -1,0 +1,55 @@
+# topics.txt -- the topic branches that make up cove-patches-<upstream tag>, in
+# the order assemble.sh merges them (git merge --no-ff, one merge per line).
+#
+# Syntax, one entry per line; '#' starts a comment, blank lines are ignored,
+# fields are separated by spaces:
+#
+#   @upstream <tag>                       the upstream tag the line is built on
+#                                         (assemble.sh --base overrides it)
+#   <branch> [base=<branch>]... [never-upstream]
+#
+#   <branch>        a topic branch name; assemble.sh reads it as
+#                   <prefix><branch> (--prefix, empty by default: the local
+#                   branch; origin/ for the fork's remote branches).
+#   base=<branch>   the topic is stacked on <branch>, an entry listed above
+#                   it; repeat for each topic it contains. The base must be an
+#                   ancestor of the topic. A topic with no base= sits directly
+#                   on the upstream tag.
+#   never-upstream  the topic is fork-only and is never offered upstream.
+#
+# Every topic must contain the upstream tag's commit. A topic that upstream
+# took is not deleted from history: it moves to the dropped block at the end,
+# as a comment, so it is never merged.
+#
+# Order: the fork-only topics first, then the rest in the v55 port map's
+# order. musl-seccomp-allowances is fork-only too, but it is stacked on
+# block-discard-offload, so it keeps its place in the map's order.
+
+@upstream v55.0
+
+# Fork-only.
+topic/fork-readme                                   never-upstream
+topic/fork-ci                                       never-upstream
+topic/fork-release      base=topic/fork-ci          never-upstream
+
+# Upstreamable, in map order (rows 1-14, then 18).
+topic/iouring-eagain-retry
+topic/xfs-dio-read-align
+topic/balloon-restore-drain
+topic/block-discard-offload
+topic/musl-seccomp-allowances base=topic/block-discard-offload never-upstream
+topic/write-zeroes-unmap      base=topic/block-discard-offload
+topic/qcow2-zero-tests        base=topic/write-zeroes-unmap
+topic/iouring-worker-cap      base=topic/musl-seccomp-allowances base=topic/iouring-eagain-retry
+topic/cow-restore-virtio-mem
+topic/copy-on-access-restore  base=topic/cow-restore-virtio-mem
+topic/cow-restore-anon-holes  base=topic/copy-on-access-restore
+topic/restore-fill-status     base=topic/cow-restore-anon-holes
+topic/uffd-hole-zeroes        base=topic/restore-fill-status
+topic/uffd-readahead          base=topic/uffd-hole-zeroes
+topic/restore-missing-device
+
+# Dropped (taken upstream; never merged):
+#   topic/rustix-1.1.6          upstream b1fbbc365 (v55.0's Cargo.lock has rustix 1.1.6)
+#   topic/qcow2-zero-handling   upstream 8740d147d, 59993240c, 6434fe739; its tests
+#                               live on as topic/qcow2-zero-tests

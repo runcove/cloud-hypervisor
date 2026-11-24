@@ -9,7 +9,9 @@ use std::io;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::AlignedFile;
-use crate::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult};
+use crate::async_io::{
+    AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, IoWorkerLimits,
+};
 use crate::formats::raw::engine_sync::RawSync;
 
 pub(super) struct FixedVhdSync {
@@ -42,6 +44,10 @@ impl AsyncIo for FixedVhdSync {
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
         self.raw_file_sync.fsync(user_data)
+    }
+
+    fn set_io_worker_limits(&mut self, limits: IoWorkerLimits) -> io::Result<()> {
+        self.raw_file_sync.set_io_worker_limits(limits)
     }
 
     fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {

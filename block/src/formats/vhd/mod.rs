@@ -225,6 +225,22 @@ mod tests {
         assert_async_io(&disk, true);
     }
 
+    #[cfg(feature = "io_uring")]
+    #[test]
+    fn io_uring_backend_caps_its_workers() {
+        use crate::async_io::IoWorkerLimits;
+
+        let disk = VhdDisk::new(make_vhd_file(), true, false).unwrap();
+        let io = &mut *disk.create_async_io(128).unwrap();
+        io.set_io_worker_limits(IoWorkerLimits::DEFAULT).unwrap();
+        // The limits reach the ring: one the kernel refuses is an error.
+        io.set_io_worker_limits(IoWorkerLimits {
+            bounded: 16,
+            unbounded: u32::MAX,
+        })
+        .unwrap_err();
+    }
+
     #[test]
     fn sync_rejects_read_straddling_logical_size() {
         let file = TempFile::new().unwrap().into_file();
