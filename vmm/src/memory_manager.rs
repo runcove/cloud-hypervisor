@@ -4932,10 +4932,14 @@ fn remap_cow_holes_with(
         };
         // A failed MAP_FIXED normally leaves the file mapping as it was
         // (an older kernel may instead have unmapped the whole range), so
-        // map the file back only where nothing is mapped: EEXIST means the
-        // file mapping survived. MAP_FIXED would fail here as the remap did
-        // when that ran out of VMAs (ENOMEM at vm.max_map_count), since
-        // replacing part of the mapping needs the same splits.
+        // map the file back only where nothing is mapped. EEXIST only says
+        // some page of the range is still mapped; it is read as "the file
+        // mapping survived" on the assumption that a failed MAP_FIXED
+        // never leaves the range partly unmapped (it either unmapped
+        // nothing, as at vm.max_map_count, or the whole range). MAP_FIXED
+        // would fail here as the remap did when that ran out of VMAs
+        // (ENOMEM at vm.max_map_count), since replacing part of the mapping
+        // needs the same splits.
         match map_file(
             addr,
             hole.len as usize,
@@ -4944,11 +4948,16 @@ fn remap_cow_holes_with(
         ) {
             Ok(ret) if ret != addr => {
                 // A kernel before 4.17 takes MAP_FIXED_NOREPLACE as a hint
-                // and maps elsewhere when the range is in use, so the file
-                // mapping survived: drop the stray copy.
+                // and maps elsewhere, which tells nothing about whether the
+                // range is still mapped: drop the stray copy and fail the
+                // restore rather than risk leaving the hole unmapped.
                 // SAFETY: ret..ret + len is the mapping just made, which
                 // nothing else knows of.
                 unsafe { libc::munmap(ret.cast(), hole.len as usize) };
+                return Err(Error::SnapshotMmap(io::Error::other(format!(
+                    "remapping a snapshot file hole failed ({e}) and the kernel \
+                     ignored MAP_FIXED_NOREPLACE when mapping the file back"
+                ))));
             }
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
@@ -6029,6 +6038,50 @@ mod tests {
         assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * MIB)).unwrap(), 0xcd);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(7 * MIB)).unwrap(), 0xef);
+    }
+
+    #[test]
+    fn cow_hole_remap_fails_when_the_kernel_ignores_fixed_noreplace() {
+        use std::ptr;
+
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        let gm = private_file_mapping(&file, 10 * MIB);
+        // A kernel before 4.17 takes MAP_FIXED_NOREPLACE as a hint and maps
+        // the file elsewhere; whether the hole is still mapped is then
+        // unknown, so the restore fails.
+        let mut file_calls = 0;
+        let res = remap_cow_holes_with(
+            &[whole_mapping(&gm)],
+            &file,
+            HoleRemapLimits::default(),
+            |_, _, _| Err(io::Error::from_raw_os_error(libc::ENOMEM)),
+            |_, len, flags, off| {
+                file_calls += 1;
+                // SAFETY: no address and no MAP_FIXED: the kernel picks a
+                // free range, which the code under test unmaps again.
+                let ret = unsafe {
+                    libc::mmap(
+                        ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        flags & !libc::MAP_FIXED_NOREPLACE,
+                        file.as_raw_fd(),
+                        off,
+                    )
+                };
+                if ret == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(ret.cast())
+            },
+        );
+        assert!(matches!(res, Err(Error::SnapshotMmap(_))), "{res:?}");
+        assert_eq!(file_calls, 1);
+        // The guest's file mapping was left alone.
+        assert!(gpa_is_file_backed(&gm, 2 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
     }
 
     #[test]
