@@ -1237,7 +1237,14 @@ impl MemoryManager {
         let mut file_cursor: u64 = 0;
 
         for range in saved_regions.ranges() {
-            let end = file_cursor + range.length;
+            // Every guest address and file offset below lies before these two
+            // ends, so neither sum wraps once both are checked.
+            let end = file_cursor.checked_add(range.length).ok_or_else(|| {
+                invalid_saved_ranges("saved memory ranges overflow a file offset")
+            })?;
+            range.gpa.checked_add(range.length).ok_or_else(|| {
+                invalid_saved_ranges("a saved memory range overflows guest memory")
+            })?;
 
             // First call doubles as a SEEK_HOLE-support probe. On error,
             // take the dense path which seeks-and-streams sequentially.
@@ -1373,7 +1380,11 @@ impl MemoryManager {
             .open(file_path)
             .map_err(Error::SnapshotOpen)?;
         // A range mapped past EOF faults SIGBUS at run time, not restore time.
-        let mapped_len: u64 = saved_regions.ranges().iter().map(|r| r.length).sum();
+        let mapped_len = saved_regions
+            .ranges()
+            .iter()
+            .try_fold(0u64, |end, r| end.checked_add(r.length))
+            .ok_or_else(|| invalid_saved_ranges("saved memory ranges overflow a file offset"))?;
         let file_len = memory_file.metadata().map_err(Error::SnapshotOpen)?.len();
         if file_len < mapped_len {
             return Err(Error::SnapshotMmap(io::Error::new(
@@ -2867,6 +2878,9 @@ impl MemoryManager {
 
             let mem_snapshot: MemoryManagerSnapshotData =
                 snapshot.to_state().map_err(Error::Restore)?;
+            // Before anything is mapped or copied for the ranges, whichever
+            // restore mode then runs.
+            check_snapshot_memory_ranges(&mem_snapshot.memory_ranges)?;
 
             let mm = MemoryManager::new(
                 vm,
@@ -4494,6 +4508,44 @@ fn is_restore_cow_compatible(guest_memory: &GuestMemory, saved_regions: &MemoryR
     !saved_ranges_overlap_each_other(saved_regions)
 }
 
+// The most memory ranges a snapshot may list. A snapshot lists one range per
+// guest RAM region, a handful per memory zone, plus one per run of plugged
+// virtio-mem blocks (`memory_range_table` with `SkipPersisted`, adjacent
+// plugged blocks merged into one range). Blocks are 2 MiB, so the most
+// ranges a guest can produce is one per 4 MiB of virtio-mem space, with every
+// other block plugged: 2^22 ranges is 16 TiB of such space, far beyond any
+// guest we run, and the table is then 64 MiB (16 bytes a range).
+const MAX_SNAPSHOT_MEMORY_RANGES: usize = 1 << 22;
+
+fn invalid_saved_ranges(msg: &str) -> Error {
+    Error::SnapshotRead(io::Error::new(io::ErrorKind::InvalidData, msg.to_string()))
+}
+
+// Fails when a snapshot lists more memory ranges than any guest produces, or
+// ranges whose guest addresses or back-to-back file offsets do not fit.
+fn check_snapshot_memory_ranges(saved_regions: &MemoryRangeTable) -> Result<(), Error> {
+    let count = saved_regions.ranges().len();
+    if count > MAX_SNAPSHOT_MEMORY_RANGES {
+        return Err(invalid_saved_ranges(&format!(
+            "snapshot lists {count} memory ranges, more than the {MAX_SNAPSHOT_MEMORY_RANGES} a restore accepts"
+        )));
+    }
+    let mut file_end: u64 = 0;
+    for range in saved_regions.ranges() {
+        if range.gpa.checked_add(range.length).is_none() {
+            return Err(invalid_saved_ranges(
+                "a saved memory range overflows guest memory",
+            ));
+        }
+        // Offsets are passed to lseek and mmap as off_t.
+        file_end = file_end
+            .checked_add(range.length)
+            .filter(|&end| i64::try_from(end).is_ok())
+            .ok_or_else(|| invalid_saved_ranges("saved memory ranges overflow a file offset"))?;
+    }
+    Ok(())
+}
+
 // Whether two saved ranges share a guest address. Empty ranges share none.
 fn saved_ranges_overlap_each_other(saved_regions: &MemoryRangeTable) -> bool {
     let mut spans: Vec<(u64, u64)> = saved_regions
@@ -5609,6 +5661,99 @@ mod tests {
         let ret = unsafe { libc::madvise(host.cast(), page as usize, libc::MADV_DONTNEED) };
         assert_eq!(ret, 0);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+    }
+
+    fn assert_invalid_ranges(res: Result<(), Error>, what: &str) {
+        match res {
+            Err(Error::SnapshotRead(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("{what} accepted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_refuses_overflowing_saved_ranges() {
+        const MIB: u64 = 1 << 20;
+        let range = |gpa, length| MemoryRange { gpa, length };
+        let table = |ranges: &[MemoryRange]| {
+            let mut t = MemoryRangeTable::default();
+            for r in ranges {
+                t.push(*r);
+            }
+            t
+        };
+
+        // File offsets that wrap, that pass off_t, and a guest end that wraps.
+        let wrapping_offset = table(&[range(0, 4 * MIB), range(32 * MIB, u64::MAX)]);
+        let past_off_t = table(&[range(0, 1 << 62), range(1 << 62, 1 << 62)]);
+        let wrapping_gpa = table(&[range(u64::MAX - MIB, 2 * MIB)]);
+        for (t, what) in [
+            (&wrapping_offset, "wrapping file offset"),
+            (&past_off_t, "file offset past off_t"),
+            (&wrapping_gpa, "wrapping guest address"),
+        ] {
+            assert_invalid_ranges(check_snapshot_memory_ranges(t), what);
+        }
+
+        // The copy and copy-on-write paths refuse them too, without the
+        // loading check, before copying anything for the bad range.
+        let (gm, zones) = restore_zone_with_virtio_mem();
+        let file = snapshot_file(&[(0xab, 4 * MIB)]);
+        for t in [&wrapping_offset, &wrapping_gpa] {
+            assert_invalid_ranges(
+                MemoryManager::copy_saved_regions(&gm, file.path().to_path_buf(), t),
+                "copy of overflowing ranges",
+            );
+            assert_invalid_ranges(
+                MemoryManager::cow_map_saved_regions(
+                    &gm,
+                    &zones,
+                    false,
+                    file.path().to_path_buf(),
+                    t,
+                )
+                .map(|_| ()),
+                "copy-on-write of overflowing ranges",
+            );
+        }
+    }
+
+    #[test]
+    fn restore_refuses_more_saved_ranges_than_the_bound() {
+        let page = get_page_size();
+        let mut table = MemoryRangeTable::default();
+        for i in 0..MAX_SNAPSHOT_MEMORY_RANGES as u64 {
+            table.push(MemoryRange {
+                gpa: i * 2 * page,
+                length: page,
+            });
+        }
+        check_snapshot_memory_ranges(&table).unwrap();
+        table.push(MemoryRange {
+            gpa: MAX_SNAPSHOT_MEMORY_RANGES as u64 * 2 * page,
+            length: page,
+        });
+        assert_invalid_ranges(check_snapshot_memory_ranges(&table), "one range too many");
+    }
+
+    #[test]
+    fn restore_copies_well_formed_saved_ranges() {
+        const MIB: u64 = 1 << 20;
+        let (gm, _zones) = restore_zone_with_virtio_mem();
+        let file = snapshot_file(&[(0xab, 4 * MIB), (0xcd, 2 * MIB)]);
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        check_snapshot_memory_ranges(&table).unwrap();
+        MemoryManager::copy_saved_regions(&gm, file.path().to_path_buf(), &table).unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(4 * MIB - 1)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(18 * MIB)).unwrap(), 0xcd);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(20 * MIB - 1)).unwrap(), 0xcd);
     }
 
     #[test]
