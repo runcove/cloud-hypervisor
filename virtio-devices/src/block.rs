@@ -2278,8 +2278,10 @@ impl Migratable for Block {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Result as IoResult};
+    use std::ffi::CString;
+    use std::io::{self, Error as IoError, Result as IoResult};
     use std::ops::Range;
+    use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
     use std::process::Command;
     use std::sync::Mutex;
@@ -2296,6 +2298,7 @@ mod tests {
     use vm_virtio::AccessType;
     use vm_virtio::queue::testing::VirtQueue as GuestQ;
     use vmm_sys_util::eventfd::EFD_NONBLOCK;
+    use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -4892,10 +4895,10 @@ mod tests {
     /// backend apply it. A syscall the filter does not allow raises SIGSYS.
     ///
     /// This runs in a process of its own, so that SIGSYS fails this test
-    /// rather than killing the test binary, and without RUST_BACKTRACE: the
-    /// panic hook then prints the backtrace, which needs getcwd and readlink,
-    /// and the filter allows neither. --nocapture has the hook write to stderr
-    /// as it does in the VMM.
+    /// rather than killing the test binary, and without RUST_BACKTRACE, so
+    /// the panic hook prints no backtrace (virtio_block_filter_allows_backtrace
+    /// covers that case). --nocapture has the hook write to stderr as it does
+    /// in the VMM.
     #[test]
     fn virtio_block_filter_allows_offload_worker() {
         const IN_CHILD: &str = "VIRTIO_BLOCK_FILTER_TEST_CHILD";
@@ -4958,5 +4961,141 @@ mod tests {
         drop(sender);
         assert_eq!(worker.join().unwrap(), 2);
         assert_eq!(notifier.read().unwrap(), 2);
+    }
+
+    /// A panic on a thread under the virtio-block seccomp filter, with
+    /// RUST_BACKTRACE set, must unwind rather than raise SIGSYS: the panic hook
+    /// prints a backtrace, which needs getcwd and readlink.
+    ///
+    /// This runs in a process of its own, so that the backtrace symbolization
+    /// is not already cached by another test, and so that SIGSYS fails this
+    /// test rather than killing the test binary. --nocapture has the hook write
+    /// to stderr as it does in the VMM.
+    #[test]
+    fn virtio_block_filter_allows_backtrace() {
+        const IN_CHILD: &str = "VIRTIO_BLOCK_BACKTRACE_TEST_CHILD";
+        if env::var_os(IN_CHILD).is_none() {
+            let output = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "block::tests::virtio_block_filter_allows_backtrace",
+                    "--nocapture",
+                ])
+                .env(IN_CHILD, "1")
+                .env("RUST_BACKTRACE", "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{}\n{stderr}", output.status);
+            // A filter on the test name that matched nothing also succeeds.
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            assert!(stderr.contains("stack backtrace"), "{stderr}");
+            return;
+        }
+        let filter = get_seccomp_filter(&SeccompAction::Trap, Thread::VirtioBlock).unwrap();
+        thread::spawn(move || {
+            apply_filter(&filter).unwrap();
+            let caught = panic::catch_unwind(|| panic!("offloaded operation panicked"));
+            assert!(caught.is_err());
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Only read-only opens pass the virtio-block seccomp filter, through
+    /// openat on every architecture and the legacy open on x86_64: the flags
+    /// the musl backtrace printer passes, O_RDONLY | O_LARGEFILE | O_CLOEXEC,
+    /// and a read-only O_DIRECTORY open are allowed; a writable open and a
+    /// read-only one with O_CREAT, O_TRUNC, O_APPEND or O_TMPFILE are refused,
+    /// and the file that O_CREAT or O_TRUNC would change is left as it was.
+    #[test]
+    fn virtio_block_filter_refuses_writable_open() {
+        // libc's O_LARGEFILE is 0 for x86_64 glibc; musl passes the kernel's.
+        #[cfg(target_arch = "x86_64")]
+        const O_LARGEFILE: libc::c_int = 0o100000;
+        #[cfg(not(target_arch = "x86_64"))]
+        const O_LARGEFILE: libc::c_int = libc::O_LARGEFILE;
+
+        let dir = TempDir::new().unwrap();
+        let existing = dir.as_path().join("existing");
+        fs::write(&existing, b"contents").unwrap();
+        let missing = dir.as_path().join("missing");
+        let c_path = |path: &Path| CString::new(path.as_os_str().as_bytes()).unwrap();
+        let (existing_c, missing_c, dir_c) =
+            (c_path(&existing), c_path(&missing), c_path(dir.as_path()));
+
+        let filter = get_seccomp_filter(
+            &SeccompAction::Errno(libc::EPERM as u32),
+            Thread::VirtioBlock,
+        )
+        .unwrap();
+        let results = thread::spawn(move || {
+            apply_filter(&filter).unwrap();
+            let cases = [
+                (
+                    "musl read-only",
+                    &existing_c,
+                    libc::O_RDONLY | O_LARGEFILE | libc::O_CLOEXEC,
+                ),
+                (
+                    "directory",
+                    &dir_c,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                ),
+                ("write-only", &existing_c, libc::O_WRONLY),
+                ("create", &missing_c, libc::O_RDONLY | libc::O_CREAT),
+                ("truncate", &existing_c, libc::O_RDONLY | libc::O_TRUNC),
+                ("append", &existing_c, libc::O_RDONLY | libc::O_APPEND),
+                ("tmpfile", &dir_c, libc::O_RDONLY | libc::O_TMPFILE),
+            ];
+            let mut results = Vec::new();
+            for (name, path, flags) in cases {
+                let mut calls = vec![("openat", libc::SYS_openat)];
+                #[cfg(target_arch = "x86_64")]
+                calls.push(("open", libc::SYS_open));
+                for (call, nr) in calls {
+                    // SAFETY: path is a NUL-terminated string that outlives
+                    // the call, and the mode is only read with O_CREAT.
+                    let fd = unsafe {
+                        if nr == libc::SYS_openat {
+                            libc::syscall(nr, libc::AT_FDCWD, path.as_ptr(), flags, 0o600)
+                        } else {
+                            libc::syscall(nr, path.as_ptr(), flags, 0o600)
+                        }
+                    } as i32;
+                    let errno = IoError::last_os_error().raw_os_error();
+                    if fd >= 0 {
+                        // SAFETY: fd was just opened here.
+                        unsafe { libc::close(fd) };
+                    }
+                    results.push((name, call, fd >= 0, errno));
+                }
+            }
+            results
+        })
+        .join()
+        .unwrap();
+
+        let wrong: Vec<_> = results
+            .into_iter()
+            .filter(|&(name, _, opened, errno)| match name {
+                "musl read-only" | "directory" => !opened,
+                _ => opened || errno != Some(libc::EPERM),
+            })
+            .map(|(name, call, opened, errno)| {
+                if opened {
+                    format!("{call} {name}: opened")
+                } else {
+                    format!("{call} {name}: refused with {errno:?}")
+                }
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert!(!missing.exists(), "O_CREAT created the file");
+        assert_eq!(
+            fs::read(&existing).unwrap(),
+            b"contents",
+            "O_TRUNC truncated"
+        );
     }
 }
