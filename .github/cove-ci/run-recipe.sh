@@ -46,10 +46,14 @@ case "$BUILD_PHASE" in
     [ -r "$BLOCK_OUT/MANIFEST" ] || cannot "no block test executables came out of the build phase"
     OPTS=(--network none --memory 10g --memory-swap 10g --security-opt seccomp=unconfined)
     ;;
-  # The arguments upstream's scripts/dev_cli.sh gives its unit tests.
+  # The arguments upstream's scripts/dev_cli.sh gives its unit tests, plus
+  # /dev/userfaultfd for the vmm's uffd restore tests, which fail without it.
+  # The device, not CAP_SYS_PTRACE or a host-wide sysctl, is the least
+  # privilege: it lets this container create userfaultfds and nothing else.
   test)
+    [ -c /dev/userfaultfd ] || cannot "the runner has no /dev/userfaultfd, which the uffd tests need"
     OPTS=(--network bridge --memory 14g --memory-swap 14g --security-opt seccomp=unconfined
-          --device /dev/kvm --device /dev/net/tun --cap-add net_admin)
+          --device /dev/kvm --device /dev/net/tun --device /dev/userfaultfd --cap-add net_admin)
     ;;
   *) cannot "phase '$BUILD_PHASE' is not build, block-tests or test" ;;
 esac
