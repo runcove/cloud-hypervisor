@@ -22,7 +22,7 @@ use seccompiler::{
 /// refused. O_TMPFILE is __O_TMPFILE | O_DIRECTORY, so only its own bit is in
 /// the mask and a read-only O_DIRECTORY open still passes. Other flags, such
 /// as O_CLOEXEC, O_LARGEFILE and O_DIRECTORY, are not checked.
-const READ_ONLY_OPEN_MASK: u64 = (libc::O_ACCMODE
+pub const READ_ONLY_OPEN_MASK: u64 = (libc::O_ACCMODE
     | libc::O_CREAT
     | libc::O_TRUNC
     | libc::O_APPEND
