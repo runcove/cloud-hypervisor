@@ -22,7 +22,10 @@ permissions: {}
 jobs:
   # The release workflow's own test: cove-release.yml's triggers and its check of
   # the previous release's checkpoint attestation, against a stub gh and a temp
-  # repo. It needs git, python3 with yaml and bash, and runs no tree code.
+  # repo. It needs git, python3 with yaml and bash. It runs the tree's own test
+  # script, which runs the tree's version.sh and the step script from the tree's
+  # cove-release.yml, with no permissions and no secrets; it must never be given
+  # a token without re-reviewing that.
   release-workflow:
     name: release workflow test
     runs-on: ubuntu-24.04

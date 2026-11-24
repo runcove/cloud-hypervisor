@@ -22,10 +22,11 @@ name: cove-release
 # attests.
 #
 # A pushed release's attestations carry the tag as their source ref and the
-# commit it names as their source and signer digest. A dispatched release's
-# carry the branch as their source ref and its head at dispatch as both
-# digests: a commit holding the tag's commit. The smoke checks the previous
-# release's checkpoint against exactly one of those two shapes (runcove-b7nqq).
+# commit it names as their source and signer digest, a commit that is also on
+# the tag's branch. A dispatched release's carry the branch as their source
+# ref and its head at dispatch as both digests: a commit holding the tag's
+# commit. The smoke checks the previous release's checkpoint against exactly
+# one of those two shapes (runcove-b7nqq).
 # BUILDINFO's fork sha is the commit that was built.
 #
 # Dispatch missed release tags in ascending order, each only once the one
@@ -304,15 +305,17 @@ jobs:
           ls -l /dev/kvm
 
       # The previous release is the highest v<upstream>-cove.<n> below this
-      # version, by version.sh's ordering, that has a GitHub Release; a test
-      # build past a release tag counts that tag as below it. No such Release,
+      # version, by version.sh's ordering, that has a GitHub Release. This
+      # workflow builds only release tags, so the version is the tag being
+      # built and the previous release is strictly below it. No such Release,
       # or one without a checkpoint (the first GitHub release has none): step 5
       # is skipped. Anything else that goes wrong fails the job: the checkpoint
       # is used only when its attestation is from this workflow on a
       # GitHub-hosted runner in one of the two release shapes in the header
-      # (the push of the previous tag at the commit it names, or a dispatch
-      # from its branch at a commit that holds the tag's commit and is still
-      # on the branch), and its sha256 matches the one published beside it.
+      # (the push of the previous tag at the commit it names, when that commit
+      # is also on the tag's branch, or a dispatch from its branch at a commit
+      # that holds the tag's commit and is still on the branch), and its sha256
+      # matches the one published beside it.
       - name: Fetch the previous release's checkpoint
         env:
           VERSION: ${{ needs.build.outputs.version }}
