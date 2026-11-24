@@ -48,6 +48,9 @@ topic/restore-fill-status     base=topic/cow-restore-anon-holes
 topic/uffd-hole-zeroes        base=topic/restore-fill-status
 topic/uffd-readahead          base=topic/uffd-hole-zeroes
 topic/restore-missing-device
+topic/vmm-readonly-open-mask  base=topic/musl-seccomp-allowances
+topic/coa-restore-file-check  base=topic/cow-restore-anon-holes
+topic/restore-range-checks    base=topic/restore-fill-status
 
 # Dropped (taken upstream; never merged):
 #   topic/rustix-1.1.6          upstream b1fbbc365 (v55.0's Cargo.lock has rustix 1.1.6)
