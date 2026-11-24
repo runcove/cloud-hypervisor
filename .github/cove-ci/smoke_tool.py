@@ -64,7 +64,8 @@ import sys
 import tarfile
 
 TARBALL = "ch-smoke-checkpoint.tar.gz"
-# smoke.sh's VERSION shape: a release tag, or git describe output for a test build.
+# smoke.sh's VERSION shape: a release tag, or the git describe output of a branch build
+# (ch-ci's ch-smoke).
 VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9._-]+)?$")
 # A checkpoint is guest RAM (256 MiB) plus a 64 MiB disk and a few small files;
 # 4 GiB leaves room for a bigger guest and stops a runaway one.

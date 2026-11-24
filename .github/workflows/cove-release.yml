@@ -22,10 +22,11 @@ name: cove-release
 # attests.
 #
 # A pushed release's attestations carry the tag as their source ref and the
-# commit it names as their source and signer digest. A dispatched release's
-# carry the branch as their source ref and its head at dispatch as both
-# digests: a commit holding the tag's commit. The smoke checks the previous
-# release's checkpoint against exactly one of those two shapes (runcove-b7nqq).
+# commit it names as their source and signer digest, a commit that is also on
+# the tag's branch. A dispatched release's carry the branch as their source
+# ref and its head at dispatch as both digests: a commit holding the tag's
+# commit. The smoke checks the previous release's checkpoint against exactly
+# one of those two shapes (runcove-b7nqq).
 # BUILDINFO's fork sha is the commit that was built.
 #
 # Dispatch missed release tags in ascending order, each only once the one
@@ -69,7 +70,7 @@ jobs:
       sha: ${{ steps.checkout.outputs.sha }}
     steps:
       # Plain git and no token: full history and tags, because build.rs runs
-      # `git describe` and the release branch is checked below. A test tag is
+      # `git describe` and the release branch is checked below. A ci-test-* tag is
       # dropped from the clone: annotated, it would be what `git describe` says.
       # A push builds the pushed ref at GITHUB_SHA; a dispatch builds its input
       # tag at the commit that tag names. Both go on as TAG and FORK_SHA (and
@@ -304,15 +305,17 @@ jobs:
           ls -l /dev/kvm
 
       # The previous release is the highest v<upstream>-cove.<n> below this
-      # version, by version.sh's ordering, that has a GitHub Release; a test
-      # build past a release tag counts that tag as below it. No such Release,
+      # version, by version.sh's ordering, that has a GitHub Release. This
+      # workflow builds only release tags, so the version is the tag being
+      # built and the previous release is strictly below it. No such Release,
       # or one without a checkpoint (the first GitHub release has none): step 5
       # is skipped. Anything else that goes wrong fails the job: the checkpoint
       # is used only when its attestation is from this workflow on a
       # GitHub-hosted runner in one of the two release shapes in the header
-      # (the push of the previous tag at the commit it names, or a dispatch
-      # from its branch at a commit that holds the tag's commit and is still
-      # on the branch), and its sha256 matches the one published beside it.
+      # (the push of the previous tag at the commit it names, when that commit
+      # is also on the tag's branch, or a dispatch from its branch at a commit
+      # that holds the tag's commit and is still on the branch), and its sha256
+      # matches the one published beside it.
       - name: Fetch the previous release's checkpoint
         env:
           VERSION: ${{ needs.build.outputs.version }}
@@ -371,8 +374,9 @@ jobs:
           pin=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/cove-release.yml"
             --deny-self-hosted-runners)
           if gh attestation verify "$dl/$name" "${pin[@]}" \
-              --source-ref "refs/tags/$prev" --source-digest "$prev_sha" --signer-digest "$prev_sha" </dev/null; then
-            echo "$prev's checkpoint: attested by the push of $prev at $prev_sha"
+              --source-ref "refs/tags/$prev" --source-digest "$prev_sha" --signer-digest "$prev_sha" </dev/null \
+            && git -C "$pc" merge-base --is-ancestor "$prev_sha" "$branch_ref"; then
+            echo "$prev's checkpoint: attested by the push of $prev at $prev_sha, on $branch_ref"
           else
             echo "$prev's checkpoint: not the push shape; trying a dispatch from $branch_ref"
             signer=''
