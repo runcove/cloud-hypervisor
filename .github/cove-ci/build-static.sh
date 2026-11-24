@@ -360,6 +360,11 @@ if [ "$BUILD_PHASE" = test ]; then
   HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')
   [ -n "$HOST_TARGET" ] || cannot "rustc -vV names no host target"
   export RUST_BACKTRACE=1
+  phase "test tools"
+  # qemu-img, for block's VHDX tests: from v55 they fail without it (v54.1
+  # skipped them). Only this phase installs it; a release build never has it.
+  apt-get install -y -qq --no-install-recommends qemu-utils >/dev/null
+  command -v qemu-img >/dev/null || cannot "qemu-utils installed no qemu-img"
   phase "cargo clippy -p block"
   cargo clippy --locked -p block --features "$BLOCK_FEATURES" --all-targets -- -D warnings
   phase "block tests"
@@ -368,8 +373,18 @@ if [ "$BUILD_PHASE" = test ]; then
   cargo test --locked --lib --bins --target "$HOST_TARGET" --release --workspace
   phase "virtio-block seccomp filter tests (x86_64 musl)"
   # Every test whose name contains virtio_block_filter, so later ones run too.
-  RUST_BACKTRACE=1 cargo-zigbuild test --locked -p virtio-devices --lib --features kvm \
-    --target x86_64-unknown-linux-musl virtio_block_filter
+  # The tests come with topic/block-discard-offload: a line without their
+  # source skips the step and says so. A line with it fails when the filter
+  # runs no test, since cargo test exits 0 when a filter matches nothing.
+  if ! grep -rqE '\bfn virtio_block_filter' virtio-devices/src; then
+    echo "build-static: SKIPPED virtio-block seccomp filter tests -- no test named virtio_block_filter* in virtio-devices/src on this line (they come with topic/block-discard-offload)"
+  else
+    FILTER_LOG=$(mktemp) || cannot "mktemp failed"
+    RUST_BACKTRACE=1 cargo-zigbuild test --locked -p virtio-devices --lib --features kvm \
+      --target x86_64-unknown-linux-musl virtio_block_filter 2>&1 | tee "$FILTER_LOG"
+    grep -qE '^running [1-9][0-9]* tests?$' "$FILTER_LOG" \
+      || fail "the filter 'virtio_block_filter' matched no test in virtio-devices --lib on x86_64-unknown-linux-musl"
+  fi
   phase "workspace doc tests"
   cargo test --locked --doc --target "$HOST_TARGET" --release --workspace
   echo "build-static: OK tests of $VERSION in $(( $(date +%s) - T_START ))s"
