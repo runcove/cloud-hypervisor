@@ -9,7 +9,10 @@ use std::io;
 
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult};
+use crate::async_io::{
+    AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, IoWorkerLimits,
+    WorkerThreadInit,
+};
 use crate::error::BlockResult;
 use crate::formats::raw::engine_uring::RawAsync;
 
@@ -50,6 +53,18 @@ impl AsyncIo for FixedVhdAsync {
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
         self.raw_file_async.fsync(user_data)
+    }
+
+    fn offloads_punch_hole_or_write_zeroes(&self) -> bool {
+        self.raw_file_async.offloads_punch_hole_or_write_zeroes()
+    }
+
+    fn set_worker_thread_init(&mut self, init: WorkerThreadInit) {
+        self.raw_file_async.set_worker_thread_init(init);
+    }
+
+    fn set_io_worker_limits(&mut self, limits: IoWorkerLimits) -> io::Result<()> {
+        self.raw_file_async.set_io_worker_limits(limits)
     }
 
     fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {

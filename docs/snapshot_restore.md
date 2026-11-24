@@ -282,7 +282,10 @@ a page is copied into the VM's own memory only when the guest (or a device, or
 KVM on its behalf) first accesses it, for the VM's whole lifetime. VMs restored
 from the same snapshot therefore share no guest memory page, unlike
 `copyonwrite`, while each VM uses host memory only for the pages it touched.
-This works with `shared=on` memory as well as private memory.
+This works with `shared=on` memory as well as private memory. The one
+exception is a memory zone with `file=` that the restored VMs reuse: each VM
+maps that same backing file, so with `shared=on` the zone's memory is shared
+between them, and a write by one VM is visible to the others.
 
 `ondemand_no_background_fetch_pages` also skips the background copy. The
 differences are the ones below that keep pages private (a discarded page gets
