@@ -4,6 +4,8 @@ name: cove-test
 # GitHub-hosted runner. The advisory gate and the refusal of a tree carrying
 # .cargo or rust-toolchain run first, before any of the tree's code. All of it
 # is the `test` phase of .github/cove-ci/build-static.sh.
+# A second job runs .github/cove-ci/tests/test-release-workflow.sh, which checks
+# cove-release.yml itself.
 
 on:
   push:
@@ -15,6 +17,32 @@ on:
 permissions: {}
 
 jobs:
+  # The release workflow's own test: cove-release.yml's triggers and its check of
+  # the previous release's checkpoint attestation, against a stub gh and a temp
+  # repo. It needs git, python3 with yaml and bash. It runs the tree's own test
+  # script, which runs the tree's version.sh and the step script from the tree's
+  # cove-release.yml, with no permissions and no secrets; it must never be given
+  # a token without re-reviewing that.
+  release-workflow:
+    name: release workflow test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the pushed commit
+        run: |
+          git init -q "$GITHUB_WORKSPACE/src"
+          cd "$GITHUB_WORKSPACE/src" || exit 1
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout -q --detach "$GITHUB_SHA"
+          git log -1 --format='checked out %H'
+
+      - name: test-release-workflow.sh
+        run: bash src/.github/cove-ci/tests/test-release-workflow.sh
+
   test:
     name: unit tests
     runs-on: ubuntu-24.04
