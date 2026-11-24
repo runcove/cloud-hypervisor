@@ -907,14 +907,26 @@ mod tests {
         assert_restricted(&mut data_io);
     }
 
-    // The ring refuses a registration change and a socket operation, as the
-    // restrictions `UringDataIo::new` registers make it.
+    // The ring refuses a registration change, a worker cap and a socket
+    // operation, as the restrictions `UringDataIo::new` registers make it.
+    // The refused worker cap is why `build_ring` registers the cap before it
+    // restricts and enables the ring.
     fn assert_restricted(data_io: &mut UringDataIo) {
         assert_eq!(
             data_io
                 .io_uring
                 .submitter()
                 .register_eventfd(data_io.notifier().as_raw_fd())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let mut max = [1, 1];
+        assert_eq!(
+            data_io
+                .io_uring
+                .submitter()
+                .register_iowq_max_workers(&mut max)
                 .unwrap_err()
                 .raw_os_error(),
             Some(libc::EACCES)
