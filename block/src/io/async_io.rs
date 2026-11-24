@@ -5,6 +5,7 @@
 use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 mod aio_data_io;
+mod blocking_offload;
 mod common;
 mod completion;
 mod guest_memory_target;
@@ -16,8 +17,14 @@ mod uring_data_io;
 use std::{io, result};
 
 pub use aio_data_io::AioDataIo;
-pub use completion::AsyncIoCompletion;
+pub use blocking_offload::OFFLOAD_DEPTH;
+#[cfg(test)]
+pub(crate) use blocking_offload::fail_next_spawn;
+pub(crate) use blocking_offload::{
+    BlockingOffload, BlockingOp, BlockingOpFn, offload_fn, spawn_offload,
+};
 pub(crate) use completion::CompletionCommon;
+pub use completion::{AsyncIoCompletion, OffloadedOp};
 pub use guest_memory_target::GuestMemoryTarget;
 pub use operation::AsyncIoOperation;
 pub use owned_io_buffer::OwnedIoBuffer;
@@ -98,6 +105,10 @@ pub enum AsyncIoError {
 
 pub type AsyncIoResult<T> = result::Result<T, AsyncIoError>;
 
+/// Runs on a worker thread spawned by an [`AsyncIo`] backend before the
+/// thread does any I/O, for instance to apply a seccomp filter.
+pub type WorkerThreadInit = Box<dyn FnOnce() -> io::Result<()> + Send>;
+
 pub trait AsyncIo: Send {
     fn notifier(&self) -> &EventFd;
 
@@ -153,6 +164,33 @@ pub trait AsyncIo: Send {
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()>;
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
+
+    /// Submits a write zeroes that may unmap the range: a punch hole, which
+    /// a backend running it on a worker thread reports as a write zeroes.
+    fn write_zeroes_unmap(
+        &mut self,
+        offset: u64,
+        length: u64,
+        user_data: u64,
+    ) -> AsyncIoResult<()> {
+        self.punch_hole(offset, length, user_data)
+    }
+
+    /// Returns whether discard and write zeroes requests run on a worker
+    /// thread rather than on the calling thread.
+    ///
+    /// Such a backend accepts at most [`OFFLOAD_DEPTH`] of them whose
+    /// completion has not been returned by
+    /// [`AsyncIo::next_completed_request`]; it fails further ones with `EIO`.
+    /// The caller bounds them, and keeps the rest queued.
+    fn offloads_punch_hole_or_write_zeroes(&self) -> bool {
+        false
+    }
+
+    /// Passes `init` to run on every worker thread this backend has spawned,
+    /// before that thread does any I/O. Must be called before any request is
+    /// submitted. Backends without worker threads drop it.
+    fn set_worker_thread_init(&mut self, _init: WorkerThreadInit) {}
 
     /// Returns the next owned completion, if one is available.
     ///
