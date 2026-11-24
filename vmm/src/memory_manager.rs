@@ -1237,7 +1237,14 @@ impl MemoryManager {
         let mut file_cursor: u64 = 0;
 
         for range in saved_regions.ranges() {
-            let end = file_cursor + range.length;
+            // Every guest address and file offset below lies before these two
+            // ends, so neither sum wraps once both are checked.
+            let end = file_cursor.checked_add(range.length).ok_or_else(|| {
+                invalid_saved_ranges("saved memory ranges overflow a file offset")
+            })?;
+            range.gpa.checked_add(range.length).ok_or_else(|| {
+                invalid_saved_ranges("a saved memory range overflows guest memory")
+            })?;
 
             // First call doubles as a SEEK_HOLE-support probe. On error,
             // take the dense path which seeks-and-streams sequentially.
@@ -1373,7 +1380,11 @@ impl MemoryManager {
             .open(file_path)
             .map_err(Error::SnapshotOpen)?;
         // A range mapped past EOF faults SIGBUS at run time, not restore time.
-        let mapped_len: u64 = saved_regions.ranges().iter().map(|r| r.length).sum();
+        let mapped_len = saved_regions
+            .ranges()
+            .iter()
+            .try_fold(0u64, |end, r| end.checked_add(r.length))
+            .ok_or_else(|| invalid_saved_ranges("saved memory ranges overflow a file offset"))?;
         let file_len = memory_file.metadata().map_err(Error::SnapshotOpen)?.len();
         if file_len < mapped_len {
             return Err(Error::SnapshotMmap(io::Error::new(
@@ -1417,6 +1428,9 @@ impl MemoryManager {
         let mut file_offset: u64 = 0;
 
         let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+        // As copy-on-write does: a page past EOF would fail its read while
+        // the VM runs, which stops the VM, so refuse the restore now.
+        check_snapshot_file_covers_ranges(&snapshot_file, saved_regions)?;
         // A fault on a hole of the snapshot file is resolved with zeroes
         // rather than by reading the hole, which would cache a zero page in
         // the host page cache for each hole page the guest touches. With
@@ -1433,9 +1447,13 @@ impl MemoryManager {
         // mounted) or opens a different inode, it reads through a clone of
         // `snapshot_file`'s fd instead, sharing its open file description (see
         // `open_file`).
-        let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(
-            FileUffdMemorySource::open_file(&snapshot_file).map_err(Error::SnapshotOpen)?,
-        ));
+        let source: Box<dyn UffdMemorySource> = Box::new(
+            FileUffdMemorySource::for_snapshot(
+                FileUffdMemorySource::open_file(&snapshot_file).map_err(Error::SnapshotOpen)?,
+                file_path,
+            )
+            .map_err(Error::SnapshotOpen)?,
+        );
         info!(
             "UFFD restore: snapshot file holes are {} and resolved without reading the \
              file; counts of the pages the source resolved are logged when it is dropped",
@@ -2892,6 +2910,9 @@ impl MemoryManager {
 
             let mem_snapshot: MemoryManagerSnapshotData =
                 snapshot.to_state().map_err(Error::Restore)?;
+            // Before anything is mapped or copied for the ranges, whichever
+            // restore mode then runs.
+            check_snapshot_memory_ranges(&mem_snapshot.memory_ranges)?;
 
             let mm = MemoryManager::new(
                 vm,
@@ -4482,6 +4503,34 @@ fn write_private_pages(
     Ok(())
 }
 
+// Fails when `file` ends before the saved ranges do. The ranges sit back to
+// back in the file, so they end at the sum of their lengths.
+fn check_snapshot_file_covers_ranges(
+    file: &File,
+    saved_regions: &MemoryRangeTable,
+) -> Result<(), Error> {
+    let ranges_end = saved_regions
+        .ranges()
+        .iter()
+        .try_fold(0u64, |end, r| end.checked_add(r.length))
+        .ok_or_else(|| {
+            Error::SnapshotRead(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "saved memory ranges overflow a file offset",
+            ))
+        })?;
+    let file_len = file.metadata().map_err(Error::SnapshotOpen)?.len();
+    if file_len < ranges_end {
+        return Err(Error::SnapshotRead(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "snapshot memory file is {file_len} bytes, shorter than the saved ranges' {ranges_end}"
+            ),
+        )));
+    }
+    Ok(())
+}
+
 // Reports whether every saved range is page-aligned and lies wholly inside a
 // single plain private-anonymous guest region — the MAP_FIXED overlay
 // preconditions — and no two overlap. File-backed regions are rejected:
@@ -4517,6 +4566,44 @@ fn is_restore_cow_compatible(guest_memory: &GuestMemory, saved_regions: &MemoryR
         file_offset = next;
     }
     !saved_ranges_overlap_each_other(saved_regions)
+}
+
+// The most memory ranges a snapshot may list. A snapshot lists one range per
+// guest RAM region, a handful per memory zone, plus one per run of plugged
+// virtio-mem blocks (`memory_range_table` with `SkipPersisted`, adjacent
+// plugged blocks merged into one range). Blocks are 2 MiB, so the most
+// ranges a guest can produce is one per 4 MiB of virtio-mem space, with every
+// other block plugged: 2^22 ranges is 16 TiB of such space, far beyond any
+// guest we run, and the table is then 64 MiB (16 bytes a range).
+const MAX_SNAPSHOT_MEMORY_RANGES: usize = 1 << 22;
+
+fn invalid_saved_ranges(msg: &str) -> Error {
+    Error::SnapshotRead(io::Error::new(io::ErrorKind::InvalidData, msg.to_string()))
+}
+
+// Fails when a snapshot lists more memory ranges than any guest produces, or
+// ranges whose guest addresses or back-to-back file offsets do not fit.
+fn check_snapshot_memory_ranges(saved_regions: &MemoryRangeTable) -> Result<(), Error> {
+    let count = saved_regions.ranges().len();
+    if count > MAX_SNAPSHOT_MEMORY_RANGES {
+        return Err(invalid_saved_ranges(&format!(
+            "snapshot lists {count} memory ranges, more than the {MAX_SNAPSHOT_MEMORY_RANGES} a restore accepts"
+        )));
+    }
+    let mut file_end: u64 = 0;
+    for range in saved_regions.ranges() {
+        if range.gpa.checked_add(range.length).is_none() {
+            return Err(invalid_saved_ranges(
+                "a saved memory range overflows guest memory",
+            ));
+        }
+        // Offsets are passed to lseek and mmap as off_t.
+        file_end = file_end
+            .checked_add(range.length)
+            .filter(|&end| i64::try_from(end).is_ok())
+            .ok_or_else(|| invalid_saved_ranges("saved memory ranges overflow a file offset"))?;
+    }
+    Ok(())
 }
 
 // Whether two saved ranges share a guest address. Empty ranges share none.
@@ -5022,10 +5109,14 @@ fn remap_cow_holes_with(
         };
         // A failed MAP_FIXED normally leaves the file mapping as it was
         // (an older kernel may instead have unmapped the whole range), so
-        // map the file back only where nothing is mapped: EEXIST means the
-        // file mapping survived. MAP_FIXED would fail here as the remap did
-        // when that ran out of VMAs (ENOMEM at vm.max_map_count), since
-        // replacing part of the mapping needs the same splits.
+        // map the file back only where nothing is mapped. EEXIST only says
+        // some page of the range is still mapped; it is read as "the file
+        // mapping survived" on the assumption that a failed MAP_FIXED
+        // never leaves the range partly unmapped (it either unmapped
+        // nothing, as at vm.max_map_count, or the whole range). MAP_FIXED
+        // would fail here as the remap did when that ran out of VMAs
+        // (ENOMEM at vm.max_map_count), since replacing part of the mapping
+        // needs the same splits.
         match map_file(
             addr,
             hole.len as usize,
@@ -5034,11 +5125,16 @@ fn remap_cow_holes_with(
         ) {
             Ok(ret) if ret != addr => {
                 // A kernel before 4.17 takes MAP_FIXED_NOREPLACE as a hint
-                // and maps elsewhere when the range is in use, so the file
-                // mapping survived: drop the stray copy.
+                // and maps elsewhere, which tells nothing about whether the
+                // range is still mapped: drop the stray copy and fail the
+                // restore rather than risk leaving the hole unmapped.
                 // SAFETY: ret..ret + len is the mapping just made, which
                 // nothing else knows of.
                 unsafe { libc::munmap(ret.cast(), hole.len as usize) };
+                return Err(Error::SnapshotMmap(io::Error::other(format!(
+                    "remapping a snapshot file hole failed ({e}) and the kernel \
+                     ignored MAP_FIXED_NOREPLACE when mapping the file back"
+                ))));
             }
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
@@ -5509,6 +5605,41 @@ mod tests {
         file
     }
 
+    #[test]
+    fn uffd_restore_refuses_snapshot_file_shorter_than_ranges() {
+        const MIB: u64 = 1 << 20;
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        // As long as the ranges, or longer: accepted.
+        for len in [6 * MIB, 6 * MIB + 4096] {
+            let file = snapshot_file(&[(0xab, len)]);
+            check_snapshot_file_covers_ranges(file.as_file(), &table).unwrap();
+        }
+        // One page short of the second range's end: refused.
+        let file = snapshot_file(&[(0xab, 6 * MIB - 4096)]);
+        match check_snapshot_file_covers_ranges(file.as_file(), &table) {
+            Err(Error::SnapshotRead(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            other => panic!("short file accepted: {other:?}"),
+        }
+        // Range lengths that overflow a file offset: refused, not wrapped.
+        table.push(MemoryRange {
+            gpa: 32 * MIB,
+            length: u64::MAX,
+        });
+        let file = snapshot_file(&[(0xab, 6 * MIB)]);
+        match check_snapshot_file_covers_ranges(file.as_file(), &table) {
+            Err(Error::SnapshotRead(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("overflowing ranges accepted: {other:?}"),
+        }
+    }
+
     // Whether the host mapping containing `gpa` is backed by a file, from the
     // inode column of /proc/self/maps.
     fn gpa_is_file_backed(gm: &GuestMemory, gpa: u64) -> bool {
@@ -5625,6 +5756,99 @@ mod tests {
         let ret = unsafe { libc::madvise(host.cast(), page as usize, libc::MADV_DONTNEED) };
         assert_eq!(ret, 0);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+    }
+
+    fn assert_invalid_ranges(res: Result<(), Error>, what: &str) {
+        match res {
+            Err(Error::SnapshotRead(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("{what} accepted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_refuses_overflowing_saved_ranges() {
+        const MIB: u64 = 1 << 20;
+        let range = |gpa, length| MemoryRange { gpa, length };
+        let table = |ranges: &[MemoryRange]| {
+            let mut t = MemoryRangeTable::default();
+            for r in ranges {
+                t.push(*r);
+            }
+            t
+        };
+
+        // File offsets that wrap, that pass off_t, and a guest end that wraps.
+        let wrapping_offset = table(&[range(0, 4 * MIB), range(32 * MIB, u64::MAX)]);
+        let past_off_t = table(&[range(0, 1 << 62), range(1 << 62, 1 << 62)]);
+        let wrapping_gpa = table(&[range(u64::MAX - MIB, 2 * MIB)]);
+        for (t, what) in [
+            (&wrapping_offset, "wrapping file offset"),
+            (&past_off_t, "file offset past off_t"),
+            (&wrapping_gpa, "wrapping guest address"),
+        ] {
+            assert_invalid_ranges(check_snapshot_memory_ranges(t), what);
+        }
+
+        // The copy and copy-on-write paths refuse them too, without the
+        // loading check, before copying anything for the bad range.
+        let (gm, zones) = restore_zone_with_virtio_mem();
+        let file = snapshot_file(&[(0xab, 4 * MIB)]);
+        for t in [&wrapping_offset, &wrapping_gpa] {
+            assert_invalid_ranges(
+                MemoryManager::copy_saved_regions(&gm, file.path().to_path_buf(), t),
+                "copy of overflowing ranges",
+            );
+            assert_invalid_ranges(
+                MemoryManager::cow_map_saved_regions(
+                    &gm,
+                    &zones,
+                    false,
+                    file.path().to_path_buf(),
+                    t,
+                )
+                .map(|_| ()),
+                "copy-on-write of overflowing ranges",
+            );
+        }
+    }
+
+    #[test]
+    fn restore_refuses_more_saved_ranges_than_the_bound() {
+        let page = get_page_size();
+        let mut table = MemoryRangeTable::default();
+        for i in 0..MAX_SNAPSHOT_MEMORY_RANGES as u64 {
+            table.push(MemoryRange {
+                gpa: i * 2 * page,
+                length: page,
+            });
+        }
+        check_snapshot_memory_ranges(&table).unwrap();
+        table.push(MemoryRange {
+            gpa: MAX_SNAPSHOT_MEMORY_RANGES as u64 * 2 * page,
+            length: page,
+        });
+        assert_invalid_ranges(check_snapshot_memory_ranges(&table), "one range too many");
+    }
+
+    #[test]
+    fn restore_copies_well_formed_saved_ranges() {
+        const MIB: u64 = 1 << 20;
+        let (gm, _zones) = restore_zone_with_virtio_mem();
+        let file = snapshot_file(&[(0xab, 4 * MIB), (0xcd, 2 * MIB)]);
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 4 * MIB,
+        });
+        table.push(MemoryRange {
+            gpa: 18 * MIB,
+            length: 2 * MIB,
+        });
+        check_snapshot_memory_ranges(&table).unwrap();
+        MemoryManager::copy_saved_regions(&gm, file.path().to_path_buf(), &table).unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(4 * MIB - 1)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(18 * MIB)).unwrap(), 0xcd);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(20 * MIB - 1)).unwrap(), 0xcd);
     }
 
     #[test]
@@ -6119,6 +6343,50 @@ mod tests {
         assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * MIB)).unwrap(), 0xcd);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(7 * MIB)).unwrap(), 0xef);
+    }
+
+    #[test]
+    fn cow_hole_remap_fails_when_the_kernel_ignores_fixed_noreplace() {
+        use std::ptr;
+
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        let gm = private_file_mapping(&file, 10 * MIB);
+        // A kernel before 4.17 takes MAP_FIXED_NOREPLACE as a hint and maps
+        // the file elsewhere; whether the hole is still mapped is then
+        // unknown, so the restore fails.
+        let mut file_calls = 0;
+        let res = remap_cow_holes_with(
+            &[whole_mapping(&gm)],
+            &file,
+            HoleRemapLimits::default(),
+            |_, _, _| Err(io::Error::from_raw_os_error(libc::ENOMEM)),
+            |_, len, flags, off| {
+                file_calls += 1;
+                // SAFETY: no address and no MAP_FIXED: the kernel picks a
+                // free range, which the code under test unmaps again.
+                let ret = unsafe {
+                    libc::mmap(
+                        ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        flags & !libc::MAP_FIXED_NOREPLACE,
+                        file.as_raw_fd(),
+                        off,
+                    )
+                };
+                if ret == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(ret.cast())
+            },
+        );
+        assert!(matches!(res, Err(Error::SnapshotMmap(_))), "{res:?}");
+        assert_eq!(file_calls, 1);
+        // The guest's file mapping was left alone.
+        assert!(gpa_is_file_backed(&gm, 2 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
     }
 
     #[test]
