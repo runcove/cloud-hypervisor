@@ -6,16 +6,50 @@ name: cove-release
 # THIRD-PARTY-NOTICES.txt. Both binaries are cross-built by zig from one x86_64
 # job. The recipe is .github/cove-ci/build-static.sh.
 #
-# A ci-test-* tag runs the same build as a non-release, named by `git describe`,
-# which is how a branch that GitHub does not hold gets a run.
+# Only a release tag starts it, pushed or named by a dispatch. A ci-test-* tag
+# runs cove-test.yml's unit tests, not this build; ch-ci's ch-build and
+# ch-smoke build and boot any branch on the forge.
+#
+# GitHub sends no push events at all when one push carries more than three
+# tags, so a tag can arrive without a run. workflow_dispatch names such a tag
+# and produces exactly what its push would have: every job checks out,
+# refuses, builds, smokes, attests and publishes the tag and the commit it
+# names, never the branch the run was started from. The build job resolves
+# both once (outputs tag and sha) and the later jobs use those. A release tag
+# v<upstream>-cove.<n> is dispatched from its own branch,
+# cove-patches-v<upstream>.
+# The release job checks the tag still names the built commit just before it
+# attests.
+#
+# A pushed release's attestations carry the tag as their source ref and the
+# commit it names as their source and signer digest. A dispatched release's
+# carry the branch as their source ref and its head at dispatch as both
+# digests: a commit holding the tag's commit. The smoke checks the previous
+# release's checkpoint against exactly one of those two shapes (runcove-b7nqq).
+# BUILDINFO's fork sha is the commit that was built.
+#
+# Dispatch missed release tags in ascending order, each only once the one
+# before it is published: the smoke wakes the checkpoint of the newest lower
+# release that has a GitHub Release.
 
 on:
   push:
     tags:
       - 'v*-cove.*'
-      - 'ci-test-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'An existing v<upstream>-cove.<n> tag to build as if it had just been pushed'
+        required: true
+        type: string
 
 permissions: {}
+
+# One run per tag at a time, pushed or dispatched; a second waits rather than
+# cancelling the first. inputs.tag here is only a group name, never a script.
+concurrency:
+  group: cove-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -28,24 +62,67 @@ jobs:
         shell: bash
     env:
       SRC: ${{ github.workspace }}/src
-      FORK_SHA: ${{ github.sha }}
-      REF: ${{ github.ref_name }}
       RUN_ID: ${{ github.run_id }}
     outputs:
       version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.checkout.outputs.tag }}
+      sha: ${{ steps.checkout.outputs.sha }}
     steps:
       # Plain git and no token: full history and tags, because build.rs runs
       # `git describe` and the release branch is checked below. A test tag is
       # dropped from the clone: annotated, it would be what `git describe` says.
+      # A push builds the pushed ref at GITHUB_SHA; a dispatch builds its input
+      # tag at the commit that tag names. Both go on as TAG and FORK_SHA (and
+      # REF, for BUILDINFO), never GITHUB_REF_NAME or GITHUB_SHA.
       - name: Check out the tagged commit
+        id: checkout
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
+          refuse() { echo "::error::REFUSING: $*"; exit 64; }
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              tag=$GITHUB_REF_NAME
+              ;;
+            workflow_dispatch)
+              tag=$INPUT_TAG
+              ;;
+            *) refuse "unexpected event $GITHUB_EVENT_NAME" ;;
+          esac
+          case "$tag" in
+            *[!A-Za-z0-9._-]*|'') refuse "tag is not a plain name" ;;
+            v*-cove.*) ;;
+            *) refuse "tag '$tag' is not a v*-cove.* release tag" ;;
+          esac
+          # A dispatched release tag runs from its own branch's workflow.
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            want_ref="refs/heads/cove-patches-${tag%-cove.*}"
+            [ "$GITHUB_REF" = "$want_ref" ] || refuse "dispatch $tag from $want_ref, not $GITHUB_REF"
+          fi
           git init -q "$SRC"
           cd "$SRC" || exit 1
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch -q --tags origin "$GITHUB_SHA" '+refs/heads/cove-patches-*:refs/remotes/origin/cove-patches-*'
-          git checkout -q --detach "$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            sha=$GITHUB_SHA
+            git fetch -q --tags origin "$sha" '+refs/heads/cove-patches-*:refs/remotes/origin/cove-patches-*'
+          else
+            git fetch -q --tags origin '+refs/heads/cove-patches-*:refs/remotes/origin/cove-patches-*'
+            sha=$(git rev-parse -q --verify "refs/tags/$tag^{commit}") || refuse "no tag '$tag' in ${GITHUB_REPOSITORY}"
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || refuse "'$sha' is not a full commit id"
+          git checkout -q --detach "$sha"
           git tag -l 'ci-test-*' | xargs -r git tag -d >/dev/null
           git log -1 --format='checked out %H'
+          {
+            echo "TAG=$tag"
+            echo "FORK_SHA=$sha"
+            echo "REF=$tag"
+          } >> "$GITHUB_ENV"
+          {
+            echo "tag=$tag"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "event $GITHUB_EVENT_NAME: tag $tag at $sha"
           df -h /
 
       # CI never mints a tag; this only reads the one that was pushed. A release
@@ -57,34 +134,26 @@ jobs:
         run: |
           refuse() { echo "::error::REFUSING: $*"; exit 64; }
           described=$(git describe --dirty)
-          case "$GITHUB_REF_NAME" in
-            ci-test-*)
-              version=$described
-              is_release=false
-              ;;
-            *)
-              tag=$GITHUB_REF_NAME
-              .github/cove-ci/version.sh --is-release "$tag" || refuse "tag '$tag' is not a v<upstream>-cove.<n> release tag"
-              [ "$(git rev-parse "refs/tags/$tag^{commit}")" = "$GITHUB_SHA" ] || refuse "tag '$tag' does not name $GITHUB_SHA"
-              [ "$(git cat-file -t "refs/tags/$tag")" = tag ] || refuse "tag '$tag' is lightweight; build.rs's plain git describe cannot see it"
-              others=0
-              while IFS= read -r t; do
-                if [ "$t" != "$tag" ] && .github/cove-ci/version.sh --is-release "$t"; then others=$((others + 1)); fi
-              done < <(git tag --points-at "$GITHUB_SHA")
-              [ "$others" -eq 0 ] || refuse "another release tag points at $GITHUB_SHA"
-              branch=cove-patches-${tag%-cove.*}
-              git rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null || refuse "no branch $branch"
-              git merge-base --is-ancestor "$GITHUB_SHA" "refs/remotes/origin/$branch" || refuse "$GITHUB_SHA is not on $branch"
-              [ "$described" = "$tag" ] || refuse "git describe says '$described', so the binary would not print '$tag'"
-              version=$tag
-              is_release=true
-              ;;
-          esac
+          tag=$TAG
+          .github/cove-ci/version.sh --is-release "$tag" || refuse "tag '$tag' is not a v<upstream>-cove.<n> release tag"
+          [ "$(git rev-parse "refs/tags/$tag^{commit}")" = "$FORK_SHA" ] || refuse "tag '$tag' does not name $FORK_SHA"
+          [ "$(git cat-file -t "refs/tags/$tag")" = tag ] || refuse "tag '$tag' is lightweight; build.rs's plain git describe cannot see it"
+          others=0
+          while IFS= read -r t; do
+            if [ "$t" != "$tag" ] && .github/cove-ci/version.sh --is-release "$t"; then others=$((others + 1)); fi
+          done < <(git tag --points-at "$FORK_SHA")
+          [ "$others" -eq 0 ] || refuse "another release tag points at $FORK_SHA"
+          branch=cove-patches-${tag%-cove.*}
+          git rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null || refuse "no branch $branch"
+          git merge-base --is-ancestor "$FORK_SHA" "refs/remotes/origin/$branch" || refuse "$FORK_SHA is not on $branch"
+          [ "$described" = "$tag" ] || refuse "git describe says '$described', so the binary would not print '$tag'"
+          version=$tag
+          is_release=true
           case "$version" in *[!A-Za-z0-9._-]*|'') refuse "version '$version' is not a plain name" ;; esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "VERSION=$version" >> "$GITHUB_ENV"
           echo "IS_RELEASE=$is_release" >> "$GITHUB_ENV"
-          echo "building $version from $GITHUB_SHA, release=$is_release"
+          echo "building $version from $FORK_SHA, release=$is_release"
 
       # The advisory gate and the refusal of a tree carrying .cargo or
       # rust-toolchain are inside this phase, before any of the tree's code runs.
@@ -126,11 +195,375 @@ jobs:
           cloud-hypervisor-static-x86_64'
           [ "$(find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort)" = "$want" ] \
             || { echo "::error::the build's files are not exactly the five agreed names"; exit 1; }
+          # -c checks only the lines there are: it must have one for each other file.
+          listed='BUILDINFO
+          THIRD-PARTY-NOTICES.txt
+          cloud-hypervisor-static-aarch64
+          cloud-hypervisor-static-x86_64'
+          [ "$(LC_ALL=C sort -k2 SHA256SUMS | sed -E 's/^[0-9a-f]{64}  //')" = "$listed" ] \
+            || { echo "::error::SHA256SUMS does not list exactly the other four files"; exit 1; }
           sha256sum --strict --status -c SHA256SUMS 2>/dev/null \
             || { echo "::error::the files do not match SHA256SUMS"; exit 1; }
           ls -l
           sha256sum BUILDINFO SHA256SUMS THIRD-PARTY-NOTICES.txt cloud-hypervisor-static-aarch64 cloud-hypervisor-static-x86_64
 
-  # THE RELEASE JOB GOES HERE, in a later change: `needs: list`, its own
-  # `permissions`, publishing these five files and attesting each binary. This
-  # workflow publishes nothing today and no job in it holds a write token.
+  # Boots the x86_64 binary and takes it through .github/cove-ci/smoke.sh, which
+  # fails unless the running VMM holds an io_uring ring. On the runner directly:
+  # Docker's default seccomp profile refuses io_uring.
+  # aarch64 is built and attested, not booted (no KVM on hosted arm runners); development use only
+  # It also packs this build's checkpoint (step 6) and records its sha256 before
+  # waking the previous release's (step 5): the release publishes only that file.
+  # Its attestation proves a release run of this workflow in this repo (a tag push, or a dispatch naming the tag) produced the file, and that
+  # run's smoke job ended without a failure: steps 0-4 and the pack passed, and step 5 passed or was SKIPPED (no previous checkpoint, or a
+  # CPUID refusal the runner's CPU explains), which proves nothing about waking the previous release's checkpoint. It does not prove
+  # that the file's contents are benign, nor which tag it belongs to.
+  # A regression check, not a gate against a hostile tree: the smoke runs from the
+  # tree under test, so its token reads this public repo and nothing more.
+  smoke:
+    name: boot on x86_64
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      checkpoint_sha256: ${{ steps.pack.outputs.sha256 }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      KERNEL_URL: https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.16.9-20260508/vmlinux-x86_64
+      KERNEL_SHA256: 9d3570b47d5abb069ca00edfbfcef4c68306a9c3d078a01f10082b258f1001b8
+      BUSYBOX_URL: https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
+      BUSYBOX_SHA256: 6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348
+    steps:
+      - name: Check out the tagged commit
+        env:
+          FORK_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$FORK_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::the build job gave no commit id"; exit 1; }
+          git init -q src
+          cd src
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$FORK_SHA"
+          git checkout -q --detach FETCH_HEAD
+          [ "$(git rev-parse HEAD)" = "$FORK_SHA" ] || { echo "::error::fetched $(git rev-parse HEAD), not $FORK_SHA"; exit 1; }
+          git log -1 --format='checked out %H'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: cloud-hypervisor-static-${{ needs.build.outputs.version }}
+          path: out
+
+      # The artifact came from the tree's code, so only this one fixed name is
+      # taken from it, and only when it is a plain file with exactly one digest
+      # in SHA256SUMS, checked on the copy that will run.
+      - name: Verify the binary against SHA256SUMS
+        run: |
+          set -euo pipefail
+          name=cloud-hypervisor-static-x86_64
+          in="$RUNNER_TEMP/smoke/in"
+          mkdir -p "$in"
+          if [ ! -f "out/$name" ] || [ -L "out/$name" ] || [ ! -f out/SHA256SUMS ] || [ -L out/SHA256SUMS ]; then
+            echo "::error::the artifact has no plain files $name and SHA256SUMS"
+            exit 1
+          fi
+          want=$(awk -v n="$name" 'NF == 2 && $2 == n { print $1 }' out/SHA256SUMS)
+          if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::SHA256SUMS does not give $name exactly one sha256"
+            exit 1
+          fi
+          install -m 0755 "out/$name" "$in/cloud-hypervisor"
+          got=$(sha256sum < "$in/cloud-hypervisor")
+          got=${got%% *}
+          if [ "$got" != "$want" ]; then
+            echo "::error::$name is $got, but SHA256SUMS says $want"
+            exit 1
+          fi
+          echo "$name $got"
+
+      - name: Fetch the kernel and busybox, build the initramfs
+        run: |
+          set -euo pipefail
+          in="$RUNNER_TEMP/smoke/in"
+          curl -fsSL --retry 3 --proto =https --proto-redir =https --max-time 600 -o "$in/vmlinux" "$KERNEL_URL"
+          curl -fsSL --retry 3 --proto =https --proto-redir =https --max-time 600 -o "$RUNNER_TEMP/smoke/busybox" "$BUSYBOX_URL"
+          echo "$KERNEL_SHA256  $in/vmlinux" | sha256sum -c -
+          echo "$BUSYBOX_SHA256  $RUNNER_TEMP/smoke/busybox" | sha256sum -c -
+          python3 src/.github/cove-ci/smoke_tool.py initramfs --busybox "$RUNNER_TEMP/smoke/busybox" --out "$in/initramfs.cpio.gz"
+
+      - name: Make /dev/kvm usable
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sleep 1
+          ls -l /dev/kvm
+
+      # The previous release is the highest v<upstream>-cove.<n> below this
+      # version, by version.sh's ordering, that has a GitHub Release; a test
+      # build past a release tag counts that tag as below it. No such Release,
+      # or one without a checkpoint (the first GitHub release has none): step 5
+      # is skipped. Anything else that goes wrong fails the job: the checkpoint
+      # is used only when its attestation is from this workflow on a
+      # GitHub-hosted runner in one of the two release shapes in the header
+      # (the push of the previous tag at the commit it names, or a dispatch
+      # from its branch at a commit that holds the tag's commit and is still
+      # on the branch), and its sha256 matches the one published beside it.
+      - name: Fetch the previous release's checkpoint
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          v=src/.github/cove-ci/version.sh
+          name=ch-smoke-checkpoint.tar.gz
+          below() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ] && [ "$1" != "$2" ]; }
+          base=${VERSION%-dirty}
+          base=$(sed -E 's/-[0-9]+-g[0-9a-f]+$//' <<<"$base")
+          at_or_below=false
+          if "$v" --is-release "$base"; then
+            [ "$base" = "$VERSION" ] || at_or_below=true
+          elif [[ "$base" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            base=$base-cove.1
+          else
+            echo "::error::cannot order version '$VERSION' against release tags"; exit 1
+          fi
+          bound=$("$v" --sort-key "$base")
+          # gh prints text from the API and the download: none of it runs as a
+          # workflow command; cmd lets this step's own through.
+          tok=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "::stop-commands::$tok"
+          cmd() { echo "::$tok::"; echo "$1"; }
+          prev='' prev_key=''
+          tags=$(gh release list --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName')
+          while IFS= read -r t; do
+            [ -n "$t" ] && "$v" --is-release "$t" || continue
+            k=$("$v" --sort-key "$t")
+            { below "$k" "$bound" || { [ "$at_or_below" = true ] && [ "$k" = "$bound" ]; }; } || continue
+            if [ -z "$prev" ] || below "$prev_key" "$k"; then prev=$t prev_key=$k; fi
+          done <<<"$tags"
+          if [ -z "$prev" ]; then
+            cmd "::notice::step 5 will be SKIPPED: no GitHub Release below $VERSION"; exit 0
+          fi
+          assets=$(gh release view "$prev" --json assets --jq '.assets[].name')
+          if ! grep -qxF "$name" <<<"$assets"; then
+            cmd "::notice::step 5 will be SKIPPED: release $prev has no $name"; exit 0
+          fi
+          dl="$RUNNER_TEMP/previous"
+          mkdir "$dl"
+          gh release download "$prev" --dir "$dl" --pattern "$name" --pattern "$name.sha256"
+          [ -f "$dl/$name" ] && [ ! -L "$dl/$name" ] && [ -f "$dl/$name.sha256" ] \
+            || { cmd "::error::release $prev did not give both $name and $name.sha256"; exit 1; }
+          line=${prev%-cove.*}
+          branch_ref=refs/heads/cove-patches-$line
+          # Only the tag, the branch and their commits: no tree, nothing runs.
+          pc="$RUNNER_TEMP/prevcheck"
+          git init -q --bare "$pc"
+          git -C "$pc" fetch -q --no-tags --filter=tree:0 "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "+refs/tags/$prev:refs/tags/$prev" "+$branch_ref:$branch_ref"
+          prev_sha=$(git -C "$pc" rev-parse -q --verify "refs/tags/$prev^{commit}") || prev_sha=''
+          [[ "$prev_sha" =~ ^[0-9a-f]{40}$ ]] || { cmd "::error::tag $prev names no commit"; exit 1; }
+          pin=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/cove-release.yml"
+            --deny-self-hosted-runners)
+          if gh attestation verify "$dl/$name" "${pin[@]}" \
+              --source-ref "refs/tags/$prev" --source-digest "$prev_sha" --signer-digest "$prev_sha" </dev/null; then
+            echo "$prev's checkpoint: attested by the push of $prev at $prev_sha"
+          else
+            echo "$prev's checkpoint: not the push shape; trying a dispatch from $branch_ref"
+            signer=''
+            digests=$(gh attestation verify "$dl/$name" "${pin[@]}" --source-ref "$branch_ref" \
+              --format json --jq '.[].verificationResult.signature.certificate.sourceRepositoryDigest' </dev/null) || digests=''
+            while IFS= read -r d; do
+              [[ "$d" =~ ^[0-9a-f]{40}$ ]] || continue
+              git -C "$pc" merge-base --is-ancestor "$prev_sha" "$d" 2>/dev/null || continue
+              git -C "$pc" merge-base --is-ancestor "$d" "$branch_ref" 2>/dev/null || continue
+              if gh attestation verify "$dl/$name" "${pin[@]}" \
+                  --source-ref "$branch_ref" --source-digest "$d" --signer-digest "$d" </dev/null; then
+                signer=$d; break
+              fi
+            done < <(sort -u <<<"$digests")
+            [ -n "$signer" ] || { cmd "::error::$prev's $name has no attestation from its tag's push or its branch's dispatch"; exit 1; }
+            echo "$prev's checkpoint: attested by a dispatch from $branch_ref at $signer"
+          fi
+          want=$(awk -v n="$name" 'NF == 2 && $2 == n { print $1 }' "$dl/$name.sha256")
+          got=$(sha256sum < "$dl/$name"); got=${got%% *}
+          if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]] || [ "$got" != "$want" ]; then
+            cmd "::error::$prev's $name does not match its $name.sha256"; exit 1
+          fi
+          install -m 0644 "$dl/$name" "$RUNNER_TEMP/smoke/in/previous.tar.gz"
+          echo "step 5 will wake $prev's checkpoint, sha256 $got"
+
+      # previous.tar.gz is fetched but not touched until the wake step.
+      - name: Run the smoke up to the pack (steps 0-4 and 6)
+        id: pack
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/smoke/out"
+          # What the binary under test prints reaches this log: none of it runs
+          # as a workflow command.
+          echo "::stop-commands::$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          printf '%s\n' "$VERSION" > "$RUNNER_TEMP/smoke/in/VERSION"
+          bash src/.github/cove-ci/smoke.sh --pack-only --in "$RUNNER_TEMP/smoke/in" --work "$RUNNER_TEMP/smoke/work" \
+            --out "$RUNNER_TEMP/smoke/out"
+          sha=$(sed -nE 's/^([0-9a-f]{64})  ch-smoke-checkpoint\.tar\.gz$/\1/p' "$RUNNER_TEMP/smoke/out/ch-smoke-checkpoint.tar.gz.sha256")
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "the pack wrote no single sha256 line"; exit 1; }
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      # A wake Cloud Hypervisor refused for CPUID (the runner that saved the
+      # checkpoint had CPU features this one lacks) ends step 5 SKIPPED, exit 0,
+      # not passed: smoke.sh's own ::warning:: is inert under stop-commands, so
+      # this step raises a fixed one once commands run again. A refusal with no
+      # flag lacking (the checkpoint's HOST_CPU_FLAGS all in this runner's)
+      # fails the step instead. The forge's ch-smoke, which saves and wakes on
+      # one host, remains the gate.
+      - name: Wake the previous release's checkpoint (steps 0 and 5)
+        run: |
+          set -euo pipefail
+          tok=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "::stop-commands::$tok"
+          bash src/.github/cove-ci/smoke.sh --wake-only --in "$RUNNER_TEMP/smoke/in" --work "$RUNNER_TEMP/smoke/work" \
+            | tee "$RUNNER_TEMP/smoke/wake.log"
+          echo "::$tok::"
+          if grep -q "^ch-smoke: step 5 (previous release's checkpoint) SKIPPED -- this runner's CPU lacks features" "$RUNNER_TEMP/smoke/wake.log"; then
+            echo "::warning title=step 5 skipped, not passed::this runner's CPU lacks features the previous release's checkpoint was saved with, so it was not woken here; see the step log for the missing flags"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: ch-smoke-checkpoint-${{ needs.build.outputs.version }}
+          path: ${{ runner.temp }}/smoke/out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  # The one job holding a write token, and only for a release tag, pushed or
+  # named by a dispatch. It runs nothing from the tree and prints nothing from
+  # the artifact. The attestation comes first, so a Release never exists without one.
+  # It also publishes the smoke's checkpoint, attested, for the next release's step 5.
+  release:
+    name: attest and publish
+    needs: [build, list, smoke]
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check the tag is the version that was built
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            push) asked=$GITHUB_REF_NAME ;;
+            workflow_dispatch) asked=$INPUT_TAG ;;
+            *) echo "::error::unexpected event"; exit 1 ;;
+          esac
+          if [ -z "$TAG" ] || [ "$TAG" != "$asked" ] || [ "$TAG" != "$VERSION" ]; then
+            echo "::error::the tag is not the version the build job decided on"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: cloud-hypervisor-static-${{ needs.build.outputs.version }}
+          path: out
+
+      - name: Verify the five files
+        working-directory: out
+        run: |
+          set -euo pipefail
+          want='f BUILDINFO
+          f SHA256SUMS
+          f THIRD-PARTY-NOTICES.txt
+          f cloud-hypervisor-static-aarch64
+          f cloud-hypervisor-static-x86_64'
+          [ "$(find . -mindepth 1 -printf '%y %P\n' | LC_ALL=C sort)" = "$want" ] \
+            || { echo "::error::the build's files are not exactly the five agreed names, all plain files"; exit 1; }
+          # -c checks only the lines there are: it must have one for each other file.
+          listed='BUILDINFO
+          THIRD-PARTY-NOTICES.txt
+          cloud-hypervisor-static-aarch64
+          cloud-hypervisor-static-x86_64'
+          [ "$(LC_ALL=C sort -k2 SHA256SUMS | sed -E 's/^[0-9a-f]{64}  //')" = "$listed" ] \
+            || { echo "::error::SHA256SUMS does not list exactly the other four files"; exit 1; }
+          sha256sum --strict --status -c SHA256SUMS 2>/dev/null \
+            || { echo "::error::the files do not match SHA256SUMS"; exit 1; }
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: ch-smoke-checkpoint-${{ needs.build.outputs.version }}
+          path: smoke
+
+      # Its own .sha256 file, published beside it: SHA256SUMS stays the build's.
+      - name: Verify the smoke's checkpoint
+        working-directory: smoke
+        env:
+          PACKED_SHA256: ${{ needs.smoke.outputs.checkpoint_sha256 }}
+        run: |
+          set -euo pipefail
+          want='f ch-smoke-checkpoint.tar.gz
+          f ch-smoke-checkpoint.tar.gz.sha256'
+          [ "$(find . -mindepth 1 -printf '%y %P\n' | LC_ALL=C sort)" = "$want" ] \
+            || { echo "::error::the smoke's files are not exactly the checkpoint and its .sha256, both plain files"; exit 1; }
+          [ "$(sed -E 's/^[0-9a-f]{64}  //' ch-smoke-checkpoint.tar.gz.sha256)" = ch-smoke-checkpoint.tar.gz ] \
+            || { echo "::error::ch-smoke-checkpoint.tar.gz.sha256 is not one line for the checkpoint"; exit 1; }
+          sha256sum --strict --status -c ch-smoke-checkpoint.tar.gz.sha256 2>/dev/null \
+            || { echo "::error::the checkpoint does not match its .sha256"; exit 1; }
+          got=$(sha256sum < ch-smoke-checkpoint.tar.gz); got=${got%% *}
+          [[ "$PACKED_SHA256" =~ ^[0-9a-f]{64}$ ]] && [ "$got" = "$PACKED_SHA256" ] \
+            || { echo "::error::the checkpoint is not the one the smoke packed before step 5"; exit 1; }
+
+      # Immediately before the attestation: the tag, read fresh from GitHub,
+      # must still name the commit that was built. Attestations are minted
+      # nowhere else in this workflow.
+      - name: Check the tag still names the built commit
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          FORK_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$FORK_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::the build job gave no commit id"; exit 1; }
+          case "$TAG" in *[!A-Za-z0-9._-]*|'') echo "::error::the build job gave no plain tag name"; exit 1 ;; esac
+          # Only the tag and its commit: no tree, nothing from it runs.
+          git init -q "$RUNNER_TEMP/tagcheck"
+          cd "$RUNNER_TEMP/tagcheck"
+          git fetch -q --no-tags --depth 1 --filter=tree:0 "https://github.com/${GITHUB_REPOSITORY}.git" "+refs/tags/$TAG:refs/tags/$TAG"
+          [ "$(git cat-file -t "refs/tags/$TAG")" = tag ] || { echo "::error::tag $TAG is no longer an annotated tag"; exit 1; }
+          now=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}")
+          [ "$now" = "$FORK_SHA" ] || { echo "::error::tag $TAG now names $now, but $FORK_SHA was built"; exit 1; }
+          echo "tag $TAG still names $FORK_SHA"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            out/cloud-hypervisor-static-x86_64
+            out/cloud-hypervisor-static-aarch64
+            smoke/ch-smoke-checkpoint.tar.gz
+
+      - name: Create the Release
+        working-directory: out
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --verify-tag --title "$TAG" \
+            --notes "Both binaries and the smoke checkpoint carry a build provenance attestation: gh attestation verify FILE --repo $GH_REPO" \
+            SHA256SUMS cloud-hypervisor-static-x86_64 cloud-hypervisor-static-aarch64 BUILDINFO THIRD-PARTY-NOTICES.txt \
+            ../smoke/ch-smoke-checkpoint.tar.gz ../smoke/ch-smoke-checkpoint.tar.gz.sha256
