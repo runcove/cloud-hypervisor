@@ -6419,15 +6419,20 @@ mod tests {
         }
     }
 
-    // A userfaultfd with all of `gm` registered for missing faults, or None
-    // when this host does not let the test create one.
+    // A userfaultfd with all of `gm` registered for missing faults. A host
+    // that does not let the test create one fails the test, unless
+    // CH_TEST_SKIP_UFFD=1 says to skip it (None).
     fn register_uffd(gm: &GuestMemoryMmap) -> Option<Uffd> {
         let fd = match uffd::create(userfaultfd::UFFD_FEATURE_MISSING_SHMEM) {
             Ok(fd) => fd,
-            Err(e) => {
-                eprintln!("skipping: cannot create a userfaultfd: {e}");
+            Err(e) if std::env::var_os("CH_TEST_SKIP_UFFD").is_some_and(|v| v == "1") => {
+                eprintln!("skipping (CH_TEST_SKIP_UFFD=1): cannot create a userfaultfd: {e}");
                 return None;
             }
+            Err(e) => panic!(
+                "cannot create a userfaultfd: {e}; run as root or with \
+                 vm.unprivileged_userfaultfd=1, or set CH_TEST_SKIP_UFFD=1 to skip"
+            ),
         };
         let page = page_size();
         let mut ranges = Vec::new();

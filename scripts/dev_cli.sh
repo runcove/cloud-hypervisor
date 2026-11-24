@@ -529,10 +529,17 @@ cmd_tests() {
 
     if [[ "$unit" = true ]]; then
         say "Running unit tests for $target..."
+        # The vmm uffd tests need /dev/userfaultfd; without it they fail
+        # and say why.
+        uffd_args=()
+        if [ -c /dev/userfaultfd ]; then
+            uffd_args=(--device /dev/userfaultfd)
+        fi
         run_container "$DOCKER_RUNTIME" run \
             "${common_args[@]}" \
             --device "$exported_device" \
             --device /dev/net/tun \
+            "${uffd_args[@]}" \
             --cap-add net_admin \
             "${common_env_args[@]}" \
             --env LLVM_PROFILE_FILE="$LLVM_PROFILE_FILE" \
