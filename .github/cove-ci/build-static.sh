@@ -18,7 +18,13 @@
 #                workspace tests run on the gnu host, where a syscall only
 #                musl's libc makes, such as legacy open or stat, goes unseen),
 #                in a container that allows io_uring and has
-#                /dev/kvm and /dev/net/tun. It builds no release binary.
+#                /dev/kvm, /dev/net/tun, /dev/userfaultfd and loop devices.
+#                It runs as root, and proves it: block's loop-device tests,
+#                which skip without root or a loop device, run again on their
+#                own and fail the phase if one skips, and they and the vmm's
+#                copy_on_access_* tests are each named on a line of their own
+#                for run-recipe.sh to turn into a notice. It builds no release
+#                binary.
 #
 # WHAT THE BUILD PHASE DOES, in order, all in /src (the fork's tree, .git included --
 # CH's cloud-hypervisor/build.rs runs `git describe --dirty` for the version
@@ -147,6 +153,9 @@ RUN_ID="${RUN_ID:-local}"
 # build.rs appends CH_EXTRA_VERSION to the version when it is set; nothing of
 # ours sets it, and nothing from outside may.
 unset CH_EXTRA_VERSION
+# The vmm's userfaultfd tests skip, instead of failing, when this is 1; the
+# test phase runs them, so nothing from outside may set it.
+unset CH_TEST_SKIP_UFFD
 # >>> cargo-env: what the environment may not choose.
 # Nor may the environment choose the compiler, a wrapper around it, cargo
 # itself, the toolchain, the target, the profile, a linker or a credential
@@ -365,12 +374,62 @@ if [ "$BUILD_PHASE" = test ]; then
   # skipped them). Only this phase installs it; a release build never has it.
   apt-get install -y -qq --no-install-recommends qemu-utils >/dev/null
   command -v qemu-img >/dev/null || cannot "qemu-utils installed no qemu-img"
+  phase "loop devices (block's root-only tests)"
+  # Block's loop-device tests return early, and pass, when they are not root
+  # or losetup fails. run-recipe.sh gives this container /dev/loop-control and
+  # the loop devices' major (7); the nodes are made here, because Docker
+  # copies only the device nodes that exist when the container starts, and
+  # LOOP_CTL_GET_FREE can hand out a loop device created after that.
+  [ "$(id -u)" -eq 0 ] || cannot "the test phase runs as uid $(id -u), not root: block's loop-device tests would skip"
+  [ -c /dev/loop-control ] || cannot "no /dev/loop-control: block's loop-device tests would skip"
+  command -v losetup >/dev/null || cannot "the build image has no losetup: block's loop-device tests would skip"
+  for i in $(seq 0 63); do
+    [ -e "/dev/loop$i" ] || mknod -m 0660 "/dev/loop$i" b 7 "$i" || cannot "could not make /dev/loop$i"
+  done
   phase "cargo clippy -p block"
   cargo clippy --locked -p block --features "$BLOCK_FEATURES" --all-targets -- -D warnings
   phase "block tests"
   cargo test --locked -p block --features "$BLOCK_FEATURES"
+  phase "block's root-only tests, uncaptured (a skip fails)"
+  # Again on their own with --nocapture, so a skip message is in this log:
+  # every test_write_zeroes_unmap_loop_device in block/src must print `ok` on
+  # its own line and none may print `Skipping`. Each one that ran is named on
+  # a `build-static: root test ran:` line, which run-recipe.sh turns into a
+  # notice. The requirement is keyed on the tests' helper: while
+  # test_helpers.rs has `struct LoopDevice`, the tests must be there, so a
+  # rename or removal of them fails here instead of running none. Only a line
+  # with neither the helper nor the tests says so and runs none.
+  ROOT_HELPER=block/src/formats/raw/test_helpers.rs
+  ROOT_WANT=$({ grep -rhoE '\bfn test_write_zeroes_unmap_loop_device\(\)' block/src || true; } | wc -l)
+  if [ -f "$ROOT_HELPER" ] && grep -qE '\bstruct LoopDevice\b' "$ROOT_HELPER"; then
+    [ "$ROOT_WANT" -gt 0 ] \
+      || fail "$ROOT_HELPER has struct LoopDevice but block/src has no test named test_write_zeroes_unmap_loop_device: were the loop-device tests renamed or removed?"
+  fi
+  if [ "$ROOT_WANT" -eq 0 ]; then
+    echo "build-static: SKIPPED root-only block tests -- no struct LoopDevice in $ROOT_HELPER and no test named test_write_zeroes_unmap_loop_device in block/src on this line"
+  else
+    ROOT_LOG=$(mktemp) || cannot "mktemp failed"
+    cargo test --locked -p block --features "$BLOCK_FEATURES" --lib test_write_zeroes_unmap_loop_device \
+      -- --nocapture --test-threads=1 2>&1 | tee "$ROOT_LOG"
+    ! grep -n 'Skipping' "$ROOT_LOG" || fail "a root-only block test skipped (the line is above)"
+    ROOT_RAN=$(grep -cE '^test [A-Za-z0-9_:]+::test_write_zeroes_unmap_loop_device \.\.\. ok$' "$ROOT_LOG" || true)
+    [ "$ROOT_RAN" -eq "$ROOT_WANT" ] \
+      || fail "$ROOT_RAN of block's $ROOT_WANT test_write_zeroes_unmap_loop_device tests printed ok on a line of their own"
+    sed -n 's/^test \([A-Za-z0-9_:]*::test_write_zeroes_unmap_loop_device\) \.\.\. ok$/build-static: root test ran: \1/p' "$ROOT_LOG"
+  fi
   phase "workspace unit tests"
-  cargo test --locked --lib --bins --target "$HOST_TARGET" --release --workspace
+  WS_LOG=$(mktemp) || cannot "mktemp failed"
+  cargo test --locked --lib --bins --target "$HOST_TARGET" --release --workspace 2>&1 | tee "$WS_LOG"
+  # The vmm's copy_on_access_* tests fail, never skip, without a userfaultfd
+  # (CH_TEST_SKIP_UFFD is unset above), so `ok` means they ran. Each test fn
+  # of that name in vmm/src must have passed; each is named for a notice.
+  COA_WANT=$({ grep -rhoE '\bfn copy_on_access_[A-Za-z0-9_]+\(\)' vmm/src || true; } | wc -l)
+  [ "$COA_WANT" -gt 0 ] \
+    || fail "no test named copy_on_access_* in vmm/src: the copy-on-access restore tests were renamed or removed, so none would be checked"
+  COA_RAN=$(grep -cE '^test [A-Za-z0-9_:]+::copy_on_access_[A-Za-z0-9_]+ \.\.\. ok$' "$WS_LOG" || true)
+  [ "$COA_RAN" -eq "$COA_WANT" ] \
+    || fail "$COA_RAN of the vmm's $COA_WANT copy_on_access_* tests passed"
+  sed -n 's/^test \([A-Za-z0-9_:]*::copy_on_access_[A-Za-z0-9_]*\) \.\.\. ok$/build-static: uffd test ran: \1/p' "$WS_LOG"
   phase "virtio-block seccomp filter tests (x86_64 musl)"
   # Every test whose name contains virtio_block_filter, so later ones run too.
   # The tests come with topic/block-discard-offload: a line without their
