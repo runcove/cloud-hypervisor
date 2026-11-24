@@ -4751,7 +4751,37 @@ fn remap_cow_holes(
     mappings: &[CowMapping],
     file: &File,
     limits: HoleRemapLimits,
+    map_anon: impl FnMut(*mut u8, usize, libc::c_int) -> io::Result<()>,
+) -> Result<Vec<HoleRemapReport>, Error> {
+    remap_cow_holes_with(mappings, file, limits, map_anon, |addr, len, flags, off| {
+        // SAFETY: remap_cow_holes_with passes a hole of a mapping the caller
+        // vouches for, without MAP_FIXED; the fd stays valid for the call.
+        let ret = unsafe {
+            libc::mmap(
+                addr.cast(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags,
+                file.as_raw_fd(),
+                off,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ret.cast())
+    })
+}
+
+// `remap_cow_holes`, mapping the file back after a failed remap through
+// `map_file` (mmap(2) of the file with the given flags and offset, but in
+// tests).
+fn remap_cow_holes_with(
+    mappings: &[CowMapping],
+    file: &File,
+    limits: HoleRemapLimits,
     mut map_anon: impl FnMut(*mut u8, usize, libc::c_int) -> io::Result<()>,
+    mut map_file: impl FnMut(*mut u8, usize, libc::c_int, libc::off_t) -> io::Result<*mut u8>,
 ) -> Result<Vec<HoleRemapReport>, Error> {
     let page_size = get_page_size();
     let mut reports: Vec<HoleRemapReport> = mappings
@@ -4789,21 +4819,38 @@ fn remap_cow_holes(
             report.bytes += hole.len;
             continue;
         };
-        // A failed MAP_FIXED may already have unmapped the range: map
-        // the file back over it as it was, so the region stays whole.
-        // SAFETY: same range as above; the fd stays valid for the call.
-        let ret = unsafe {
-            libc::mmap(
-                addr.cast(),
-                hole.len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_FIXED | m.map_flags,
-                file.as_raw_fd(),
-                hole.off as libc::off_t,
-            )
-        };
-        if ret == libc::MAP_FAILED {
-            return Err(Error::SnapshotMmap(io::Error::last_os_error()));
+        // A failed MAP_FIXED normally leaves the file mapping as it was
+        // (an older kernel may instead have unmapped the whole range), so
+        // map the file back only where nothing is mapped. EEXIST only says
+        // some page of the range is still mapped; it is read as "the file
+        // mapping survived" on the assumption that a failed MAP_FIXED
+        // never leaves the range partly unmapped (it either unmapped
+        // nothing, as at vm.max_map_count, or the whole range). MAP_FIXED
+        // would fail here as the remap did when that ran out of VMAs
+        // (ENOMEM at vm.max_map_count), since replacing part of the mapping
+        // needs the same splits.
+        match map_file(
+            addr,
+            hole.len as usize,
+            libc::MAP_PRIVATE | libc::MAP_FIXED_NOREPLACE | m.map_flags,
+            hole.off as libc::off_t,
+        ) {
+            Ok(ret) if ret != addr => {
+                // A kernel before 4.17 takes MAP_FIXED_NOREPLACE as a hint
+                // and maps elsewhere, which tells nothing about whether the
+                // range is still mapped: drop the stray copy and fail the
+                // restore rather than risk leaving the hole unmapped.
+                // SAFETY: ret..ret + len is the mapping just made, which
+                // nothing else knows of.
+                unsafe { libc::munmap(ret.cast(), hole.len as usize) };
+                return Err(Error::SnapshotMmap(io::Error::other(format!(
+                    "remapping a snapshot file hole failed ({e}) and the kernel \
+                     ignored MAP_FIXED_NOREPLACE when mapping the file back"
+                ))));
+            }
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(e) => return Err(Error::SnapshotMmap(e)),
         }
         warn!("Restore (mode=copyonwrite): remapping a snapshot file hole failed: {e}");
         report.skipped_failed += 1;
@@ -5776,6 +5823,117 @@ mod tests {
     }
 
     #[test]
+    fn cow_hole_remap_keeps_the_file_mapping_when_out_of_vmas() {
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        let gm = private_file_mapping(&file, 10 * MIB);
+        // As at vm.max_map_count: the anonymous remap fails with ENOMEM and
+        // leaves the file mapping, and so would any other MAP_FIXED over it.
+        let mut anon_calls = 0;
+        let mut file_calls = 0;
+        let mut reports = remap_cow_holes_with(
+            &[whole_mapping(&gm)],
+            &file,
+            HoleRemapLimits::default(),
+            |_, _, _| {
+                anon_calls += 1;
+                Err(io::Error::from_raw_os_error(libc::ENOMEM))
+            },
+            |addr, len, flags, off| {
+                file_calls += 1;
+                if flags & libc::MAP_FIXED != 0 {
+                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                }
+                // SAFETY: the range lies in gm's mapping, which the test
+                // owns, and the flags carry no MAP_FIXED.
+                let ret = unsafe {
+                    libc::mmap(
+                        addr.cast(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        flags,
+                        file.as_raw_fd(),
+                        off,
+                    )
+                };
+                if ret == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(ret.cast())
+            },
+        )
+        .unwrap();
+        assert_eq!((anon_calls, file_calls), (1, 1));
+        let report = reports.pop().unwrap();
+        assert_eq!(
+            report,
+            HoleRemapReport {
+                extents: 3,
+                found: 3,
+                skipped_failed: 3,
+                fallback: Some("mmap_failed"),
+                ..Default::default()
+            }
+        );
+        assert_holes_add_up(&report);
+        // Every hole is still mapped from the file, and the range reads the
+        // file's data (past the file's end, at 8 MiB, it would fault).
+        for gpa in [2 * MIB, 6 * MIB, 8 * MIB] {
+            assert!(gpa_is_file_backed(&gm, gpa));
+        }
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(2 * MIB)).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(6 * MIB)).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(5 * MIB)).unwrap(), 0xcd);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(7 * MIB)).unwrap(), 0xef);
+    }
+
+    #[test]
+    fn cow_hole_remap_fails_when_the_kernel_ignores_fixed_noreplace() {
+        use std::ptr;
+
+        let Some(file) = sparse_snapshot_file() else {
+            return;
+        };
+        let gm = private_file_mapping(&file, 10 * MIB);
+        // A kernel before 4.17 takes MAP_FIXED_NOREPLACE as a hint and maps
+        // the file elsewhere; whether the hole is still mapped is then
+        // unknown, so the restore fails.
+        let mut file_calls = 0;
+        let res = remap_cow_holes_with(
+            &[whole_mapping(&gm)],
+            &file,
+            HoleRemapLimits::default(),
+            |_, _, _| Err(io::Error::from_raw_os_error(libc::ENOMEM)),
+            |_, len, flags, off| {
+                file_calls += 1;
+                // SAFETY: no address and no MAP_FIXED: the kernel picks a
+                // free range, which the code under test unmaps again.
+                let ret = unsafe {
+                    libc::mmap(
+                        ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        flags & !libc::MAP_FIXED_NOREPLACE,
+                        file.as_raw_fd(),
+                        off,
+                    )
+                };
+                if ret == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(ret.cast())
+            },
+        );
+        assert!(matches!(res, Err(Error::SnapshotMmap(_))), "{res:?}");
+        assert_eq!(file_calls, 1);
+        // The guest's file mapping was left alone.
+        assert!(gpa_is_file_backed(&gm, 2 * MIB));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+    }
+
+    #[test]
     fn cow_hole_remap_failure_skips_the_holes_of_later_ranges() {
         let kib = 1 << 10;
         // Range 0 ([0, 2) MiB) and range 1 ([2, 4) MiB) have two holes each;
@@ -6423,9 +6581,11 @@ mod tests {
     // that does not let the test create one fails the test, unless
     // CH_TEST_SKIP_UFFD=1 says to skip it (None).
     fn register_uffd(gm: &GuestMemoryMmap) -> Option<Uffd> {
+        use std::env;
+
         let fd = match uffd::create(userfaultfd::UFFD_FEATURE_MISSING_SHMEM) {
             Ok(fd) => fd,
-            Err(e) if std::env::var_os("CH_TEST_SKIP_UFFD").is_some_and(|v| v == "1") => {
+            Err(e) if env::var_os("CH_TEST_SKIP_UFFD").is_some_and(|v| v == "1") => {
                 eprintln!("skipping (CH_TEST_SKIP_UFFD=1): cannot create a userfaultfd: {e}");
                 return None;
             }
