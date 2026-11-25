@@ -141,9 +141,11 @@ exit 2
 EOF
 chmod +x "$T/bin/gh"
 
-# case NAME WANT(pass|fail) ATT_REF ATT_DIGEST [RELEASE_TAG [VERSION]]
+# case NAME WANT(pass|fail) ATT_REF ATT_DIGEST [RELEASE_TAGS [VERSION [PREVIOUS]]]
+# RELEASE_TAGS is what gh release list returns (newline-separated); PREVIOUS,
+# if given, is the release the step must pick and wake.
 run_case() {
-  local name=$1 want=$2 d="$T/case-$1" rel=${5:-v54.1-cove.5} ver=${6:-v54.1-cove.6}
+  local name=$1 want=$2 d="$T/case-$1" rel=${5:-v54.1-cove.5} ver=${6:-v54.1-cove.6} prev=${7:-}
   mkdir -p "$d/rt/smoke/in" "$d/wd"
   ln -s "$ROOT" "$d/wd/src"
   local rc=0
@@ -157,6 +159,9 @@ run_case() {
   # A refusal counts only if the stub gh was asked to verify an attestation and
   # the step then said it found none it accepts.
   local why=''
+  if [ -n "$prev" ]; then
+    grep -qF "step 5 will wake $prev's checkpoint" "$d/out" || why="the step did not pick $prev as the previous release"
+  fi
   if [ "$want" = fail ]; then
     grep -q '^gh attestation verify' "$d/gh.log" 2>/dev/null || why="the stub gh was never asked to verify an attestation"
     grep -qF "has no attestation from its tag's push or its branch's dispatch" "$d/out" || why="${why:+$why; }the step did not end in its attestation refusal"
@@ -164,7 +169,7 @@ run_case() {
   if [ "$got" = "$want" ] && [ -z "$unpinned" ] && [ -z "$why" ]; then
     ok "$name: $want"
   else
-    bad "$name: want $want, got $got (rc $rc)" "$(tail -n 8 "$d/out")" ${why:+"not a real refusal: $why"} ${unpinned:+"unpinned: $unpinned"}
+    bad "$name: want $want, got $got (rc $rc)" "$(tail -n 8 "$d/out")" ${why:+"not as expected: $why"} ${unpinned:+"unpinned: $unpinned"}
   fi
 }
 
@@ -179,6 +184,21 @@ run_case dispatch-before-tag   fail refs/heads/cove-patches-v54.1 "$c0"
 run_case other-tag             fail refs/tags/ci-test-1         "$c1"
 # A push-shape attestation for a tag whose commit is not on the release branch.
 run_case push-shape-off-branch fail refs/tags/v54.1-cove.7      "$c3" v54.1-cove.7 v54.1-cove.8
+# The previous release is on another patch line: v55.0-cove.1 is the first
+# release of its line, the newest release below it is v54.1-cove.5, and the
+# step takes that one (not the older v54.1-cove.4, not the higher
+# v55.0-cove.2) and checks its attestation against its own line's branch
+# (cove-patches-v54.1, the only branch the temp repo has).
+run_case previous-on-other-line pass refs/tags/v54.1-cove.5     "$c1" \
+  $'v54.1-cove.4\nv54.1-cove.5\nv55.0-cove.2' v55.0-cove.1 v54.1-cove.5
 
-echo "passed $pass, failed $failed"
+# The count of cases this file runs. A case deleted (or added without raising
+# this) makes the run fail, so a missing case cannot go unnoticed.
+EXPECTED_CASES=12
+ran=$((pass + failed))
+echo "passed $pass, failed $failed (ran $ran of $EXPECTED_CASES expected cases)"
+if [ "$ran" -ne "$EXPECTED_CASES" ]; then
+  echo "FAIL ran $ran cases, expected $EXPECTED_CASES: a case was removed or added without updating EXPECTED_CASES"
+  exit 1
+fi
 [ "$failed" -eq 0 ]
